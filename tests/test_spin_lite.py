@@ -1,5 +1,10 @@
 import numpy as np
 import pytest
+import os
+from pathlib import Path
+import socket
+import subprocess
+import sys
 import torch
 
 from torchnep.data import build_neighbor_list_np, parse_nep_in, read_xyz
@@ -217,7 +222,7 @@ def test_xyz_parser_reads_spin_and_mforce_aliases(tmp_path):
     np.testing.assert_allclose(frame["tau"], [[-3, 6, -3]])
 
 
-def test_single_device_training_smoke_with_mforce(tmp_path):
+def _write_spin_training_case(tmp_path):
     config = tmp_path / "nep.in"
     config.write_text(
         "type 1 Fe\n"
@@ -262,6 +267,11 @@ def test_single_device_training_smoke_with_mforce(tmp_path):
         "Fe 2.1 1.2 1 0.1 0.8 0.2 0 0.06 0.01\n"
         "Fe 1.2 2.1 1.3 0.2 0 0.8 0.01 0 0.07\n"
     )
+    return config, xyz
+
+
+def test_single_device_training_smoke_with_mforce(tmp_path):
+    config, xyz = _write_spin_training_case(tmp_path)
     output = tmp_path / "output"
     train_nep(
         str(config), str(xyz), output_dir=str(output),
@@ -282,3 +292,56 @@ def test_single_device_training_smoke_with_mforce(tmp_path):
     assert tau.shape == (6, 6)
     assert np.isfinite(tau[:, :3]).all()
     assert "spin_descriptor" not in (output / "nep_final.txt").read_text()
+
+
+def test_two_rank_sharded_training_smoke_with_mforce(tmp_path):
+    config, xyz = _write_spin_training_case(tmp_path)
+    output = tmp_path / "output_ddp"
+    driver = tmp_path / "run_ddp.py"
+    driver.write_text(
+        "import sys\n"
+        "from torchnep import train_nep_sharded\n"
+        "train_nep_sharded(\n"
+        "    sys.argv[1], sys.argv[2], output_dir=sys.argv[3],\n"
+        "    precision='float64', restart=False, prediction_interval=0,\n"
+        "    use_gpumd_qscaler=False, run_seed=1,\n"
+        "    valid_file=sys.argv[2],\n"
+        ")\n"
+    )
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = (
+        repo_root + os.pathsep + env["PYTHONPATH"]
+        if env.get("PYTHONPATH") else repo_root)
+    env["OMP_NUM_THREADS"] = "1"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        master_port = str(sock.getsockname()[1])
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "torch.distributed.run",
+            "--nnodes=1", "--node_rank=0", "--nproc_per_node=2",
+            "--master_addr=127.0.0.1", f"--master_port={master_port}",
+            str(driver), str(config), str(xyz), str(output),
+        ],
+        cwd=tmp_path, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout
+    for name in (
+        "nep_best.txt", "nep_final.txt", "loss.out",
+        "mforce_train.out", "tau_train.out",
+        "mforce_test.out", "tau_test.out",
+    ):
+        assert (output / name).stat().st_size > 0, completed.stdout
+    header = (output / "loss.out").read_text().splitlines()[0]
+    assert "rmse_m(eV/muB)" in header
+    assert "rmse_tau_test(eV)" in header
+    for name in (
+        "mforce_train.out", "tau_train.out",
+        "mforce_test.out", "tau_test.out",
+    ):
+        values = np.loadtxt(output / name)
+        assert values.shape == (6, 6)
+        assert np.isfinite(values[:, :3]).all()

@@ -107,8 +107,9 @@ lambda_tau 0.0
 
 `spin_dof_type` selects atoms whose magnetic force is trained and returned.
 `spin_env_type` selects atoms allowed in their magnetic environment and must
-include every `spin_dof_type`. Spin training currently uses `train_nep`;
-`train_nep_sharded` and `compute_tiled` reject spin models explicitly.
+include every `spin_dof_type`. Both `train_nep` and the data-sharded DDP
+entry point `train_nep_sharded` support spin training and write magnetic-force
+and torque prediction files. `compute_tiled` still rejects spin models.
 Exported potentials use a counted `nep4_spin1` metadata block in `nep.txt`.
 
 ### Training hyperparameters

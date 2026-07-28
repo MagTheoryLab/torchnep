@@ -104,7 +104,8 @@ class _NEPDDPShim(nn.Module):
             self._compute_cached = model.compute_properties_cached
 
     def forward(self, batch, use_autograd_forces: bool,
-                need_forces: bool, need_virial: bool, backend: str):
+                need_forces: bool, need_virial: bool,
+                need_mforce: bool, need_tau: bool, backend: str):
         if use_autograd_forces:
             return self.model.compute_properties(
                 batch["rij_rad"], batch["rij_ang"],
@@ -113,7 +114,13 @@ class _NEPDDPShim(nn.Module):
                 batch["atom_types"], batch["N"],
                 batch["struct_idx"], batch["num_structures"],
                 need_forces=need_forces, need_virial=need_virial,
-                backend=backend)
+                backend=backend, spins=batch.get("spins"),
+                need_mforce=need_mforce, need_tau=need_tau,
+                rij_spin=batch.get("rij_spin"),
+                pi_spin=batch.get("pair_i_spin"),
+                pj_spin=batch.get("pair_j_spin"))
+        batch["need_mforce"] = need_mforce
+        batch["need_tau"] = need_tau
         return self._compute_cached(
             batch, need_forces=need_forces, need_virial=need_virial,
             backend=backend)
@@ -158,8 +165,11 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
         c2 = torch.ones_like(model.c_param_2)
         c3 = (torch.ones_like(model.c_param_3)
               if model.c_param_3 is not None else None)
+        c_spin = (torch.ones_like(model.c_param_spin)
+                  if model.c_param_spin is not None else None)
     else:
         c2, c3 = model.c_param_2, model.c_param_3
+        c_spin = model.c_param_spin
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -180,6 +190,14 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
             has_q_123=model.has_q_123, has_q_233=model.has_q_233,
             has_q_134=model.has_q_134,
         )
+        if model.spin_descriptor is not None:
+            q_spin = model.spin_descriptor(
+                batch["rij_spin"], batch["pair_i_spin"],
+                batch["pair_j_spin"], batch["spins"], batch["N"],
+                batch["atom_types"], c_spin, None,
+                model.spin_dof_type_active, model.spin_env_type_active,
+            )
+            q = torch.cat((q, q_spin), dim=-1)
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
 
@@ -220,8 +238,9 @@ def train_nep_sharded(
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
 
-    All hyperparameters (epoch / batch / lr / lambda_e,f,v / stage2* / ...)
-    come from ``config_file`` — see README for the nep.in reference.
+    All hyperparameters (epoch / batch / eval_batch / lr /
+    lambda_e,f,v,m,tau / stage2* / ...) come from ``config_file`` — see
+    README for the nep.in reference.
 
     Each rank loads structures[rank::world_size] only, so data-store memory
     scales as 1/world_size.  Gradients are all-reduced by DDP; q_scaler and
@@ -369,11 +388,6 @@ def train_nep_sharded(
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
-    if orig_config.get("spin_mode", 0):
-        raise NotImplementedError(
-            "Spin NEP Lite training is currently supported by train_nep "
-            "only; train_nep_sharded does not yet implement distributed "
-            "magnetic-force reduction")
     if is_main:
         for line in format_config_summary(orig_config):
             _log(line)
@@ -383,6 +397,7 @@ def train_nep_sharded(
     lambda_2 = config["lambda_2"]
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
+    eval_batch_size    = config["eval_batch_size"]
     lr                 = config["lr"]
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
@@ -393,12 +408,16 @@ def train_nep_sharded(
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
     pref_v             = config["lambda_v"]
+    pref_m             = config["lambda_m"]
+    pref_tau           = config["lambda_tau"]
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")
     stage2_lr          = config["stage2_lr"]
     stage2_pref_e      = config["stage2_pref_e"]
     stage2_pref_f      = config["stage2_pref_f"]
     stage2_pref_v      = config["stage2_pref_v"]
+    stage2_pref_m      = config["stage2_pref_m"]
+    stage2_pref_tau    = config["stage2_pref_tau"]
 
     # ---- Data: each rank loads 1/world_size of structures ----------------
     _log("Data")
@@ -550,25 +569,37 @@ def train_nep_sharded(
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
         [data_store.n, data_store.n_energy,
-         data_store.n_forces, data_store.n_virial],
+         data_store.n_forces, data_store.n_virial,
+         data_store.n_mforces, data_store.n_tau],
         dtype=torch.long, device=dev)
     dist.all_reduce(counts_t)
-    g_n, g_ne, g_nf, g_nv = counts_t.tolist()
-    _log(f"  coverage (global): {g_ne} E / {g_nf} F / {g_nv} V")
+    g_n, g_ne, g_nf, g_nv, g_nm, g_nt = counts_t.tolist()
+    coverage = f"  coverage (global): {g_ne} E / {g_nf} F / {g_nv} V"
+    if orig_config.get("spin_mode", 0):
+        coverage += f" / {g_nm} M / {g_nt} T"
+    _log(coverage)
     if valid_store is not None:
         vcounts_t = torch.tensor(
             [valid_store.n_energy, valid_store.n_forces,
-             valid_store.n_virial, int(valid_store.has_forces),
-             int(valid_store.has_virial)],
+             valid_store.n_virial, valid_store.n_mforces,
+             valid_store.n_tau, int(valid_store.has_forces),
+             int(valid_store.has_virial), int(valid_store.has_mforces),
+             int(valid_store.has_tau)],
             dtype=torch.long, device=dev)
         dist.all_reduce(vcounts_t)
-        gv_ne, gv_nf, gv_nv = vcounts_t[:3].tolist()
+        gv_ne, gv_nf, gv_nv, gv_nm, gv_nt = vcounts_t[:5].tolist()
         # Global channel flags for the per-epoch validation eval — per-rank
         # shards may lack a channel that other shards have.
-        valid_has_forces = bool(vcounts_t[3].item() > 0)
-        valid_has_virial = bool(vcounts_t[4].item() > 0)
-        _log(f"  validation coverage (global, incl. padding): "
-             f"{gv_ne} E / {gv_nf} F / {gv_nv} V")
+        valid_has_forces = bool(vcounts_t[5].item() > 0)
+        valid_has_virial = bool(vcounts_t[6].item() > 0)
+        valid_has_mforces = bool(vcounts_t[7].item() > 0)
+        valid_has_tau = bool(vcounts_t[8].item() > 0)
+        valid_coverage = (
+            f"  validation coverage (global, incl. padding): "
+            f"{gv_ne} E / {gv_nf} F / {gv_nv} V")
+        if orig_config.get("spin_mode", 0):
+            valid_coverage += f" / {gv_nm} M / {gv_nt} T"
+        _log(valid_coverage)
     _log("")
 
     # ---- Model -----------------------------------------------------------
@@ -639,13 +670,16 @@ def train_nep_sharded(
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
-    # has_forces / has_virial: OR across ranks
+    # Channel availability: OR across ranks.
     flags_t = torch.tensor(
-        [int(data_store.has_forces), int(data_store.has_virial)],
+        [int(data_store.has_forces), int(data_store.has_virial),
+         int(data_store.has_mforces), int(data_store.has_tau)],
         dtype=torch.long, device=dev)
     dist.all_reduce(flags_t, op=dist.ReduceOp.MAX)
     global_has_forces = bool(flags_t[0].item())
     global_has_virial = bool(flags_t[1].item())
+    global_has_mforces = bool(flags_t[2].item())
+    global_has_tau = bool(flags_t[3].item())
 
     # Decide whether torch.compile will actually run BEFORE resolving the
     # backend — the backend choice depends on it. Only the analytical path is
@@ -751,6 +785,35 @@ def train_nep_sharded(
     def _loss_fn(pred, ref):
         return torch.mean((pred - ref) ** 2)
 
+    def _evaluate_sharded(store, eval_bs, need_forces, need_virial,
+                          need_mforce, need_tau, loss_weights,
+                          fit_energy_offset=False):
+        """Frozen-weight evaluation of one sharded store on all ranks."""
+        sums = _accumulate_true_loss_sums(
+            store, eval_bs, raw_model,
+            raw_model.compute_properties, _shim._compute_cached,
+            use_autograd_forces, train_backend,
+            need_forces, need_virial, need_mforce, need_tau, dtype, dev)
+        sums_t = torch.tensor(sums, device=dev, dtype=torch.float64)
+        dist.all_reduce(sums_t)
+        (s_le, s_lf, s_lv, s_ls, s_lm, s_lt,
+         n_e, n_f, n_v, n_m, n_t, s_e_resid) = sums_t.tolist()
+        delta = (
+            s_e_resid / n_e if fit_energy_offset and n_e > 0 else 0.0)
+        if fit_energy_offset and n_e > 0:
+            with torch.no_grad():
+                raw_model.b1.add_(delta)
+        mse_e = max(0.0, s_le / max(n_e, 1.0) - delta * delta)
+        mse_f = s_lf / max(n_f, 1.0)
+        mse_v = s_lv / max(n_v, 1.0)
+        mse_s = s_ls / max(n_v, 1.0)
+        mse_m = s_lm / max(n_m, 1.0)
+        mse_t = s_lt / max(n_t, 1.0)
+        pe, pf, pv, pm, pt = loss_weights
+        total = pe * mse_e + pf * mse_f + pv * mse_v + pm * mse_m + pt * mse_t
+        return (total, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
+                np.sqrt(mse_s), np.sqrt(mse_m), np.sqrt(mse_t))
+
     swa_model = None
     stage2_scheduler = None
     if stage2:
@@ -768,8 +831,10 @@ def train_nep_sharded(
     # old-scale best_loss would keep the new run from ever saving a new best).
     cur_loss_weights = {
         "lambda_e": pref_e, "lambda_f": pref_f, "lambda_v": pref_v,
+        "lambda_m": pref_m, "lambda_tau": pref_tau,
         "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
-        "stage2_pref_v": stage2_pref_v,
+        "stage2_pref_v": stage2_pref_v, "stage2_pref_m": stage2_pref_m,
+        "stage2_pref_tau": stage2_pref_tau,
     }
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
@@ -838,12 +903,16 @@ def train_nep_sharded(
         if write_header:
             hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                    "rmse_v(eV/atom)  rmse_stress(GPa)")
+            if raw_model.spin_descriptor is not None:
+                hdr += "  rmse_m(eV/muB)  rmse_tau(eV)"
             if valid_store is not None:
                 # GPUMD loss.out convention: train RMSEs, then test RMSEs.
                 # (The loss column is then the VALIDATION loss — it is what
                 # drives the scheduler and the best-model choice.)
                 hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
                         "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+                if raw_model.spin_descriptor is not None:
+                    hdr += "  rmse_m_test(eV/muB)  rmse_tau_test(eV)"
             loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
@@ -896,7 +965,9 @@ def train_nep_sharded(
             perm = torch.randperm(n_local, generator=g).tolist()
 
             sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/A**3)**2
+            sum_lm = sum_lt = 0.0
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
+            sum_m_atoms = sum_t_atoms = 0
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
 
@@ -913,8 +984,10 @@ def train_nep_sharded(
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
-                cur_pref_e, cur_pref_f, cur_pref_v = (
-                    stage2_pref_e, stage2_pref_f, stage2_pref_v)
+                (cur_pref_e, cur_pref_f, cur_pref_v,
+                 cur_pref_m, cur_pref_tau) = (
+                    stage2_pref_e, stage2_pref_f, stage2_pref_v,
+                    stage2_pref_m, stage2_pref_tau)
                 # Apply stage 2 lr + reset the first time we hit stage 2 in
                 # THIS run — covers both the natural transition and resuming
                 # from a stage-1 checkpoint whose start_epoch has already
@@ -955,7 +1028,8 @@ def train_nep_sharded(
                         best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                             f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
+                             f"V_w={cur_pref_v}, M_w={cur_pref_m}, "
+                             f"Tau_w={cur_pref_tau}, lr={stage2_lr:.2e}")
                     else:
                         # Resumed mid-stage-2: keep the checkpoint's restored
                         # (possibly decayed) lr / optimizer / scheduler /
@@ -964,11 +1038,13 @@ def train_nep_sharded(
                         cur_lr = optimizer.param_groups[0]['lr']
                         _log(f"Stage 2 resumed at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                             f"V_w={cur_pref_v}, lr={cur_lr:.2e} "
+                             f"V_w={cur_pref_v}, M_w={cur_pref_m}, "
+                             f"Tau_w={cur_pref_tau}, lr={cur_lr:.2e} "
                              f"(kept from checkpoint)")
                     _log(f"{'='*72}")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
+                cur_pref_m, cur_pref_tau = pref_m, pref_tau
 
             # Per-epoch compute eligibility: a weight of 0 means "don't compute
             # this channel". Recomputed every epoch so a stage-1 zero weight
@@ -976,6 +1052,12 @@ def train_nep_sharded(
             # virial compute/backward.
             has_forces = global_has_forces and cur_pref_f > 0
             has_virial = global_has_virial and cur_pref_v > 0
+            has_mforces = (
+                raw_model.spin_descriptor is not None
+                and global_has_mforces and cur_pref_m > 0)
+            has_tau = (
+                raw_model.spin_descriptor is not None
+                and global_has_tau and cur_pref_tau > 0)
 
             for start in range(0, n_local, batch_size):
                 idx = perm[start:start + batch_size]
@@ -984,13 +1066,19 @@ def train_nep_sharded(
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
                 result = model(batch, use_autograd_forces,
-                               has_forces, has_virial, train_backend)
+                               has_forces, has_virial,
+                               has_mforces, has_tau, train_backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
                 f_mask = batch["force_mask"] if has_forces else None
                 v_mask = batch["virial_mask"] if has_virial else None
+                active = raw_model.spin_dof_type_active[
+                    batch["atom_types"]]
+                m_mask = (
+                    batch["mforce_mask"] & active if has_mforces else None)
+                t_mask = batch["tau_mask"] & active if has_tau else None
 
                 # --- DDP-correct normalisation --------------------------
                 # DDP averages gradients by world_size. If each rank used a
@@ -1007,11 +1095,15 @@ def train_nep_sharded(
                     float(e_mask.sum().item()),
                     float(f_mask.sum().item()) if f_mask is not None else 0.0,
                     float(v_mask.sum().item()) if v_mask is not None else 0.0,
+                    float(m_mask.sum().item()) if m_mask is not None else 0.0,
+                    float(t_mask.sum().item()) if t_mask is not None else 0.0,
                 ], device=dev, dtype=torch.float64)
                 dist.all_reduce(counts)
                 n_e_g = max(counts[0].item(), 1.0)
                 n_f_g = max(counts[1].item(), 1.0)
                 n_v_g = max(counts[2].item(), 1.0)
+                n_m_g = max(counts[3].item(), 1.0)
+                n_t_g = max(counts[4].item(), 1.0)
                 ws = float(world_size)
 
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
@@ -1057,6 +1149,18 @@ def train_nep_sharded(
                         sum_sq_s = ((v_diff * scale) ** 2).sum()
                         sum_ls += (sum_sq_s.item() / 6.0)
 
+                if m_mask is not None and m_mask.any():
+                    m_diff = result["mforces"][m_mask] - batch["mforces"][m_mask]
+                    sum_sq_m = (m_diff ** 2).sum()
+                    loss = loss + cur_pref_m * sum_sq_m * ws / (3.0 * n_m_g)
+                    sum_lm += sum_sq_m.item() / 3.0
+
+                if t_mask is not None and t_mask.any():
+                    t_diff = result["tau"][t_mask] - batch["tau"][t_mask]
+                    sum_sq_t = (t_diff ** 2).sum()
+                    loss = loss + cur_pref_tau * sum_sq_t * ws / (3.0 * n_t_g)
+                    sum_lt += sum_sq_t.item() / 3.0
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
@@ -1097,18 +1201,24 @@ def train_nep_sharded(
                 sum_e_structs += batch["energy_mask"].sum().item()
                 sum_f_atoms += batch["force_mask"].sum().item()
                 sum_v_structs += batch["virial_mask"].sum().item()
+                if m_mask is not None:
+                    sum_m_atoms += int(m_mask.sum().item())
+                if t_mask is not None:
+                    sum_t_atoms += int(t_mask.sum().item())
                 max_gn = max(max_gn, gn)
 
             metrics = torch.tensor(
-                [sum_le, sum_lf, sum_lv, sum_ls,
+                [sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
                  float(sum_e_structs), float(sum_f_atoms),
-                 float(sum_v_structs), sum_e_resid],
+                 float(sum_v_structs), float(sum_m_atoms),
+                 float(sum_t_atoms), sum_e_resid],
                 device=dev)
             dist.all_reduce(metrics)
             gn_t = torch.tensor(max_gn, device=dev)
             dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
-            (sum_le, sum_lf, sum_lv, sum_ls,
+            (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
              sum_e_structs, sum_f_atoms, sum_v_structs,
+             sum_m_atoms, sum_t_atoms,
              sum_e_resid) = metrics.tolist()
             max_gn = gn_t.item()
 
@@ -1128,12 +1238,31 @@ def train_nep_sharded(
             mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
+            mse_m = sum_lm / max(sum_m_atoms, 1) if sum_lm > 0 else 0.0
+            mse_t = sum_lt / max(sum_t_atoms, 1) if sum_lt > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
-                        + cur_pref_v * mse_v)
+                        + cur_pref_v * mse_v + cur_pref_m * mse_m
+                        + cur_pref_tau * mse_t)
             rmse_e = np.sqrt(mse_e)                           # eV/atom
             rmse_f = np.sqrt(mse_f)                           # eV/A
             rmse_v = np.sqrt(mse_v)                           # eV/atom
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa    # GPa
+            rmse_m = np.sqrt(mse_m)                           # eV/muB
+            rmse_t = np.sqrt(mse_t)                           # eV
+
+            # Magnetic-force and torque losses are derivatives with respect
+            # to spin coordinates. As in train_nep, use one frozen-weight
+            # pass for the epoch metric/scheduler/best gate instead of mixing
+            # predictions from weights that changed between minibatches.
+            if raw_model.spin_descriptor is not None:
+                (avg_loss, rmse_e, rmse_f, rmse_v, rmse_s,
+                 rmse_m, rmse_t) = _evaluate_sharded(
+                    data_store, eval_batch_size,
+                    has_forces, has_virial, has_mforces, has_tau,
+                    (cur_pref_e, cur_pref_f, cur_pref_v,
+                     cur_pref_m, cur_pref_tau),
+                    fit_energy_offset=True)
+                rmse_s_gpa = rmse_s * EV_PER_A3_TO_GPa
 
             # Validation (COLLECTIVE): each rank evaluates its valid shard
             # with frozen weights, the error sums are all-reduced, so every
@@ -1143,28 +1272,19 @@ def train_nep_sharded(
             # that would leak validation info into the saved model).
             valid_loss = None
             if valid_store is not None:
-                v_sums = _accumulate_true_loss_sums(
-                    valid_store, batch_size, raw_model,
-                    raw_model.compute_properties, _shim._compute_cached,
-                    use_autograd_forces, train_backend,
+                (valid_loss, v_rmse_e, v_rmse_f, v_rmse_v,
+                 v_rmse_s, v_rmse_m, v_rmse_t) = _evaluate_sharded(
+                    valid_store, eval_batch_size,
                     valid_has_forces and cur_pref_f > 0,
                     valid_has_virial and cur_pref_v > 0,
-                    False, False, dtype, dev)
-                v_sums_t = torch.tensor(v_sums, device=dev,
-                                        dtype=torch.float64)
-                dist.all_reduce(v_sums_t)
-                (v_le, v_lf, v_lv, v_ls, _v_lm, _v_lt,
-                 v_ne, v_nf, v_nv, _v_nm, _v_nt, _) = v_sums_t.tolist()
-                v_mse_e = v_le / max(v_ne, 1.0)
-                v_mse_f = v_lf / max(v_nf, 1.0)
-                v_mse_v = v_lv / max(v_nv, 1.0)
-                v_mse_s = v_ls / max(v_nv, 1.0)
-                valid_loss = (cur_pref_e * v_mse_e + cur_pref_f * v_mse_f
-                              + cur_pref_v * v_mse_v)
-                v_rmse_e = np.sqrt(v_mse_e)
-                v_rmse_f = np.sqrt(v_mse_f)
-                v_rmse_v = np.sqrt(v_mse_v)
-                v_rmse_s = np.sqrt(v_mse_s) * EV_PER_A3_TO_GPa
+                    (raw_model.spin_descriptor is not None
+                     and valid_has_mforces and cur_pref_m > 0),
+                    (raw_model.spin_descriptor is not None
+                     and valid_has_tau and cur_pref_tau > 0),
+                    (cur_pref_e, cur_pref_f, cur_pref_v,
+                     cur_pref_m, cur_pref_tau),
+                    fit_energy_offset=False)
+                v_rmse_s *= EV_PER_A3_TO_GPa
             dt = time.time() - t_epoch
 
             # With a validation set, the validation loss IS the run's loss:
@@ -1197,9 +1317,13 @@ def train_nep_sharded(
             if is_main:
                 row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
                        f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+                if raw_model.spin_descriptor is not None:
+                    row += f" {rmse_m:.6f} {rmse_t:.6f}"
                 if valid_loss is not None:
                     row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
                             f"{v_rmse_s:.4f}")
+                    if raw_model.spin_descriptor is not None:
+                        row += f" {v_rmse_m:.6f} {v_rmse_t:.6f}"
                 loss_log.write(row + "\n")
                 loss_log.flush()
 
@@ -1207,15 +1331,26 @@ def train_nep_sharded(
                 cur_lr = optimizer.param_groups[0]['lr']
                 v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                          if has_virial else "")
+                spin_str = ""
+                if has_mforces:
+                    spin_str += f" | M {rmse_m:.5f} eV/muB"
+                if has_tau:
+                    spin_str += f" | T {rmse_t:.5f} eV"
                 valid_str = ""
                 if valid_loss is not None:
                     valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
                                  + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
                                     if has_virial else ""))
+                    if (raw_model.spin_descriptor is not None
+                            and valid_has_mforces and cur_pref_m > 0):
+                        valid_str += f" M {v_rmse_m:.5f}"
+                    if (raw_model.spin_descriptor is not None
+                            and valid_has_tau and cur_pref_tau > 0):
+                        valid_str += f" T {v_rmse_t:.5f}"
                 line = (f"{stage_str}Epoch {epoch:4d} | "
                         f"loss {sched_loss:.4e} | "
                         f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                        f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
+                        f"{v_str}{spin_str}{valid_str} | gnorm {max_gn:.1f} | "
                         f"lr {cur_lr:.2e} | {dt:.1f}s")
                 if epoch % print_interval == 0 or epoch == 1:
                     _log(line)
@@ -1245,30 +1380,20 @@ def train_nep_sharded(
                     best_valid_loss = valid_loss
                     if is_main:
                         _save_best()
-            elif epoch < true_eval_start:
-                if new_min and is_main:
-                    _save_best()
+            elif (epoch < true_eval_start
+                  or raw_model.spin_descriptor is not None):
+                if new_min:
+                    if raw_model.spin_descriptor is not None:
+                        best_true_loss = avg_loss
+                    if is_main:
+                        _save_best()
             elif new_min or epoch == num_epochs or stop_now:
-                local_sums = _accumulate_true_loss_sums(
-                    data_store, batch_size, raw_model,
-                    raw_model.compute_properties, _shim._compute_cached,
-                    use_autograd_forces, train_backend,
-                    has_forces, has_virial, False, False, dtype, dev)
-                sums_t = torch.tensor(local_sums, device=dev,
-                                      dtype=torch.float64)
-                dist.all_reduce(sums_t)
-                (s_le, s_lf, s_lv, _s_ls, _s_lm, _s_lt,
-                 n_e, n_f, n_v, _n_m, _n_t, s_e_resid) = sums_t.tolist()
-                # Exact optimal b1 for these frozen weights, from the global
-                # (all-reduced) residual — identical on every rank.
-                delta = s_e_resid / n_e if n_e > 0 else 0.0
-                if n_e > 0:
-                    with torch.no_grad():
-                        raw_model.b1.add_(delta)
-                mse_e = max(0.0, s_le / max(n_e, 1.0) - delta * delta)
-                t_loss = (cur_pref_e * mse_e
-                          + cur_pref_f * s_lf / max(n_f, 1.0)
-                          + cur_pref_v * s_lv / max(n_v, 1.0))
+                t_loss, *_ = _evaluate_sharded(
+                    data_store, eval_batch_size,
+                    has_forces, has_virial, has_mforces, has_tau,
+                    (cur_pref_e, cur_pref_f, cur_pref_v,
+                     cur_pref_m, cur_pref_tau),
+                    fit_energy_offset=True)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     if is_main:
@@ -1302,14 +1427,14 @@ def train_nep_sharded(
                     raw_model, data_store, local_global_idx,
                     n_total_frames=n_total,
                     output_dir=output_dir,
-                    batch_size=batch_size, backend=backend,
+                    batch_size=eval_batch_size, backend=backend,
                     verbose=False)
                 if valid_store is not None:
                     predict_from_store_sharded(
                         raw_model, valid_store, valid_local_global_idx,
                         n_total_frames=n_valid_total,
                         output_dir=output_dir,
-                        batch_size=batch_size, backend=backend,
+                        batch_size=eval_batch_size, backend=backend,
                         verbose=False, suffix="test")
 
             if stop_now:
@@ -1358,14 +1483,14 @@ def train_nep_sharded(
         raw_model, data_store, local_global_idx,
         n_total_frames=n_total,
         output_dir=output_dir,
-        batch_size=batch_size, backend=backend,
+        batch_size=eval_batch_size, backend=backend,
         verbose=is_main)
     if valid_store is not None:
         predict_from_store_sharded(
             raw_model, valid_store, valid_local_global_idx,
             n_total_frames=n_valid_total,
             output_dir=output_dir,
-            batch_size=batch_size, backend=backend,
+            batch_size=eval_batch_size, backend=backend,
             verbose=False, suffix="test")
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
