@@ -129,7 +129,7 @@ from .train import (
     _BANNER, _AUTHOR,
     _backend_info, GPUDataStore,
     format_config_summary,
-    preprocess_structures,
+    preprocess_structures, compute_max_neighbors,
     _save_checkpoint, _load_checkpoint,
     _trim_loss_log, _accumulate_true_loss_sums,
     _make_lr_scheduler, _scheduler_step,
@@ -506,19 +506,6 @@ def train_nep_sharded(
     structures = preprocess_structures(local_frames, config, np_dtype)
     _log(f"  built neighbor lists (local shard) in {time.time() - t0:.1f}s")
 
-    # max_NN: local max then all-reduce so rank-0 has the global value
-    def _compute_max_neighbors_local(structures):
-        max_rad = max_ang = 0
-        for s in structures:
-            n = s["natoms"]
-            if len(s["pair_i_rad"]) > 0:
-                counts = np.bincount(s["pair_i_rad"], minlength=n)
-                max_rad = max(max_rad, int(counts.max()))
-            if len(s["pair_i_ang"]) > 0:
-                counts = np.bincount(s["pair_i_ang"], minlength=n)
-                max_ang = max(max_ang, int(counts.max()))
-        return max_rad, max_ang
-
     # Validation frames: sharded across ranks with the same padded-perm
     # scheme as the training frames (equal shard sizes keep the per-epoch
     # eval time balanced; a padding duplicate contributes its error twice in
@@ -543,11 +530,11 @@ def train_nep_sharded(
             config, np_dtype)
         del valid_frames
 
-    local_max_rad, local_max_ang = _compute_max_neighbors_local(structures)
+    local_max_rad, local_max_ang = compute_max_neighbors(structures)
     if structures_v is not None:
         # nep.txt records max neighbor counts for MD buffer sizing — cover
         # the validation frames too (folded into the same all-reduce).
-        v_max_rad, v_max_ang = _compute_max_neighbors_local(structures_v)
+        v_max_rad, v_max_ang = compute_max_neighbors(structures_v)
         local_max_rad = max(local_max_rad, v_max_rad)
         local_max_ang = max(local_max_ang, v_max_ang)
     nn_t = torch.tensor([local_max_rad, local_max_ang], dtype=torch.long,

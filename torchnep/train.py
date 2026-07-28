@@ -690,12 +690,19 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
 
 
 def compute_max_neighbors(structures):
-    """Return (max_NN_radial, max_NN_angular) over all structures."""
+    """Return (max_NN_radial, max_NN_angular) over all structures.
+
+    ``max_NN_radial`` also covers the spin neighbor list because GPUMD uses
+    the first exported capacity for radial/spin storage.
+    """
     max_rad = max_ang = 0
     for s in structures:
         n = s["natoms"]
         if len(s["pair_i_rad"]) > 0:
             counts = np.bincount(s["pair_i_rad"], minlength=n)
+            max_rad = max(max_rad, int(counts.max()))
+        if len(s.get("pair_i_spin", ())) > 0:
+            counts = np.bincount(s["pair_i_spin"], minlength=n)
             max_rad = max(max_rad, int(counts.max()))
         if len(s["pair_i_ang"]) > 0:
             counts = np.bincount(s["pair_i_ang"], minlength=n)

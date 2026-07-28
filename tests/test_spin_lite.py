@@ -11,7 +11,12 @@ import torch
 from torchnep.data import build_neighbor_list_np, parse_nep_in, read_xyz
 from torchnep.model import NEPModel
 from torchnep.nep import NEPCalculator
-from torchnep.train import GPUDataStore, preprocess_structures, train_nep
+from torchnep.train import (
+    GPUDataStore,
+    compute_max_neighbors,
+    preprocess_structures,
+    train_nep,
+)
 from torchnep.spin import (
     SpinNEPLiteChiralDescriptor,
     SpinNEPLiteDescriptor,
@@ -200,6 +205,36 @@ def _cached_spin_batch(chiral, spin_compress=2, spin_l_max=2):
     batch["need_mforce"] = True
     batch["need_tau"] = True
     return config, frame, batch
+
+
+def test_export_neighbor_capacity_covers_spin_cutoff_extension():
+    config = dict(_config(chiral=1))
+    config["cutoff_radial"] = 1.5
+    config["cutoff_angular"] = 1.5
+    config["spin_cutoff"] = [5.2, 1.5]
+    frame = {
+        "natoms": 4,
+        "species": ["Fe", "Ge", "Fe", "Ge"],
+        "cell": np.eye(3) * 20.0,
+        "positions": np.array([
+            [1.0, 1.0, 1.0],
+            [4.0, 1.0, 1.0],
+            [7.0, 1.0, 1.0],
+            [10.0, 1.0, 1.0],
+        ], dtype=np.float64),
+        "energy": 0.0,
+        "spins": np.ones((4, 3), dtype=np.float64),
+    }
+    structure = preprocess_structures(
+        [frame], config, dtype=np.float64, n_workers=1)[0]
+    radial_max = int(np.bincount(
+        structure["pair_i_rad"], minlength=frame["natoms"]).max())
+    spin_max = int(np.bincount(
+        structure["pair_i_spin"], minlength=frame["natoms"]).max())
+
+    assert spin_max > radial_max
+    max_radial, _ = compute_max_neighbors([structure])
+    assert max_radial == spin_max
 
 
 def _autograd_spin_properties(model, batch):
