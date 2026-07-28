@@ -29,6 +29,8 @@ from .constants import (
     ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS,
 )
 from . import ops
+from .spin import SpinNEPLiteChiralDescriptor, SpinNEPLiteDescriptor
+from .spin_schema import spin_checkpoint_lines
 
 
 class FittingNet(nn.Module):
@@ -82,6 +84,71 @@ class NEPModel(nn.Module):
         self.has_q_134  = 1 if (len(lm) > 6 and lm[6] > 0) else 0
         self.num_neurons = config["neuron"]
 
+        # Spin NEP Lite protocol. The descriptor family is deliberately not a
+        # configurable string: spin_mode=1 selects Lite and spin_chiral=1 adds
+        # the chiral extension.
+        if "spin_descriptor" in config:
+            raise ValueError(
+                "spin_descriptor is not supported; use spin_mode 1 and "
+                "optional spin_chiral 1")
+        self.spin_mode = int(config.get("spin_mode", 0))
+        self.spin_chiral = int(config.get("spin_chiral", 0))
+        if self.spin_mode not in (0, 1):
+            raise ValueError("spin_mode must be 0 or 1")
+        if self.spin_chiral not in (0, 1):
+            raise ValueError("spin_chiral must be 0 or 1")
+        if self.spin_chiral and not self.spin_mode:
+            raise ValueError("spin_chiral requires spin_mode 1")
+        self.spin_descriptor_kind = (
+            "spin_nep_lite_chiral" if self.spin_chiral
+            else "spin_nep_lite")
+        self.spin_compress = int(config.get("spin_compress", 4))
+        if self.spin_compress < 1:
+            raise ValueError("spin_compress must be >= 1")
+
+        def _spin_int_list(key, default, size):
+            values = list(config.get(key, default))
+            if len(values) != size:
+                raise ValueError(f"{key} requires {size} values")
+            return [int(value) for value in values]
+
+        self.spin_n_max = _spin_int_list("spin_n_max", [3, 0], 2)
+        self.spin_basis_size = _spin_int_list(
+            "spin_basis_size", [3, 3], 2)
+        self.spin_l_max = _spin_int_list("spin_l_max", [4, 0, 0], 3)
+        spin_cutoff = list(config.get(
+            "spin_cutoff", [self.rc_radial, self.rc_angular]))
+        if len(spin_cutoff) != 2:
+            raise ValueError("spin_cutoff requires two values")
+        self.spin_cutoff = [float(value) for value in spin_cutoff]
+        if min(self.spin_cutoff) <= 0:
+            raise ValueError("spin_cutoff values must be > 0")
+
+        def _active_types(key, default=None):
+            names = config.get(key, default)
+            active = torch.ones(self.num_types, dtype=torch.bool)
+            is_set = names is not None
+            if names is not None:
+                if not names:
+                    raise ValueError(f"{key} must enable at least one type")
+                unknown = [name for name in names if name not in self.type_names]
+                if unknown:
+                    raise ValueError(f"{key} contains unknown type(s): {unknown}")
+                active.zero_()
+                for name in names:
+                    active[self.type_names.index(name)] = True
+            return active, is_set
+
+        spin_dof, self.is_spin_dof_type_set = _active_types("spin_dof_type")
+        spin_env, self.is_spin_env_type_set = _active_types(
+            "spin_env_type",
+            config.get("spin_dof_type", None),
+        )
+        if bool((spin_dof & ~spin_env).any().item()):
+            raise ValueError("spin_dof_type must be a subset of spin_env_type")
+        self.register_buffer("spin_dof_type_active", spin_dof)
+        self.register_buffer("spin_env_type_active", spin_env)
+
         # q_123 / q_233 (extra 4-body bispectrum) need L=3 moments.
         if (self.has_q_123 or self.has_q_233) and self.l_max_3b < 3:
             raise ValueError("q_123 / q_233 require l_max_3b >= 3")
@@ -128,11 +195,25 @@ class NEPModel(nn.Module):
         self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
         self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
         self.dim_angular_134  = n_ap1 if self.has_q_134  else 0
-        self.dim = (self.dim_radial + self.dim_angular_3b +
-                    self.dim_angular_4b + self.dim_angular_5b +
-                    self.dim_angular_112 +
-                    self.dim_angular_123 + self.dim_angular_233 +
-                    self.dim_angular_134)
+        self.struct_dim = (self.dim_radial + self.dim_angular_3b +
+                           self.dim_angular_4b + self.dim_angular_5b +
+                           self.dim_angular_112 +
+                           self.dim_angular_123 + self.dim_angular_233 +
+                           self.dim_angular_134)
+        self.spin_descriptor = None
+        self.spin_dim = 0
+        if self.spin_mode:
+            descriptor_cls = (
+                SpinNEPLiteChiralDescriptor if self.spin_chiral
+                else SpinNEPLiteDescriptor)
+            self.spin_descriptor = descriptor_cls(
+                spin_compress=self.spin_compress,
+                spin_l_max=self.spin_l_max[0],
+                basis_size_radial=self.spin_basis_size[0],
+                cutoff_radial=self.spin_cutoff[0],
+            )
+            self.spin_dim = self.spin_descriptor.dim
+        self.dim = self.struct_dim + self.spin_dim
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         nt = self.num_types
@@ -141,9 +222,21 @@ class NEPModel(nn.Module):
         self.c_param_3 = nn.Parameter(torch.empty(
             nt, nt, self.n_max_angular + 1, self.basis_size_angular + 1)
         ) if self.l_max_3b > 0 else None
+        self.c_param_spin = None
+        if self.spin_mode:
+            self.c_param_spin = nn.Parameter(torch.empty(
+                1, nt, nt, self.spin_compress,
+                self.spin_basis_size[0] + 1))
         nn.init.normal_(self.c_param_2, std=0.1)
         if self.c_param_3 is not None:
             nn.init.normal_(self.c_param_3, std=0.1)
+        if self.c_param_spin is not None:
+            self.c_param_spin.data.zero_()
+            for index in range(min(
+                    self.spin_compress, self.spin_basis_size[0] + 1)):
+                self.c_param_spin.data[..., index, index] = 1.0
+            self.c_param_spin.data.add_(
+                torch.randn_like(self.c_param_spin) * 0.01)
 
         # Per-type fitting networks (no per-type bias — shared b1 below)
         self.fitting_nets = nn.ModuleList([
@@ -155,6 +248,7 @@ class NEPModel(nn.Module):
 
         # q_scaler (computed from data, not learned)
         self.register_buffer("q_scaler", torch.ones(self.dim))
+        self.register_buffer("energy_baseline", torch.zeros(self.num_types))
         self.register_buffer("_c3b", torch.tensor(C3B[:self.num_lm]))
         self.register_buffer("_c4b", torch.tensor(C4B))
         self.register_buffer("_c5b", torch.tensor(C5B))
@@ -165,11 +259,19 @@ class NEPModel(nn.Module):
         diff = torch.clamp(q_max - q_min, min=1e-10)
         self.q_scaler.copy_(1.0 / diff)
 
+    @torch.no_grad()
+    def set_energy_baseline(self, baseline: torch.Tensor):
+        self.energy_baseline.copy_(baseline.to(
+            dtype=self.energy_baseline.dtype,
+            device=self.energy_baseline.device,
+        ))
+
     def compute_descriptors(self, rij_rad, rij_ang, pi_rad, pj_rad,
                             pi_ang, pj_ang, atom_types, N,
-                            backend: str = "loop"):
+                            backend: str = "loop", spins=None,
+                            rij_spin=None, pi_spin=None, pj_spin=None):
         """Compute descriptors. Returns (N, dim). See ops.resolve_backend."""
-        return ops.compute_descriptors(
+        q_struct = ops.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
             atom_types, N, self.c_param_2, self.c_param_3,
             self.rc_radial, self.rc_angular,
@@ -184,15 +286,30 @@ class NEPModel(nn.Module):
             has_q_123=self.has_q_123, has_q_233=self.has_q_233,
             has_q_134=self.has_q_134,
         )
+        if self.spin_descriptor is None:
+            return q_struct
+        if spins is None:
+            raise ValueError("spin_mode requires per-atom spins")
+        if rij_spin is None:
+            rij_spin, pi_spin, pj_spin = rij_rad, pi_rad, pj_rad
+        q_spin = self.spin_descriptor(
+            rij_spin, pi_spin, pj_spin, spins, N, atom_types,
+            self.c_param_spin, None,
+            self.spin_dof_type_active, self.spin_env_type_active,
+        )
+        return torch.cat((q_struct, q_spin), dim=-1)
 
     def forward(self, rij_rad, rij_ang, pi_rad, pj_rad,
                 pi_ang, pj_ang, atom_types, N,
-                backend: str = "loop"):
+                backend: str = "loop", spins=None,
+                rij_spin=None, pi_spin=None, pj_spin=None,
+                include_baseline: bool = True):
         """Forward pass: returns per-atom energy Ei (N,)."""
         q = self.compute_descriptors(
             rij_rad, rij_ang, pi_rad, pj_rad,
             pi_ang, pj_ang, atom_types, N,
-            backend=backend)
+            backend=backend, spins=spins,
+            rij_spin=rij_spin, pi_spin=pi_spin, pj_spin=pj_spin)
         q_scaled = q * self.q_scaler
 
         Ei = torch.zeros(N, dtype=q.dtype, device=q.device)
@@ -207,24 +324,40 @@ class NEPModel(nn.Module):
             else:
                 dummy_accum = dummy_accum + net(dummy_q).sum()
         Ei = Ei + dummy_accum * 0.0
-        return Ei - self.b1
+        Ei = Ei - self.b1
+        if include_baseline:
+            Ei = Ei + self.energy_baseline[atom_types]
+        return Ei
 
     def compute_properties(self, rij_rad, rij_ang, pi_rad, pj_rad,
                            pi_ang, pj_ang, atom_types, N,
                            struct_idx, num_structures,
                            need_forces=True, need_virial=False,
-                           backend: str = "loop"):
+                           backend: str = "loop", spins=None,
+                           need_mforce=False,
+                           rij_spin=None, pi_spin=None, pj_spin=None,
+                           create_graph: bool | None = None):
         """Compute energy, forces, virial (autograd-through-rij path)."""
         dtype = rij_rad.dtype
         device = rij_rad.device
+        derivative_graph = (
+            bool(self.training) if create_graph is None else bool(create_graph))
 
-        if need_forces:
+        if need_forces or need_virial:
             rij_rad = rij_rad.detach().requires_grad_(True)
             rij_ang = rij_ang.detach().requires_grad_(True)
+            if rij_spin is not None:
+                rij_spin = rij_spin.detach().requires_grad_(True)
+        if self.spin_descriptor is not None:
+            if spins is None:
+                raise ValueError("spin_mode requires per-atom spins")
+            if need_mforce:
+                spins = spins.detach().requires_grad_(True)
 
         Ei = self.forward(rij_rad, rij_ang, pi_rad, pj_rad,
                           pi_ang, pj_ang, atom_types, N,
-                          backend=backend)
+                          backend=backend, spins=spins,
+                          rij_spin=rij_spin, pi_spin=pi_spin, pj_spin=pj_spin)
 
         if self.zbl is not None:
             Ei = Ei + ops.compute_zbl(
@@ -241,29 +374,65 @@ class NEPModel(nn.Module):
 
         result = {"Ei": Ei, "Etot": Etot}
 
-        if need_forces:
+        if need_forces or need_virial:
+            grad_inputs = [rij_rad, rij_ang]
+            has_separate_spin_pairs = (
+                self.spin_descriptor is not None and rij_spin is not None
+                and rij_spin is not rij_rad)
+            if has_separate_spin_pairs:
+                grad_inputs.append(rij_spin)
             grads = torch.autograd.grad(
-                Ei.sum(), [rij_rad, rij_ang],
-                create_graph=self.training, allow_unused=True)
+                Ei.sum(), grad_inputs,
+                create_graph=derivative_graph,
+                retain_graph=derivative_graph or need_mforce,
+                allow_unused=True)
             g_rad = grads[0] if grads[0] is not None else torch.zeros_like(rij_rad)
             g_ang = grads[1] if grads[1] is not None else torch.zeros_like(rij_ang)
 
-            rr = rij_rad if self.training else rij_rad.detach()
-            ra = rij_ang if self.training else rij_ang.detach()
+            rr = rij_rad if derivative_graph else rij_rad.detach()
+            ra = rij_ang if derivative_graph else rij_ang.detach()
             gr = g_rad
             ga = g_ang
 
             forces, virial = ops.accumulate_forces_virial(
                 N, pi_rad, pj_rad, rr, gr,
                 pi_ang, pj_ang, ra, ga, dtype, device)
-            result["forces"] = forces
+            if has_separate_spin_pairs:
+                g_spin = (grads[2] if grads[2] is not None
+                          else torch.zeros_like(rij_spin))
+                empty_i = torch.zeros(0, dtype=torch.long, device=device)
+                empty_r = torch.zeros(0, 3, dtype=dtype, device=device)
+                f_spin, v_spin = ops.accumulate_forces_virial(
+                    N, pi_spin, pj_spin,
+                    rij_spin if derivative_graph else rij_spin.detach(), g_spin,
+                    empty_i, empty_i, empty_r, empty_r,
+                    dtype, device,
+                )
+                forces = forces + f_spin
+                virial = virial + v_spin
+            if need_forces:
+                result["forces"] = forces
             if need_virial:
                 result["virial"] = virial
+
+        if self.spin_descriptor is not None and need_mforce:
+            grad_spin = torch.autograd.grad(
+                Ei.sum(), spins,
+                create_graph=derivative_graph,
+                retain_graph=derivative_graph,
+                allow_unused=True,
+            )[0]
+            if grad_spin is None:
+                grad_spin = torch.zeros_like(spins)
+            mforces = -grad_spin
+            active = self.spin_dof_type_active[atom_types].unsqueeze(-1)
+            result["mforces"] = mforces * active.to(mforces.dtype)
 
         return result
 
     def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
-                                   backend: str = "loop"):
+                                   backend: str = "loop",
+                                   create_graph: bool | None = None):
         """Compute energy, forces, virial using precomputed basis.
 
         Uses fully analytical force computation — no create_graph=True needed.
@@ -274,6 +443,28 @@ class NEPModel(nn.Module):
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
         N = batch["N"]
+
+        # Spin training uses the autograd path so forces and magnetic forces
+        # remain differentiable through the descriptor. The structural-only
+        # model keeps the fast analytical path below unchanged.
+        if self.spin_descriptor is not None:
+            with torch.enable_grad():
+                return self.compute_properties(
+                    batch["rij_rad"], batch["rij_ang"],
+                    batch["pair_i_rad"], batch["pair_j_rad"],
+                    batch["pair_i_ang"], batch["pair_j_ang"],
+                    batch["atom_types"], N,
+                    batch["struct_idx"], batch["num_structures"],
+                    need_forces=need_forces,
+                    need_virial=need_virial,
+                    backend=backend,
+                    spins=batch.get("spins"),
+                    need_mforce=batch.get("need_mforce", False),
+                    rij_spin=batch.get("rij_spin"),
+                    pi_spin=batch.get("pair_i_spin"),
+                    pj_spin=batch.get("pair_j_spin"),
+                    create_graph=create_graph,
+                )
 
         # Descriptors from cached basis.
         # When forces needed: return intermediates (s, gn_ang) for analytical force.
@@ -435,6 +626,33 @@ class NEPModel(nn.Module):
         with open(path) as f:
             lines = [ln.strip() for ln in f if ln.strip()]
 
+        has_spin_baseline = False
+        for line in lines:
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                float(parts[0])
+                break
+            except ValueError:
+                pass
+            if parts[0] == "spin_descriptor":
+                raise ValueError(
+                    "spin_descriptor is not supported by the standalone "
+                    "Spin NEP Lite protocol")
+            if parts[0] == "spin_baseline":
+                if len(parts) != self.num_types + 1:
+                    raise ValueError(
+                        "spin_baseline must have one value per type")
+                self.energy_baseline.copy_(torch.tensor(
+                    [float(value) for value in parts[1:]],
+                    dtype=self.energy_baseline.dtype,
+                    device=self.energy_baseline.device,
+                ))
+                has_spin_baseline = True
+        if self.spin_mode and not has_spin_baseline:
+            raise ValueError("spin model is missing spin_baseline")
+
         # Count header lines (non-numeric lines at the top)
         header_lines = 0
         for ln in lines:
@@ -489,6 +707,16 @@ class NEPModel(nn.Module):
                 torch.from_numpy(np.ascontiguousarray(np.transpose(c3, (2, 3, 0, 1)))))
             idx += n_c3
 
+        if self.c_param_spin is not None:
+            n_cs = self.c_param_spin.numel()
+            cs = vals[idx:idx + n_cs].reshape(
+                1, self.spin_compress, self.spin_basis_size[0] + 1,
+                nt, nt,
+            )
+            self.c_param_spin.data.copy_(torch.from_numpy(
+                np.ascontiguousarray(np.transpose(cs, (0, 3, 4, 1, 2)))))
+            idx += n_cs
+
         # q_scaler (buffer — kept; the weights were trained against it)
         q_scaler = vals[idx:idx + dim]
         self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
@@ -514,8 +742,13 @@ class NEPModel(nn.Module):
                 "obtain them.")
         lines = []
         zbl_suffix = "_zbl" if self.zbl is not None else ""
-        lines.append(f"nep4{zbl_suffix} {self.num_types} "
+        model_tag = "nep4_spin1" if self.spin_mode else "nep4"
+        lines.append(f"{model_tag}{zbl_suffix} {self.num_types} "
                      + " ".join(self.type_names))
+        if self.spin_mode:
+            spin_lines = spin_checkpoint_lines(self)
+            lines.append(f"spin_mode 1 {len(spin_lines)}")
+            lines.extend(spin_lines)
 
         if self.zbl is not None:
             tw = self.zbl_typewise_factor
@@ -579,6 +812,11 @@ class NEPModel(nn.Module):
             c3 = self.c_param_3.detach().cpu().numpy().transpose(2, 3, 0, 1)
             for v in c3.flat:
                 lines.append(f"  {v:.10e}")
+        if self.c_param_spin is not None:
+            c_spin = self.c_param_spin.detach().cpu().numpy().transpose(
+                0, 3, 4, 1, 2)
+            for v in c_spin.flat:
+                lines.append(f"  {v:.10e}")
 
         for v in self.q_scaler.detach().cpu().numpy():
             lines.append(f"  {v:.10e}")
@@ -601,6 +839,8 @@ def gpumd_init_parameters(model: NEPModel) -> None:
     torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
     if model.c_param_3 is not None:
         torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
+    if model.c_param_spin is not None:
+        torch.nn.init.uniform_(model.c_param_spin, -1.0, 1.0)
     for net in model.fitting_nets:
         torch.nn.init.uniform_(net.w0, -1.0, 1.0)
         torch.nn.init.uniform_(net.b0, -1.0, 1.0)
@@ -654,6 +894,26 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         new_config["zbl"] = model.zbl
         if getattr(model, "zbl_typewise_factor", None) is not None:
             new_config["typewise_cutoff_zbl_factor"] = model.zbl_typewise_factor
+    if model.spin_mode:
+        new_config.update({
+            "spin_mode": 1,
+            "spin_chiral": model.spin_chiral,
+            "spin_compress": model.spin_compress,
+            "spin_n_max": list(model.spin_n_max),
+            "spin_basis_size": list(model.spin_basis_size),
+            "spin_l_max": list(model.spin_l_max),
+            "spin_cutoff": list(model.spin_cutoff),
+            "spin_dof_type": [
+                model.type_names[index]
+                for index in keep_idx
+                if bool(model.spin_dof_type_active[index].item())
+            ],
+            "spin_env_type": [
+                model.type_names[index]
+                for index in keep_idx
+                if bool(model.spin_env_type_active[index].item())
+            ],
+        })
 
     dev = model.b1.device
     dtype = model.b1.dtype
@@ -670,6 +930,7 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
     # Shared bias and q_scaler (independent of num_types)
     new_model.b1.data.copy_(model.b1.data)
     new_model.q_scaler.copy_(model.q_scaler)
+    new_model.energy_baseline.copy_(model.energy_baseline[keep_idx])
 
     # c_param: slice rows and columns for kept types
     with torch.no_grad():
@@ -677,5 +938,8 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         new_model.c_param_2.data.copy_(model.c_param_2.data[ix][:, ix])
         if new_model.c_param_3 is not None:
             new_model.c_param_3.data.copy_(model.c_param_3.data[ix][:, ix])
+        if new_model.c_param_spin is not None:
+            new_model.c_param_spin.data.copy_(
+                model.c_param_spin.data[:, ix][:, :, ix])
 
     return new_model

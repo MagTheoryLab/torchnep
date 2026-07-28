@@ -57,11 +57,11 @@ def _parse_properties_schema(comment: str):
 def _parse_frame_block(block, energy_key="energy"):
     """Parse one frame from a list of text lines (picklable for mp.Pool).
 
-    Reads extended XYZ with a ``Properties=...`` schema. Only
-    ``species:S:1``, ``pos:R:3``, and ``force:R:3`` / ``forces:R:3`` are
-    consumed — any other columns are silently ignored. Energy / virial /
-    stress / lattice come from the comment-line key=value tags; see
-    ``_parse_comment`` for strict-mode validation rules.
+    Reads extended XYZ with a ``Properties=...`` schema. In addition to the
+    structural fields, ``spin``/``spins``/``moment`` and
+    ``mforce``/``mforces``/``magnetic_force`` vector fields are recognized.
+    Energy / virial / stress / lattice come from the comment-line key=value
+    tags; see ``_parse_comment`` for strict-mode validation rules.
     """
     natoms = int(block[0].strip())
     comment = block[1].strip()
@@ -108,6 +108,23 @@ def _parse_frame_block(block, energy_key="energy"):
         _, f_col, f_w = schema[force_key]
         f_off = _numeric_offset(f_col)
         frame["forces"] = arr[:, f_off:f_off + f_w].copy()
+
+    def _read_vector(aliases, output_key):
+        field = next((name for name in aliases if name in schema), None)
+        if field is None:
+            return
+        _, col, width = schema[field]
+        if width != 3:
+            raise ValueError(
+                f"{field} must have exactly 3 components, got {width}")
+        offset = _numeric_offset(col)
+        frame[output_key] = arr[:, offset:offset + width].copy()
+
+    _read_vector(("spin", "spins", "moment", "moments"), "spins")
+    _read_vector((
+        "mforce", "mforces", "force_mag", "forces_mag",
+        "magnetic_force", "magnetic_forces",
+    ), "mforces")
     return frame
 
 
@@ -300,8 +317,46 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_f"] = float(parts[1])
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
+            elif key == "lambda_m":
+                params["lambda_m"] = float(parts[1])
             elif key == "lambda_2":
                 params["lambda_2"] = float(parts[1])
+            elif key == "spin_descriptor":
+                raise ValueError(
+                    "spin_descriptor is not part of the standalone TorchNEP "
+                    "protocol; use 'spin_mode 1' and optional 'spin_chiral 1'")
+            elif key == "spin_mode":
+                params["spin_mode"] = int(parts[1])
+            elif key == "spin_chiral":
+                params["spin_chiral"] = int(parts[1])
+            elif key == "spin_compress":
+                params["spin_compress"] = int(parts[1])
+            elif key == "spin_n_max":
+                if len(parts) != 3:
+                    raise ValueError(
+                        "spin_n_max requires two values: 2body 3body")
+                params["spin_n_max"] = [int(parts[1]), int(parts[2])]
+            elif key == "spin_basis_size":
+                if len(parts) != 3:
+                    raise ValueError(
+                        "spin_basis_size requires two values: 2body 3body")
+                params["spin_basis_size"] = [int(parts[1]), int(parts[2])]
+            elif key == "spin_l_max":
+                if len(parts) != 4:
+                    raise ValueError(
+                        "spin_l_max requires three values: 3body 4body 5body")
+                params["spin_l_max"] = [int(x) for x in parts[1:]]
+            elif key == "spin_cutoff":
+                if len(parts) != 3:
+                    raise ValueError(
+                        "spin_cutoff requires two values: radial angular")
+                params["spin_cutoff"] = [float(parts[1]), float(parts[2])]
+            elif key in ("spin_dof_type", "spin_env_type"):
+                params[key] = parts[1:]
+            elif key == "spin_type":
+                raise ValueError(
+                    "spin_type was replaced by spin_dof_type; use "
+                    "spin_dof_type and optional spin_env_type")
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
             elif key == "save_potential":
@@ -378,9 +433,32 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_e", 0.01)
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
+    params.setdefault("lambda_m", 1.0)
     params.setdefault("lambda_1", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
+
+    # Spin NEP Lite is selected by the protocol itself. ``spin_chiral`` adds
+    # the chiral tokens; there is intentionally no descriptor-name switch.
+    params.setdefault("spin_mode", 0)
+    params.setdefault("spin_chiral", 0)
+    params.setdefault("spin_compress", 4)
+    params.setdefault("spin_n_max", [3, 0])
+    params.setdefault("spin_basis_size", [3, 3])
+    params.setdefault("spin_l_max", [4, 0, 0])
+    params.setdefault(
+        "spin_cutoff",
+        [params["cutoff_radial"], params["cutoff_angular"]],
+    )
+    params.setdefault("spin_dof_type", None)
+    params.setdefault("spin_env_type", None)
+
+    if params["spin_mode"] not in (0, 1):
+        raise ValueError("spin_mode must be 0 or 1")
+    if params["spin_chiral"] not in (0, 1):
+        raise ValueError("spin_chiral must be 0 or 1")
+    if params["spin_chiral"] and not params["spin_mode"]:
+        raise ValueError("spin_chiral requires spin_mode 1")
 
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)

@@ -157,6 +157,18 @@ def format_config_summary(config: dict) -> List[str]:
         if config.get("typewise_cutoff_zbl_factor") is not None:
             zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
         lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
+    if config.get("spin_mode", 0):
+        lines.append(f"  {tag('spin_mode'):10}  spin_mode    1 (Spin NEP Lite)")
+        lines.append(f"  {tag('spin_chiral'):10}  spin_chiral "
+                     f"{config['spin_chiral']}")
+        lines.append(f"  {tag('spin_compress'):10}  spin_compress "
+                     f"{config['spin_compress']}")
+        lines.append(f"  {tag('spin_basis_size'):10}  spin_basis_size "
+                     f"{' '.join(str(x) for x in config['spin_basis_size'])}")
+        lines.append(f"  {tag('spin_l_max'):10}  spin_l_max  "
+                     f"{' '.join(str(x) for x in config['spin_l_max'])}")
+        lines.append(f"  {tag('spin_cutoff'):10}  spin_cutoff "
+                     f"{' '.join(str(x) for x in config['spin_cutoff'])}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
@@ -179,6 +191,9 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
     lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
+    if config.get("spin_mode", 0):
+        lines.append(f"  {tag('lambda_m'):10}  lambda_m     "
+                     f"{config['lambda_m']}")
     if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
         lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
         lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
@@ -270,7 +285,19 @@ class GPUDataStore:
 
         n_rad = np.array([len(s["pair_i_rad"]) for s in structures], dtype=np.int64)
         n_ang = np.array([len(s["pair_i_ang"]) for s in structures], dtype=np.int64)
+        n_spin = np.array(
+            [len(s.get("pair_i_spin", s["pair_i_rad"])) for s in structures],
+            dtype=np.int64,
+        )
         self.natoms = [int(s["natoms"]) for s in structures]
+        self.type_counts = [
+            np.bincount(
+                s["atom_types"],
+                minlength=(len(config["type_names"]) if config is not None
+                           else int(np.max(s["atom_types"])) + 1),
+            )
+            for s in structures
+        ]
 
         # preprocess_structures already returns arrays with the right dtype
         # (int64 for indices, float32 for rij). Skip the defensive astype —
@@ -282,6 +309,12 @@ class GPUDataStore:
         pi_a_cat = np.concatenate([s["pair_i_ang"]  for s in structures])
         pj_a_cat = np.concatenate([s["pair_j_ang"]  for s in structures])
         rij_a_cat = np.concatenate([s["rij_ang"]    for s in structures])
+        pi_s_cat = np.concatenate([
+            s.get("pair_i_spin", s["pair_i_rad"]) for s in structures])
+        pj_s_cat = np.concatenate([
+            s.get("pair_j_spin", s["pair_j_rad"]) for s in structures])
+        rij_s_cat = np.concatenate([
+            s.get("rij_spin", s["rij_rad"]) for s in structures])
 
         at_all   = torch.from_numpy(at_cat).to(device=device, non_blocking=True)
 
@@ -293,12 +326,18 @@ class GPUDataStore:
         pj_a_all = torch.from_numpy(pj_a_cat).to(device=device, non_blocking=True)
         rij_a_all = torch.from_numpy(rij_a_cat).to(device=device, dtype=dtype,
                                                     non_blocking=True)
+        pi_s_all = torch.from_numpy(pi_s_cat).to(device=device, non_blocking=True)
+        pj_s_all = torch.from_numpy(pj_s_cat).to(device=device, non_blocking=True)
+        rij_s_all = torch.from_numpy(rij_s_cat).to(
+            device=device, dtype=dtype, non_blocking=True)
 
         self.energy = [float(s["energy"]) if "energy" in s else 0.0
                        for s in structures]
         self.has_energy_flag = ["energy" in s for s in structures]
         self.has_forces_flag = ["forces" in s for s in structures]
         self.has_virial_flag = ["virial" in s for s in structures]
+        self.has_spins_flag = ["spins" in s for s in structures]
+        self.has_mforces_flag = ["mforces" in s for s in structures]
 
         f_parts = []
         for s in structures:
@@ -310,6 +349,22 @@ class GPUDataStore:
                                                else np.float64, copy=False)
         f_all = torch.from_numpy(f_cat).to(device=device, dtype=dtype,
                                             non_blocking=True)
+
+        spin_parts = []
+        mforce_parts = []
+        for s in structures:
+            natoms = s["natoms"]
+            spin_parts.append(np.asarray(
+                s.get("spins", np.zeros((natoms, 3)))).reshape(-1, 3))
+            mforce_parts.append(np.asarray(
+                s.get("mforces", np.zeros((natoms, 3)))).reshape(-1, 3))
+        np_dtype = np.float32 if dtype == torch.float32 else np.float64
+        spins_all = torch.from_numpy(
+            np.concatenate(spin_parts).astype(np_dtype, copy=False)
+        ).to(device=device, dtype=dtype, non_blocking=True)
+        mforces_all = torch.from_numpy(
+            np.concatenate(mforce_parts).astype(np_dtype, copy=False)
+        ).to(device=device, dtype=dtype, non_blocking=True)
 
         v_parts = []
         for s in structures:
@@ -390,6 +445,7 @@ class GPUDataStore:
 
         nr_list = n_rad.tolist()
         na_list = n_ang.tolist()
+        ns_list = n_spin.tolist()
         nat_list = [int(x) for x in self.natoms]
 
         self.atom_types = list(torch.split(at_all, nat_list))
@@ -399,7 +455,12 @@ class GPUDataStore:
         self.pi_ang = list(torch.split(pi_a_all, na_list))
         self.pj_ang = list(torch.split(pj_a_all, na_list))
         self.rij_ang = list(torch.split(rij_a_all, na_list))
+        self.pi_spin = list(torch.split(pi_s_all, ns_list))
+        self.pj_spin = list(torch.split(pj_s_all, ns_list))
+        self.rij_spin = list(torch.split(rij_s_all, ns_list))
         self.forces = list(torch.split(f_all, nat_list))
+        self.spins = list(torch.split(spins_all, nat_list))
+        self.mforces = list(torch.split(mforces_all, nat_list))
         self.virial = list(torch.unbind(v_all, dim=0))
 
         if config is not None:
@@ -414,8 +475,10 @@ class GPUDataStore:
         self.n_energy = sum(self.has_energy_flag)
         self.n_forces = sum(self.has_forces_flag)
         self.n_virial = sum(self.has_virial_flag)
+        self.n_mforces = sum(self.has_mforces_flag)
         self.has_forces = self.n_forces > 0
         self.has_virial = self.n_virial > 0
+        self.has_mforces = self.n_mforces > 0
 
     def collate(self, indices: List[int]) -> Dict:
         """Fast GPU-side batch collation. No CPU->GPU transfer."""
@@ -444,6 +507,11 @@ class GPUDataStore:
         pj_a = torch.cat([self.pj_ang[i] + offsets[k]
                           for k, i in enumerate(indices)])
         rij_a = torch.cat([self.rij_ang[i] for i in indices])
+        pi_s = torch.cat([self.pi_spin[i] + offsets[k]
+                          for k, i in enumerate(indices)])
+        pj_s = torch.cat([self.pj_spin[i] + offsets[k]
+                          for k, i in enumerate(indices)])
+        rij_s = torch.cat([self.rij_spin[i] for i in indices])
 
         energy = torch.tensor([self.energy[i] for i in indices],
                               dtype=self.dtype, device=self.device)
@@ -458,7 +526,9 @@ class GPUDataStore:
             "atom_types": atom_types, "struct_idx": struct_idx,
             "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
             "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
+            "pair_i_spin": pi_s, "pair_j_spin": pj_s, "rij_spin": rij_s,
             "energy": energy, "natoms": natoms, "volumes": volumes,
+            "spins": torch.cat([self.spins[i] for i in indices]),
         }
 
         batch["energy_mask"] = torch.tensor(
@@ -478,6 +548,14 @@ class GPUDataStore:
             [self.has_virial_flag[i] for i in indices],
             dtype=torch.bool, device=self.device)
 
+        batch["mforces"] = torch.cat([self.mforces[i] for i in indices])
+        mforce_flags = [self.has_mforces_flag[i] for i in indices]
+        batch["mforce_mask"] = torch.cat([
+            torch.full((self.natoms[indices[k]],), mforce_flags[k],
+                       dtype=torch.bool, device=self.device)
+            for k in range(B)
+        ])
+
         if self.has_cached_basis:
             batch["fk_rad"] = torch.cat([self.fk_rad[i] for i in indices])
             batch["fkp_rad"] = torch.cat([self.fkp_rad[i] for i in indices])
@@ -496,7 +574,7 @@ class GPUDataStore:
 
 def _preprocess_one_frame(args):
     """Worker: build neighbor lists for a single frame. Picklable for mp.Pool."""
-    frame, rc_rad, rc_ang, max_rc, type_names, dtype = args
+    frame, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype = args
     positions = frame["positions"].astype(dtype)
     cell = frame["cell"].astype(dtype)
     atom_types = np.array([type_names.index(s) for s in frame["species"]],
@@ -505,6 +583,7 @@ def _preprocess_one_frame(args):
     dij = np.linalg.norm(rij, axis=1)
     rad_mask = dij < rc_rad
     ang_mask = dij < rc_ang
+    spin_mask = dij < rc_spin
     s = {
         "natoms": frame["natoms"],
         "atom_types": atom_types,
@@ -513,6 +592,8 @@ def _preprocess_one_frame(args):
         "rij_rad": rij[rad_mask].astype(dtype),
         "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
         "rij_ang": rij[ang_mask].astype(dtype),
+        "pair_i_spin": pair_i[spin_mask], "pair_j_spin": pair_j[spin_mask],
+        "rij_spin": rij[spin_mask].astype(dtype),
     }
     if "energy" in frame:
         s["energy"] = frame["energy"]
@@ -520,6 +601,10 @@ def _preprocess_one_frame(args):
         s["forces"] = frame["forces"].astype(dtype)
     if "virial" in frame:
         s["virial"] = frame["virial"].astype(dtype)
+    if "spins" in frame:
+        s["spins"] = frame["spins"].astype(dtype)
+    if "mforces" in frame:
+        s["mforces"] = frame["mforces"].astype(dtype)
     return s
 
 
@@ -543,8 +628,11 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
     """
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
+    rc_spin = (
+        float(config.get("spin_cutoff", [rc_rad, rc_ang])[0])
+        if config.get("spin_mode", 0) else rc_rad)
     type_names = config["type_names"]
-    max_rc = max(rc_rad, rc_ang)
+    max_rc = max(rc_rad, rc_ang, rc_spin)
 
     if n_workers is None:
         cpu_total = os.cpu_count() or 1
@@ -553,7 +641,8 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
         n_workers = int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
 
     if n_workers <= 1 or len(frames) < 64:
-        return [_preprocess_one_frame((f, rc_rad, rc_ang, max_rc, type_names, dtype))
+        return [_preprocess_one_frame((
+            f, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype))
                 for f in frames]
 
     import multiprocessing as mp
@@ -563,7 +652,10 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
     except ValueError:
         ctx = mp.get_context("spawn")
 
-    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
+    args = [
+        (f, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype)
+        for f in frames
+    ]
     chunksize = max(1, len(frames) // (n_workers * 4))
     with ctx.Pool(n_workers) as pool:
         return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
@@ -581,6 +673,21 @@ def compute_max_neighbors(structures):
             counts = np.bincount(s["pair_i_ang"], minlength=n)
             max_ang = max(max_ang, int(counts.max()))
     return max_rad, max_ang
+
+
+def fit_energy_baseline(structures, num_types):
+    """Least-squares per-type energy baseline from labelled frame totals."""
+    labelled = [structure for structure in structures if "energy" in structure]
+    if not labelled:
+        return np.zeros(num_types, dtype=np.float64)
+    counts = np.stack([
+        np.bincount(structure["atom_types"], minlength=num_types)
+        for structure in labelled
+    ]).astype(np.float64)
+    totals = np.asarray(
+        [structure["energy"] for structure in labelled], dtype=np.float64)
+    baseline, *_ = np.linalg.lstsq(counts, totals, rcond=None)
+    return baseline
 
 
 # The 6 unique components of the symmetric virial, picked from the row-major
@@ -621,8 +728,11 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
         c2 = torch.ones_like(model.c_param_2)
         c3 = (torch.ones_like(model.c_param_3)
               if model.c_param_3 is not None else None)
+        c_spin = (torch.ones_like(model.c_param_spin)
+                  if model.c_param_spin is not None else None)
     else:
         c2, c3 = model.c_param_2, model.c_param_3
+        c_spin = model.c_param_spin
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -643,6 +753,14 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
             has_q_123=model.has_q_123, has_q_233=model.has_q_233,
             has_q_134=model.has_q_134,
         )
+        if model.spin_descriptor is not None:
+            q_spin = model.spin_descriptor(
+                batch["rij_spin"], batch["pair_i_spin"],
+                batch["pair_j_spin"], batch["spins"], batch["N"],
+                batch["atom_types"], c_spin, None,
+                model.spin_dof_type_active, model.spin_env_type_active,
+            )
+            q = torch.cat((q, q_spin), dim=-1)
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
 
@@ -888,7 +1006,10 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         batch["atom_types"], batch["N"],
                         batch["struct_idx"], batch["num_structures"],
                         need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
+                        backend=backend, spins=batch.get("spins"),
+                        rij_spin=batch.get("rij_spin"),
+                        pi_spin=batch.get("pair_i_spin"),
+                        pj_spin=batch.get("pair_j_spin"))
                 else:
                     result = compute_props_cached(
                         batch, need_forces=has_forces,
@@ -1232,6 +1353,7 @@ def train_nep(
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
     pref_v             = config["lambda_v"]
+    pref_m             = config["lambda_m"]
     # Optional stage-2 block
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")  # may be None -> auto 0.5*num_epochs
@@ -1280,6 +1402,10 @@ def train_nep(
     _log("Data")
     _log("----")
     frames = read_xyz(data_file, energy_key=energy_key)
+    if config.get("spin_mode", 0) and any(
+            "spins" not in frame for frame in frames):
+        raise ValueError(
+            "spin_mode 1 requires a spin/moment vector for every atom")
     _log(f"  read {len(frames)} structures from {data_file} "
          f"(energy label: {energy_key})")
 
@@ -1349,6 +1475,9 @@ def train_nep(
     _log(f"  built neighbor lists in {time.time() - t0:.1f}s")
 
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
+    energy_baseline_values = (
+        fit_energy_baseline(structures, config["num_types"])
+        if config.get("spin_mode", 0) else None)
 
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
@@ -1357,7 +1486,9 @@ def train_nep(
         torch.cuda.synchronize()
     _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
     _log(f"  coverage: {data_store.n_energy} E / "
-         f"{data_store.n_forces} F / {data_store.n_virial} V")
+         f"{data_store.n_forces} F / {data_store.n_virial} V"
+         + (f" / {data_store.n_mforces} M"
+            if config.get("spin_mode", 0) else ""))
 
     valid_store = None
     if valid_frames is not None:
@@ -1370,6 +1501,12 @@ def train_nep(
         max_NN_rad = max(max_NN_rad, vNN_rad)
         max_NN_ang = max(max_NN_ang, vNN_ang)
         valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
+        if (config.get("spin_mode", 0)
+                and pref_m > 0 and valid_store.has_mforces):
+            raise NotImplementedError(
+                "validation-set magnetic-force loss is not implemented yet; "
+                "remove mforce labels from the validation set or disable "
+                "validation for this spin run")
         del structures_v, valid_frames
         _log(f"  validation set ready in {time.time() - t0:.1f}s — "
              f"coverage: {valid_store.n_energy} E / "
@@ -1390,6 +1527,9 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
+    if energy_baseline_values is not None:
+        model.set_energy_baseline(torch.as_tensor(
+            energy_baseline_values, dtype=dtype, device=dev))
 
     # use_gpumd_qscaler: reproduce GPUMD's init for fresh training. GPUMD (SNES
     # mu init, snes.cu initialize_mu_and_sigma) draws EVERY parameter
@@ -1453,9 +1593,14 @@ def train_nep(
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1={model.b1.item():.4f}")
     else:
-        mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
-                            for i in range(data_store.n)
-                            if data_store.has_energy_flag[i]])
+        mean_epa = np.mean([
+            (data_store.energy[i] - float(
+                data_store.type_counts[i] @
+                model.energy_baseline.detach().cpu().numpy()))
+            / data_store.natoms[i]
+            for i in range(data_store.n)
+            if data_store.has_energy_flag[i]
+        ])
         with torch.no_grad():
             model.b1.fill_(-mean_epa)
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
@@ -1471,7 +1616,7 @@ def train_nep(
         ok, msg = _compile_check(dev)
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
-        elif use_autograd_forces:
+        elif use_autograd_forces or model.spin_descriptor is not None:
             compile_msg = ("  torch.compile: skipped — incompatible with "
                            "autograd double-backward forces")
         else:
@@ -1488,7 +1633,10 @@ def train_nep(
     backend = _resolve_backend(orig_backend, num_types=model.num_types)
     train_backend = _resolve_backend(
         orig_backend, num_types=model.num_types, use_compile=compile_on)
-    force_str = "autograd" if use_autograd_forces else "analytical"
+    force_str = (
+        "autograd" if (use_autograd_forces
+                       or model.spin_descriptor is not None)
+        else "analytical")
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
              f"forces: {force_str}")
@@ -1559,6 +1707,7 @@ def train_nep(
     # old-scale best_loss would keep the new run from ever saving a new best).
     cur_loss_weights = {
         "lambda_e": pref_e, "lambda_f": pref_f, "lambda_v": pref_v,
+        "lambda_m": pref_m,
         "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
         "stage2_pref_v": stage2_pref_v,
     }
@@ -1623,6 +1772,8 @@ def train_nep(
     if write_header:
         hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                "rmse_v(eV/atom)  rmse_stress(GPa)")
+        if raw_model.spin_descriptor is not None:
+            hdr += "  rmse_m(eV/muB)"
         if valid_store is not None:
             # GPUMD loss.out convention: train RMSEs, then test RMSEs.
             # (The loss column is then the VALIDATION loss — it is what
@@ -1680,9 +1831,9 @@ def train_nep(
             g.manual_seed(run_seed + epoch)
             perm = torch.randperm(n_structs, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = 0.0
+            sum_le = sum_lf = sum_lv = sum_lm = 0.0
             sum_ls = 0.0                     # (eV/A**3)**2 accumulator for stress
-            sum_e_structs = sum_f_atoms = sum_v_structs = 0
+            sum_e_structs = sum_f_atoms = sum_v_structs = sum_m_atoms = 0
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
 
@@ -1762,10 +1913,14 @@ def train_nep(
             # above) — and so pref_v=0 really skips virial compute/backward.
             has_forces = data_store.has_forces and cur_pref_f > 0
             has_virial = data_store.has_virial and cur_pref_v > 0
+            has_mforces = (
+                raw_model.spin_descriptor is not None
+                and data_store.has_mforces and pref_m > 0)
 
             for start in range(0, n_structs, batch_size):
                 idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
+                batch["need_mforce"] = has_mforces
 
                 if use_autograd_forces:
                     result = compute_props(
@@ -1775,7 +1930,11 @@ def train_nep(
                         batch["atom_types"], batch["N"],
                         batch["struct_idx"], batch["num_structures"],
                         need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
+                        backend=backend, spins=batch.get("spins"),
+                        need_mforce=has_mforces,
+                        rij_spin=batch.get("rij_spin"),
+                        pi_spin=batch.get("pair_i_spin"),
+                        pj_spin=batch.get("pair_j_spin"))
                 else:
                     result = compute_props_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
@@ -1830,6 +1989,20 @@ def train_nep(
                             s_diff = v_diff * scale
                             sum_ls += (s_diff ** 2).mean().item() * v_mask.sum().item()
 
+                if has_mforces:
+                    m_mask = (
+                        batch["mforce_mask"]
+                        & raw_model.spin_dof_type_active[
+                            batch["atom_types"]])
+                    if m_mask.any():
+                        m_pred = result["mforces"][m_mask]
+                        m_ref = batch["mforces"][m_mask]
+                        loss_m = _loss_fn(m_pred, m_ref)
+                        loss = loss + pref_m * loss_m
+                        sum_lm += (
+                            (m_pred - m_ref) ** 2
+                        ).mean().item() * m_mask.sum().item()
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
@@ -1875,6 +2048,8 @@ def train_nep(
                 sum_e_structs += batch["energy_mask"].sum().item()
                 sum_f_atoms += batch["force_mask"].sum().item()
                 sum_v_structs += batch["virial_mask"].sum().item()
+                if has_mforces:
+                    sum_m_atoms += int(m_mask.sum().item())
                 max_gn = max(max_gn, gn)
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
@@ -1894,13 +2069,15 @@ def train_nep(
             mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
+            mse_m = sum_lm / max(sum_m_atoms, 1) if sum_lm > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
-                        + cur_pref_v * mse_v)
+                        + cur_pref_v * mse_v + pref_m * mse_m)
             # Output units: eV/atom (E, V), eV/A (F), GPa (stress).
             rmse_e = np.sqrt(mse_e)
             rmse_f = np.sqrt(mse_f)
             rmse_v = np.sqrt(mse_v)
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
+            rmse_m = np.sqrt(mse_m)
 
             # Validation: frozen-weight full pass every epoch (b1 already
             # train-fitted by the analytical update above; never re-fitted on
@@ -1949,6 +2126,8 @@ def train_nep(
 
             row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
                    f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+            if raw_model.spin_descriptor is not None:
+                row += f" {rmse_m:.6f}"
             if valid_loss is not None:
                 row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
                         f"{v_rmse_s:.4f}")
@@ -1959,6 +2138,7 @@ def train_nep(
             cur_lr = optimizer.param_groups[0]['lr']
             v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                      if has_virial else "")
+            m_str = (f" | M {rmse_m:.5f} eV/muB" if has_mforces else "")
             valid_str = ""
             if valid_loss is not None:
                 valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
@@ -1966,7 +2146,7 @@ def train_nep(
                                 if has_virial else ""))
             line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                    f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
+                    f"{v_str}{m_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
@@ -1998,7 +2178,8 @@ def train_nep(
                 if valid_loss < best_valid_loss:
                     best_valid_loss = valid_loss
                     _save_best()
-            elif epoch < true_eval_start:
+            elif (epoch < true_eval_start
+                  or raw_model.spin_descriptor is not None):
                 if new_min:
                     _save_best()
             elif new_min or epoch == num_epochs or stop_now:

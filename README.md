@@ -54,13 +54,17 @@ enforced, and violations raise on load.
 
 ### Per-atom columns
 
-The `Properties=...` schema declares column layout. TorchNEP reads only
-three fields and silently ignores everything else (e.g. `Z:I:1`):
+The `Properties=...` schema declares column layout. TorchNEP reads these
+fields and silently ignores everything else (e.g. `Z:I:1`):
 
 - `species:S:1` — chemical symbol (case-sensitive; must match the
   `type` list in `nep.in`).
 - `pos:R:3` — Cartesian position in Å.
 - `force:R:3` or `forces:R:3` — reference force in eV/Å (optional).
+- `spin:R:3`, `spins:R:3`, or `moment:R:3` — per-atom magnetic moment
+  (required when `spin_mode 1`).
+- `mforce:R:3`, `mforces:R:3`, or `magnetic_force:R:3` — reference
+  magnetic force in eV/μB (optional).
 
 ---
 
@@ -79,6 +83,30 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
 
+### Spin NEP Lite
+
+`spin_mode 1` enables the Spin NEP Lite descriptor. `spin_chiral 1` adds
+the chiral extension; there is intentionally no `spin_descriptor` switch.
+
+```text
+spin_mode 1
+spin_chiral 1
+spin_compress 4
+spin_n_max 3 0
+spin_basis_size 3 3
+spin_l_max 4 0 0
+spin_cutoff 6 5
+spin_dof_type Fe
+spin_env_type Fe Ge
+lambda_m 1.0
+```
+
+`spin_dof_type` selects atoms whose magnetic force is trained and returned.
+`spin_env_type` selects atoms allowed in their magnetic environment and must
+include every `spin_dof_type`. Spin training currently uses `train_nep`;
+`train_nep_sharded` and `compute_tiled` reject spin models explicitly.
+Exported potentials use a counted `nep4_spin1` metadata block in `nep.txt`.
+
 ### Training hyperparameters
 
 | Parameter | Default | Description |
@@ -90,6 +118,7 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `lambda_e` | `0.01` | Energy loss weight |
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
+| `lambda_m` | `1.0` | Magnetic-force loss weight (Spin NEP Lite) |
 | `lambda_1` | `0.0` | L1 regularisation weight |
 | `lambda_2` | `0.0` | L2 regularisation weight |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
@@ -148,6 +177,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa); with a validation set, four more columns (test RMSE_E/F/V/stress) and the loss column is the validation loss |
 | `energy_train.out` | Per-frame predicted vs reference E/atom (eV/atom) |
 | `force_train.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
+| `mforce_train.out` | Per-atom predicted vs reference magnetic force (eV/μB; spin models only) |
 | `virial_train.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
 | `stress_train.out` | Per-frame predicted vs reference stress (GPa) |
 | `*_test.out` | Same four files for the validation set (GPUMD `test.xyz` naming/format); only written when `valid_file`/`valid_ratio` is used |

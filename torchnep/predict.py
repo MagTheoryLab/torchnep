@@ -152,6 +152,9 @@ def predict_dataset(
     # 1) Read xyz
     t0 = time.time()
     frames = read_xyz(xyz_file, energy_key=energy_key)
+    if calc.spin_mode and any("spins" not in frame for frame in frames):
+        raise ValueError(
+            "spin model requires a spin/moment vector for every atom")
     n_struct = len(frames)
     _log(f"  read_xyz:    {time.time() - t0:5.1f}s   ({n_struct} frames, "
          f"energy label: {energy_key})")
@@ -164,6 +167,8 @@ def predict_dataset(
         "cutoff_radial": rc_rad,
         "cutoff_angular": rc_ang,
         "type_names": calc.type_names,
+        "spin_mode": calc.spin_mode,
+        "spin_cutoff": calc.spin_cutoff,
     }
     structures = preprocess_structures(frames, pp_config, np_dtype)
     del frames
@@ -178,9 +183,12 @@ def predict_dataset(
                           dtype=np.int64)
     nang_arr = np.asarray([len(s["pair_i_ang"]) for s in structures],
                           dtype=np.int64)
+    nspin_arr = np.asarray([len(s["pair_i_spin"]) for s in structures],
+                           dtype=np.int64)
     nat_cum = np.concatenate([[0], np.cumsum(natoms_arr)])
     nrad_cum = np.concatenate([[0], np.cumsum(nrad_arr)])
     nang_cum = np.concatenate([[0], np.cumsum(nang_arr)])
+    nspin_cum = np.concatenate([[0], np.cumsum(nspin_arr)])
     N_atoms_total = int(nat_cum[-1])
 
     # Pair indices are global (atom positions in the concatenation), so a
@@ -196,6 +204,15 @@ def predict_dataset(
     all_pj_a = np.concatenate(
         [s["pair_j_ang"] + nat_cum[i] for i, s in enumerate(structures)])
     all_rij_a = np.concatenate([s["rij_ang"] for s in structures])
+    all_pi_s = np.concatenate(
+        [s["pair_i_spin"] + nat_cum[i] for i, s in enumerate(structures)])
+    all_pj_s = np.concatenate(
+        [s["pair_j_spin"] + nat_cum[i] for i, s in enumerate(structures)])
+    all_rij_s = np.concatenate([s["rij_spin"] for s in structures])
+    all_spins = np.concatenate([
+        s.get("spins", np.zeros((s["natoms"], 3), dtype=np_dtype))
+        for s in structures
+    ])
 
     energy_ref = np.array(
         [s["energy"] if s.get("energy") is not None else np.nan
@@ -210,6 +227,18 @@ def predict_dataset(
             if f is not None:
                 forces_ref[nat_cum[i]:nat_cum[i + 1]] = \
                     np.asarray(f).reshape(-1, 3)
+
+    has_mforces_global = any(
+        s.get("mforces") is not None for s in structures)
+    mforces_ref = None
+    if calc.spin_mode:
+        mforces_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        for i, s in enumerate(structures):
+            magnetic_force = s.get("mforces")
+            if magnetic_force is not None:
+                mforces_ref[nat_cum[i]:nat_cum[i + 1]] = np.asarray(
+                    magnetic_force).reshape(-1, 3)
 
     has_virial_global = any(s.get("virial") is not None for s in structures)
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
@@ -247,17 +276,26 @@ def predict_dataset(
     pi_a_gpu  = torch.from_numpy(all_pi_a).to(device=device)
     pj_a_gpu  = torch.from_numpy(all_pj_a).to(device=device)
     rij_a_gpu = torch.from_numpy(all_rij_a).to(device=device, dtype=dt)
+    pi_s_gpu = torch.from_numpy(all_pi_s).to(device=device)
+    pj_s_gpu = torch.from_numpy(all_pj_s).to(device=device)
+    rij_s_gpu = torch.from_numpy(all_rij_s).to(device=device, dtype=dt)
+    spins_gpu = torch.from_numpy(all_spins).to(device=device, dtype=dt)
     natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     _log(f"  upload:      {time.time() - t0:5.1f}s")
-    del all_at, all_pi_r, all_pj_r, all_rij_r, all_pi_a, all_pj_a, all_rij_a
+    del (all_at, all_pi_r, all_pj_r, all_rij_r,
+         all_pi_a, all_pj_a, all_rij_a,
+         all_pi_s, all_pj_s, all_rij_s, all_spins)
 
     # 4) Batched compute loop ------------------------------------------------
     e_pred_arr = np.empty(n_struct, dtype=np.float64)
     f_pred_arr = (np.empty((N_atoms_total, 3), dtype=np.float64)
                   if has_forces_global else None)
     v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
+    m_pred_arr = (
+        np.empty((N_atoms_total, 3), dtype=np.float64)
+        if calc.spin_mode else None)
 
     # Descriptor buffer (only allocated when requested).
     #   mode 1 -> (n_struct, dim)         per-frame averaged scaled descriptor
@@ -276,6 +314,7 @@ def predict_dataset(
             a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
             r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
             g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
+            s_lo, s_hi = int(nspin_cum[start]), int(nspin_cum[end])
             N = a_hi - a_lo
 
             atom_types = at_gpu[a_lo:a_hi]
@@ -285,6 +324,9 @@ def predict_dataset(
             pi_a = pi_a_gpu[g_lo:g_hi] - a_lo
             pj_a = pj_a_gpu[g_lo:g_hi] - a_lo
             rij_a = rij_a_gpu[g_lo:g_hi]
+            pi_s = pi_s_gpu[s_lo:s_hi] - a_lo
+            pj_s = pj_s_gpu[s_lo:s_hi] - a_lo
+            rij_s = rij_s_gpu[s_lo:s_hi]
 
             struct_idx = torch.repeat_interleave(
                 torch.arange(B, device=device, dtype=torch.long),
@@ -318,6 +360,9 @@ def predict_dataset(
                 "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
                 "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
                 "blm": blm,
+                "pair_i_spin": pi_s, "pair_j_spin": pj_s,
+                "rij_spin": rij_s,
+                "spins": spins_gpu[a_lo:a_hi],
             }
             result = calc.compute_batch(batch, backend=backend)
 
@@ -336,6 +381,8 @@ def predict_dataset(
 
             if f_pred_arr is not None:
                 f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
+            if m_pred_arr is not None:
+                m_pred_arr[a_lo:a_hi] = result["mforces"].cpu().numpy()
 
             if output_descriptor:
                 # ``compute_batch`` already returns ``q * q_scaler``.
@@ -367,6 +414,12 @@ def predict_dataset(
         f_pred_arr = np.zeros((N_atoms_total, 3), dtype=np.float64)
     np.savetxt(os.path.join(output_dir, "force_train.out"),
                np.column_stack([f_pred_arr, forces_ref]), fmt="%.10g")
+    if m_pred_arr is not None:
+        np.savetxt(
+            os.path.join(output_dir, "mforce_train.out"),
+            np.column_stack([m_pred_arr, mforces_ref]),
+            fmt="%.10g",
+        )
 
     np.savetxt(os.path.join(output_dir, "virial_train.out"),
                np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
@@ -432,6 +485,9 @@ def predict_from_store(model, data_store, output_dir: str,
 
     e_pred = np.empty(n_struct, dtype=np.float64)
     f_pred = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+    m_pred = (
+        np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+        if model.spin_descriptor is not None else None)
     v_pred = np.empty((n_struct, 6), dtype=np.float64)
 
     was_training = model.training
@@ -443,6 +499,7 @@ def predict_from_store(model, data_store, output_dir: str,
             idx = list(range(start, end))
             B = end - start
             batch = data_store.collate(idx)
+            batch["need_mforce"] = model.spin_descriptor is not None
             r = model.compute_properties_cached(
                 batch, need_forces=True, need_virial=True, backend=backend)
 
@@ -458,6 +515,8 @@ def predict_from_store(model, data_store, output_dir: str,
 
             a_lo = int(nat_cum[start]); a_hi = int(nat_cum[end])
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
+            if m_pred is not None:
+                m_pred[a_lo:a_hi] = r["mforces"].cpu().numpy()
     if was_training:
         model.train()
     if dev.type == "cuda":
@@ -497,6 +556,17 @@ def predict_from_store(model, data_store, output_dir: str,
                np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
                np.column_stack([f_pred, forces_ref]), fmt="%.10g")
+    if m_pred is not None:
+        mforces_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        for i in range(n_struct):
+            if data_store.has_mforces_flag[i]:
+                a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
+                mforces_ref[a_lo:a_hi] = (
+                    data_store.mforces[i].cpu().numpy())
+        np.savetxt(
+            os.path.join(output_dir, f"mforce_{suffix}.out"),
+            np.column_stack([m_pred, mforces_ref]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 

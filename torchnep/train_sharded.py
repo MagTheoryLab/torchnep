@@ -369,6 +369,11 @@ def train_nep_sharded(
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
+    if orig_config.get("spin_mode", 0):
+        raise NotImplementedError(
+            "Spin NEP Lite training is currently supported by train_nep "
+            "only; train_nep_sharded does not yet implement distributed "
+            "magnetic-force reduction")
     if is_main:
         for line in format_config_summary(orig_config):
             _log(line)
