@@ -231,14 +231,19 @@ def predict_dataset(
     has_mforces_global = any(
         s.get("mforces") is not None for s in structures)
     mforces_ref = None
+    tau_ref = None
     if calc.spin_mode:
         mforces_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        tau_ref = np.full(
             (N_atoms_total, 3), np.nan, dtype=np.float64)
         for i, s in enumerate(structures):
             magnetic_force = s.get("mforces")
             if magnetic_force is not None:
-                mforces_ref[nat_cum[i]:nat_cum[i + 1]] = np.asarray(
+                a_lo, a_hi = nat_cum[i], nat_cum[i + 1]
+                mforces_ref[a_lo:a_hi] = np.asarray(
                     magnetic_force).reshape(-1, 3)
+                tau_ref[a_lo:a_hi] = np.asarray(s["tau"]).reshape(-1, 3)
 
     has_virial_global = any(s.get("virial") is not None for s in structures)
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
@@ -294,6 +299,9 @@ def predict_dataset(
                   if has_forces_global else None)
     v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
     m_pred_arr = (
+        np.empty((N_atoms_total, 3), dtype=np.float64)
+        if calc.spin_mode else None)
+    t_pred_arr = (
         np.empty((N_atoms_total, 3), dtype=np.float64)
         if calc.spin_mode else None)
 
@@ -383,6 +391,7 @@ def predict_dataset(
                 f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
             if m_pred_arr is not None:
                 m_pred_arr[a_lo:a_hi] = result["mforces"].cpu().numpy()
+                t_pred_arr[a_lo:a_hi] = result["tau"].cpu().numpy()
 
             if output_descriptor:
                 # ``compute_batch`` already returns ``q * q_scaler``.
@@ -418,6 +427,11 @@ def predict_dataset(
         np.savetxt(
             os.path.join(output_dir, "mforce_train.out"),
             np.column_stack([m_pred_arr, mforces_ref]),
+            fmt="%.10g",
+        )
+        np.savetxt(
+            os.path.join(output_dir, "tau_train.out"),
+            np.column_stack([t_pred_arr, tau_ref]),
             fmt="%.10g",
         )
 
@@ -466,6 +480,8 @@ def predict_from_store(model, data_store, output_dir: str,
       energy_train.out  — per-frame (pred, ref) in eV/atom
       force_train.out   — per-atom (fx,fy,fz pred, ref) in eV/A
       virial_train.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
+      mforce_train.out  — spin models: per-atom magnetic force (pred, ref)
+      tau_train.out     — spin models: per-atom spin x mforce (pred, ref)
 
     ``suffix`` picks the file-name tail: "train" (default) for the training
     set, "test" for the validation set (GPUMD's *_test.out naming).
@@ -488,6 +504,9 @@ def predict_from_store(model, data_store, output_dir: str,
     m_pred = (
         np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
         if model.spin_descriptor is not None else None)
+    t_pred = (
+        np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+        if model.spin_descriptor is not None else None)
     v_pred = np.empty((n_struct, 6), dtype=np.float64)
 
     was_training = model.training
@@ -500,6 +519,7 @@ def predict_from_store(model, data_store, output_dir: str,
             B = end - start
             batch = data_store.collate(idx)
             batch["need_mforce"] = model.spin_descriptor is not None
+            batch["need_tau"] = model.spin_descriptor is not None
             r = model.compute_properties_cached(
                 batch, need_forces=True, need_virial=True, backend=backend)
 
@@ -517,6 +537,7 @@ def predict_from_store(model, data_store, output_dir: str,
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
             if m_pred is not None:
                 m_pred[a_lo:a_hi] = r["mforces"].cpu().numpy()
+                t_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
     if was_training:
         model.train()
     if dev.type == "cuda":
@@ -559,14 +580,20 @@ def predict_from_store(model, data_store, output_dir: str,
     if m_pred is not None:
         mforces_ref = np.full(
             (N_atoms_total, 3), np.nan, dtype=np.float64)
+        tau_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
         for i in range(n_struct):
             if data_store.has_mforces_flag[i]:
                 a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
                 mforces_ref[a_lo:a_hi] = (
                     data_store.mforces[i].cpu().numpy())
+                tau_ref[a_lo:a_hi] = data_store.tau[i].cpu().numpy()
         np.savetxt(
             os.path.join(output_dir, f"mforce_{suffix}.out"),
             np.column_stack([m_pred, mforces_ref]), fmt="%.10g")
+        np.savetxt(
+            os.path.join(output_dir, f"tau_{suffix}.out"),
+            np.column_stack([t_pred, tau_ref]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 
@@ -582,8 +609,9 @@ def predict_from_store(model, data_store, output_dir: str,
     np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
+    extra = "|mforce|tau" if model.spin_descriptor is not None else ""
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
+         f"-> {output_dir}/(energy|force|virial|stress{extra})_{suffix}.out")
 
 
 # ---------------------------------------------------------------------------

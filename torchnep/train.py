@@ -175,6 +175,8 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append("---------------------------")
     lines.append(f"  {tag('num_epochs'):10}  epoch        {config['num_epochs']}")
     lines.append(f"  {tag('batch_size'):10}  batch        {config['batch_size']}")
+    lines.append(f"  {tag('eval_batch_size'):10}  eval_batch   "
+                 f"{config['eval_batch_size']}")
     lines.append(f"  {tag('lr'):10}  lr           {config['lr']}")
     lines.append(f"  {tag('stop_lr'):10}  stop_lr      {config['stop_lr']}")
     lines.append(f"  {tag('lr_scheduler'):10}  lr_scheduler {config['lr_scheduler']}")
@@ -194,6 +196,8 @@ def format_config_summary(config: dict) -> List[str]:
     if config.get("spin_mode", 0):
         lines.append(f"  {tag('lambda_m'):10}  lambda_m     "
                      f"{config['lambda_m']}")
+        lines.append(f"  {tag('lambda_tau'):10}  lambda_tau   "
+                     f"{config['lambda_tau']}")
     if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
         lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
         lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
@@ -217,6 +221,11 @@ def format_config_summary(config: dict) -> List[str]:
         lines.append(f"  {tag('stage2_pref_e'):10}  stage2_lambda_e {config['stage2_pref_e']}")
         lines.append(f"  {tag('stage2_pref_f'):10}  stage2_lambda_f {config['stage2_pref_f']}")
         lines.append(f"  {tag('stage2_pref_v'):10}  stage2_lambda_v {config['stage2_pref_v']}")
+        if config.get("spin_mode", 0):
+            lines.append(f"  {tag('stage2_pref_m'):10}  stage2_lambda_m "
+                         f"{config['stage2_pref_m']}")
+            lines.append(f"  {tag('stage2_pref_tau'):10}  "
+                         f"stage2_lambda_tau {config['stage2_pref_tau']}")
 
     return lines
 
@@ -338,6 +347,7 @@ class GPUDataStore:
         self.has_virial_flag = ["virial" in s for s in structures]
         self.has_spins_flag = ["spins" in s for s in structures]
         self.has_mforces_flag = ["mforces" in s for s in structures]
+        self.has_tau_flag = ["tau" in s for s in structures]
 
         f_parts = []
         for s in structures:
@@ -352,18 +362,24 @@ class GPUDataStore:
 
         spin_parts = []
         mforce_parts = []
+        tau_parts = []
         for s in structures:
             natoms = s["natoms"]
             spin_parts.append(np.asarray(
                 s.get("spins", np.zeros((natoms, 3)))).reshape(-1, 3))
             mforce_parts.append(np.asarray(
                 s.get("mforces", np.zeros((natoms, 3)))).reshape(-1, 3))
+            tau_parts.append(np.asarray(
+                s.get("tau", np.zeros((natoms, 3)))).reshape(-1, 3))
         np_dtype = np.float32 if dtype == torch.float32 else np.float64
         spins_all = torch.from_numpy(
             np.concatenate(spin_parts).astype(np_dtype, copy=False)
         ).to(device=device, dtype=dtype, non_blocking=True)
         mforces_all = torch.from_numpy(
             np.concatenate(mforce_parts).astype(np_dtype, copy=False)
+        ).to(device=device, dtype=dtype, non_blocking=True)
+        tau_all = torch.from_numpy(
+            np.concatenate(tau_parts).astype(np_dtype, copy=False)
         ).to(device=device, dtype=dtype, non_blocking=True)
 
         v_parts = []
@@ -461,6 +477,7 @@ class GPUDataStore:
         self.forces = list(torch.split(f_all, nat_list))
         self.spins = list(torch.split(spins_all, nat_list))
         self.mforces = list(torch.split(mforces_all, nat_list))
+        self.tau = list(torch.split(tau_all, nat_list))
         self.virial = list(torch.unbind(v_all, dim=0))
 
         if config is not None:
@@ -476,9 +493,11 @@ class GPUDataStore:
         self.n_forces = sum(self.has_forces_flag)
         self.n_virial = sum(self.has_virial_flag)
         self.n_mforces = sum(self.has_mforces_flag)
+        self.n_tau = sum(self.has_tau_flag)
         self.has_forces = self.n_forces > 0
         self.has_virial = self.n_virial > 0
         self.has_mforces = self.n_mforces > 0
+        self.has_tau = self.n_tau > 0
 
     def collate(self, indices: List[int]) -> Dict:
         """Fast GPU-side batch collation. No CPU->GPU transfer."""
@@ -555,6 +574,13 @@ class GPUDataStore:
                        dtype=torch.bool, device=self.device)
             for k in range(B)
         ])
+        batch["tau"] = torch.cat([self.tau[i] for i in indices])
+        tau_flags = [self.has_tau_flag[i] for i in indices]
+        batch["tau_mask"] = torch.cat([
+            torch.full((self.natoms[indices[k]],), tau_flags[k],
+                       dtype=torch.bool, device=self.device)
+            for k in range(B)
+        ])
 
         if self.has_cached_basis:
             batch["fk_rad"] = torch.cat([self.fk_rad[i] for i in indices])
@@ -605,6 +631,8 @@ def _preprocess_one_frame(args):
         s["spins"] = frame["spins"].astype(dtype)
     if "mforces" in frame:
         s["mforces"] = frame["mforces"].astype(dtype)
+    if "tau" in frame:
+        s["tau"] = frame["tau"].astype(dtype)
     return s
 
 
@@ -966,12 +994,14 @@ def _trim_loss_log(path, last_epoch):
 def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                                compute_props, compute_props_cached,
                                use_autograd_forces, backend,
-                               has_forces, has_virial, dtype, dev):
+                               has_forces, has_virial, has_mforce, has_tau,
+                               dtype, dev):
     """Frozen-weight squared-error sums over the LOCAL data_store.
 
     Mirrors the training-epoch accumulation exactly (same masks, same
     per-sample units), but forward-only on one fixed set of weights.
-    Returns (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid) so
+    Returns structural/magnetic squared-error sums, sample counts, and the
+    signed energy residual so
     callers can finish the per-sample averaging themselves — the DDP path
     all-reduces these numbers across ranks first, which makes the aggregated
     loss EXACTLY the full-dataset value (a sum of per-shard sums), identical
@@ -983,15 +1013,19 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
     sum_le/n_e − δ².
     """
     sum_le = sum_lf = sum_lv = sum_ls = 0.0
+    sum_lm = sum_lt = 0.0
     sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
-    n_e = n_f = n_v = 0
+    n_e = n_f = n_v = n_m = n_t = 0
 
     was_training = raw_model.training
     raw_model.eval()  # autograd path: .training drives create_graph
     # The analytical path needs no graph at all; the autograd path still
     # needs grad-enabled rij for the force evaluation, so no_grad only
     # wraps the cached (analytical) compute.
-    ctx = contextlib.nullcontext() if use_autograd_forces else torch.no_grad()
+    spin_grad = (raw_model.spin_descriptor is not None
+                 and (has_forces or has_virial or has_mforce or has_tau))
+    ctx = (contextlib.nullcontext()
+           if (use_autograd_forces or spin_grad) else torch.no_grad())
     try:
         with ctx:
             for start in range(0, data_store.n, batch_size):
@@ -1007,10 +1041,13 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         batch["struct_idx"], batch["num_structures"],
                         need_forces=has_forces, need_virial=has_virial,
                         backend=backend, spins=batch.get("spins"),
+                        need_mforce=has_mforce, need_tau=has_tau,
                         rij_spin=batch.get("rij_spin"),
                         pi_spin=batch.get("pair_i_spin"),
                         pj_spin=batch.get("pair_j_spin"))
                 else:
+                    batch["need_mforce"] = has_mforce
+                    batch["need_tau"] = has_tau
                     result = compute_props_cached(
                         batch, need_forces=has_forces,
                         need_virial=has_virial, backend=backend)
@@ -1052,17 +1089,36 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         sum_ls += ((v_diff * s_scale) ** 2) \
                             .mean(dim=1).sum().item()
                         n_v += int(v_mask.sum().item())
+
+                active = raw_model.spin_dof_type_active[
+                    batch["atom_types"]]
+                if has_mforce and "mforces" in result:
+                    m_mask = batch["mforce_mask"] & active
+                    if m_mask.any():
+                        m_diff = (
+                            result["mforces"][m_mask]
+                            - batch["mforces"][m_mask])
+                        sum_lm += (m_diff ** 2).mean(dim=1).sum().item()
+                        n_m += int(m_mask.sum().item())
+
+                if has_tau and "tau" in result:
+                    t_mask = batch["tau_mask"] & active
+                    if t_mask.any():
+                        t_diff = result["tau"][t_mask] - batch["tau"][t_mask]
+                        sum_lt += (t_diff ** 2).mean(dim=1).sum().item()
+                        n_t += int(t_mask.sum().item())
     finally:
         if was_training:
             raw_model.train()
 
-    return sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid
+    return (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
+            n_e, n_f, n_v, n_m, n_t, sum_e_resid)
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, backend,
-                        pref_e, pref_f, pref_v, dtype, dev):
+                        pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
     """Weighted loss + RMSEs of the CURRENT (frozen) weights, full dataset.
 
     Single-GPU wrapper around ``_accumulate_true_loss_sums`` — used to
@@ -1074,15 +1130,21 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     agree. This is what keeps nep_best ≤ nep_final: every candidate (the final
     epoch always among them) is judged AND saved with its own exact b1.
 
-    Returns (true_loss, rmse_e, rmse_f, rmse_v) — energy terms offset-corrected.
+    Returns loss and E/F/V/stress/M/tau RMSEs; energy is offset-corrected.
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, _sum_ls, n_e, n_f, n_v, sum_e_resid = \
-        _accumulate_true_loss_sums(
-            data_store, batch_size, raw_model,
-            compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    has_mforce = (raw_model.spin_descriptor is not None
+                  and data_store.has_mforces and pref_m > 0)
+    has_tau = (raw_model.spin_descriptor is not None
+               and data_store.has_tau and pref_tau > 0)
+    sums = _accumulate_true_loss_sums(
+        data_store, batch_size, raw_model,
+        compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial,
+        has_mforce, has_tau, dtype, dev)
+    (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
+     n_e, n_f, n_v, n_m, n_t, sum_e_resid) = sums
     # Exact optimal b1 for these frozen weights, solved from this same pass.
     delta = sum_e_resid / n_e if n_e > 0 else 0.0
     if n_e > 0:
@@ -1093,14 +1155,19 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
-    true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+    mse_s = sum_ls / max(n_v, 1)
+    mse_m = sum_lm / max(n_m, 1)
+    mse_t = sum_lt / max(n_t, 1)
+    true_loss = (pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+                 + pref_m * mse_m + pref_tau * mse_t)
+    return (true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
+            np.sqrt(mse_s), np.sqrt(mse_m), np.sqrt(mse_t))
 
 
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
                          compute_props, compute_props_cached,
                          use_autograd_forces, backend,
-                         pref_e, pref_f, pref_v, dtype, dev):
+                         pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
     """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
 
     Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
@@ -1109,23 +1176,33 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
     information into the saved model. Energy MSE is therefore the plain
     residual mean square with the current (train-fitted) b1.
 
-    Returns (valid_loss, rmse_e, rmse_f, rmse_v, rmse_stress_gpa).
+    Returns validation loss and E/F/V/stress/M/tau RMSEs.
     """
     from .constants import EV_PER_A3_TO_GPa
     has_forces = valid_store.has_forces and pref_f > 0
     has_virial = valid_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, _ = \
-        _accumulate_true_loss_sums(
-            valid_store, batch_size, raw_model,
-            compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    has_mforce = (raw_model.spin_descriptor is not None
+                  and valid_store.has_mforces and pref_m > 0)
+    has_tau = (raw_model.spin_descriptor is not None
+               and valid_store.has_tau and pref_tau > 0)
+    sums = _accumulate_true_loss_sums(
+        valid_store, batch_size, raw_model,
+        compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial,
+        has_mforce, has_tau, dtype, dev)
+    (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
+     n_e, n_f, n_v, n_m, n_t, _) = sums
     mse_e = sum_le / max(n_e, 1)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
     mse_s = sum_ls / max(n_v, 1)
-    valid_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+    mse_m = sum_lm / max(n_m, 1)
+    mse_t = sum_lt / max(n_t, 1)
+    valid_loss = (pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+                  + pref_m * mse_m + pref_tau * mse_t)
     return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
-            np.sqrt(mse_s) * EV_PER_A3_TO_GPa)
+            np.sqrt(mse_s) * EV_PER_A3_TO_GPa,
+            np.sqrt(mse_m), np.sqrt(mse_t))
 
 
 def _quiet_compile_logs():
@@ -1343,6 +1420,7 @@ def train_nep(
     # Training schedule + loss weights
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
+    eval_batch_size    = config["eval_batch_size"]
     lr                 = config["lr"]
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
@@ -1354,6 +1432,7 @@ def train_nep(
     pref_f             = config["lambda_f"]
     pref_v             = config["lambda_v"]
     pref_m             = config["lambda_m"]
+    pref_tau           = config["lambda_tau"]
     # Optional stage-2 block
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")  # may be None -> auto 0.5*num_epochs
@@ -1361,6 +1440,8 @@ def train_nep(
     stage2_pref_e      = config["stage2_pref_e"]
     stage2_pref_f      = config["stage2_pref_f"]
     stage2_pref_v      = config["stage2_pref_v"]
+    stage2_pref_m      = config["stage2_pref_m"]
+    stage2_pref_tau    = config["stage2_pref_tau"]
     # Stage 2 can have its own decay schedule (default: same as stage 1).
     # Use this when the two stages span different LR ranges — e.g. stage 1
     # 1e-2 -> 1e-3 (factor 0.794, 10 decays) vs stage 2 1e-3 -> 1e-5
@@ -1487,7 +1568,7 @@ def train_nep(
     _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
     _log(f"  coverage: {data_store.n_energy} E / "
          f"{data_store.n_forces} F / {data_store.n_virial} V"
-         + (f" / {data_store.n_mforces} M"
+         + (f" / {data_store.n_mforces} M / {data_store.n_tau} T"
             if config.get("spin_mode", 0) else ""))
 
     valid_store = None
@@ -1501,16 +1582,12 @@ def train_nep(
         max_NN_rad = max(max_NN_rad, vNN_rad)
         max_NN_ang = max(max_NN_ang, vNN_ang)
         valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
-        if (config.get("spin_mode", 0)
-                and pref_m > 0 and valid_store.has_mforces):
-            raise NotImplementedError(
-                "validation-set magnetic-force loss is not implemented yet; "
-                "remove mforce labels from the validation set or disable "
-                "validation for this spin run")
         del structures_v, valid_frames
         _log(f"  validation set ready in {time.time() - t0:.1f}s — "
              f"coverage: {valid_store.n_energy} E / "
-             f"{valid_store.n_forces} F / {valid_store.n_virial} V")
+             f"{valid_store.n_forces} F / {valid_store.n_virial} V"
+             + (f" / {valid_store.n_mforces} M / {valid_store.n_tau} T"
+                if config.get("spin_mode", 0) else ""))
     _log("")
 
     # ---- Master RNG seed -------------------------------------------------
@@ -1707,9 +1784,10 @@ def train_nep(
     # old-scale best_loss would keep the new run from ever saving a new best).
     cur_loss_weights = {
         "lambda_e": pref_e, "lambda_f": pref_f, "lambda_v": pref_v,
-        "lambda_m": pref_m,
+        "lambda_m": pref_m, "lambda_tau": pref_tau,
         "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
-        "stage2_pref_v": stage2_pref_v,
+        "stage2_pref_v": stage2_pref_v, "stage2_pref_m": stage2_pref_m,
+        "stage2_pref_tau": stage2_pref_tau,
     }
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
@@ -1773,13 +1851,15 @@ def train_nep(
         hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                "rmse_v(eV/atom)  rmse_stress(GPa)")
         if raw_model.spin_descriptor is not None:
-            hdr += "  rmse_m(eV/muB)"
+            hdr += "  rmse_m(eV/muB)  rmse_tau(eV)"
         if valid_store is not None:
             # GPUMD loss.out convention: train RMSEs, then test RMSEs.
             # (The loss column is then the VALIDATION loss — it is what
             # drives the scheduler and the best-model choice.)
             hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
                     "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+            if raw_model.spin_descriptor is not None:
+                hdr += "  rmse_m_test(eV/muB)  rmse_tau_test(eV)"
         loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
@@ -1831,9 +1911,10 @@ def train_nep(
             g.manual_seed(run_seed + epoch)
             perm = torch.randperm(n_structs, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = sum_lm = 0.0
+            sum_le = sum_lf = sum_lv = sum_lm = sum_lt = 0.0
             sum_ls = 0.0                     # (eV/A**3)**2 accumulator for stress
-            sum_e_structs = sum_f_atoms = sum_v_structs = sum_m_atoms = 0
+            sum_e_structs = sum_f_atoms = sum_v_structs = 0
+            sum_m_atoms = sum_t_atoms = 0
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
 
@@ -1850,8 +1931,10 @@ def train_nep(
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
-                cur_pref_e, cur_pref_f, cur_pref_v = (
-                    stage2_pref_e, stage2_pref_f, stage2_pref_v)
+                (cur_pref_e, cur_pref_f, cur_pref_v,
+                 cur_pref_m, cur_pref_tau) = (
+                    stage2_pref_e, stage2_pref_f, stage2_pref_v,
+                    stage2_pref_m, stage2_pref_tau)
                 # Apply stage 2 lr + reset the first time we hit stage 2 in
                 # THIS run — covers both the natural transition and resuming
                 # from a stage-1 checkpoint whose start_epoch has already
@@ -1890,7 +1973,8 @@ def train_nep(
                         best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                             f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
+                             f"V_w={cur_pref_v}, M_w={cur_pref_m}, "
+                             f"Tau_w={cur_pref_tau}, lr={stage2_lr:.2e}")
                     else:
                         # Resumed mid-stage-2: keep the checkpoint's restored
                         # (possibly decayed) lr / optimizer / scheduler /
@@ -1901,11 +1985,13 @@ def train_nep(
                         cur_lr = optimizer.param_groups[0]['lr']
                         _log(f"Stage 2 resumed at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                             f"V_w={cur_pref_v}, lr={cur_lr:.2e} "
+                             f"V_w={cur_pref_v}, M_w={cur_pref_m}, "
+                             f"Tau_w={cur_pref_tau}, lr={cur_lr:.2e} "
                              f"(kept from checkpoint)")
                     _log(f"{'='*72}")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
+                cur_pref_m, cur_pref_tau = pref_m, pref_tau
 
             # Per-epoch compute eligibility: a weight of 0 means "don't compute
             # this channel". This is recomputed every epoch so a stage-1 zero
@@ -1915,12 +2001,16 @@ def train_nep(
             has_virial = data_store.has_virial and cur_pref_v > 0
             has_mforces = (
                 raw_model.spin_descriptor is not None
-                and data_store.has_mforces and pref_m > 0)
+                and data_store.has_mforces and cur_pref_m > 0)
+            has_tau = (
+                raw_model.spin_descriptor is not None
+                and data_store.has_tau and cur_pref_tau > 0)
 
             for start in range(0, n_structs, batch_size):
                 idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
                 batch["need_mforce"] = has_mforces
+                batch["need_tau"] = has_tau
 
                 if use_autograd_forces:
                     result = compute_props(
@@ -1932,6 +2022,7 @@ def train_nep(
                         need_forces=has_forces, need_virial=has_virial,
                         backend=backend, spins=batch.get("spins"),
                         need_mforce=has_mforces,
+                        need_tau=has_tau,
                         rij_spin=batch.get("rij_spin"),
                         pi_spin=batch.get("pair_i_spin"),
                         pj_spin=batch.get("pair_j_spin"))
@@ -1998,10 +2089,24 @@ def train_nep(
                         m_pred = result["mforces"][m_mask]
                         m_ref = batch["mforces"][m_mask]
                         loss_m = _loss_fn(m_pred, m_ref)
-                        loss = loss + pref_m * loss_m
+                        loss = loss + cur_pref_m * loss_m
                         sum_lm += (
                             (m_pred - m_ref) ** 2
                         ).mean().item() * m_mask.sum().item()
+
+                if has_tau:
+                    t_mask = (
+                        batch["tau_mask"]
+                        & raw_model.spin_dof_type_active[
+                            batch["atom_types"]])
+                    if t_mask.any():
+                        t_pred = result["tau"][t_mask]
+                        t_ref = batch["tau"][t_mask]
+                        loss_t = _loss_fn(t_pred, t_ref)
+                        loss = loss + cur_pref_tau * loss_t
+                        sum_lt += (
+                            (t_pred - t_ref) ** 2
+                        ).mean().item() * t_mask.sum().item()
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -2050,6 +2155,8 @@ def train_nep(
                 sum_v_structs += batch["virial_mask"].sum().item()
                 if has_mforces:
                     sum_m_atoms += int(m_mask.sum().item())
+                if has_tau:
+                    sum_t_atoms += int(t_mask.sum().item())
                 max_gn = max(max_gn, gn)
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
@@ -2070,14 +2177,31 @@ def train_nep(
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
             mse_m = sum_lm / max(sum_m_atoms, 1) if sum_lm > 0 else 0.0
+            mse_t = sum_lt / max(sum_t_atoms, 1) if sum_lt > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
-                        + cur_pref_v * mse_v + pref_m * mse_m)
+                        + cur_pref_v * mse_v + cur_pref_m * mse_m
+                        + cur_pref_tau * mse_t)
             # Output units: eV/atom (E, V), eV/A (F), GPa (stress).
             rmse_e = np.sqrt(mse_e)
             rmse_f = np.sqrt(mse_f)
             rmse_v = np.sqrt(mse_v)
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
             rmse_m = np.sqrt(mse_m)
+            rmse_t = np.sqrt(mse_t)
+
+            # Spin losses contain derivatives with respect to the magnetic
+            # coordinates. Evaluate the frozen end-of-epoch weights on the
+            # complete training set so logging, scheduling and nep_best all
+            # use the same model state rather than moving minibatch averages.
+            if raw_model.spin_descriptor is not None:
+                (avg_loss, rmse_e, rmse_f, rmse_v, rmse_s,
+                 rmse_m, rmse_t) = _evaluate_true_loss(
+                    data_store, eval_batch_size, raw_model,
+                    compute_props, compute_props_cached,
+                    use_autograd_forces, train_backend,
+                    cur_pref_e, cur_pref_f, cur_pref_v,
+                    cur_pref_m, cur_pref_tau, dtype, dev)
+                rmse_s_gpa = rmse_s * EV_PER_A3_TO_GPa
 
             # Validation: frozen-weight full pass every epoch (b1 already
             # train-fitted by the analytical update above; never re-fitted on
@@ -2085,12 +2209,14 @@ def train_nep(
             # the best-model choice below — the anti-overfitting signal.
             valid_loss = None
             if valid_store is not None:
-                valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s = \
+                (valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s,
+                 v_rmse_m, v_rmse_t) = \
                     _evaluate_valid_loss(
-                        valid_store, batch_size, raw_model,
+                        valid_store, eval_batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, train_backend,
-                        cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                        cur_pref_e, cur_pref_f, cur_pref_v,
+                        cur_pref_m, cur_pref_tau, dtype, dev)
             dt = time.time() - t_epoch
 
             # With a validation set, the validation loss IS the run's loss:
@@ -2127,10 +2253,12 @@ def train_nep(
             row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
                    f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
             if raw_model.spin_descriptor is not None:
-                row += f" {rmse_m:.6f}"
+                row += f" {rmse_m:.6f} {rmse_t:.6f}"
             if valid_loss is not None:
                 row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
                         f"{v_rmse_s:.4f}")
+                if raw_model.spin_descriptor is not None:
+                    row += f" {v_rmse_m:.6f} {v_rmse_t:.6f}"
             loss_log.write(row + "\n")
             loss_log.flush()
 
@@ -2138,15 +2266,24 @@ def train_nep(
             cur_lr = optimizer.param_groups[0]['lr']
             v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                      if has_virial else "")
-            m_str = (f" | M {rmse_m:.5f} eV/muB" if has_mforces else "")
+            spin_str = ""
+            if has_mforces:
+                spin_str += f" | M {rmse_m:.5f} eV/muB"
+            if has_tau:
+                spin_str += f" | T {rmse_t:.5f} eV"
             valid_str = ""
             if valid_loss is not None:
                 valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
                              + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
                                 if has_virial else ""))
+                if raw_model.spin_descriptor is not None:
+                    if valid_store.has_mforces and cur_pref_m > 0:
+                        valid_str += f" M {v_rmse_m:.5f}"
+                    if valid_store.has_tau and cur_pref_tau > 0:
+                        valid_str += f" T {v_rmse_t:.5f}"
             line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                    f"{v_str}{m_str}{valid_str} | gnorm {max_gn:.1f} | "
+                    f"{v_str}{spin_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
@@ -2181,13 +2318,16 @@ def train_nep(
             elif (epoch < true_eval_start
                   or raw_model.spin_descriptor is not None):
                 if new_min:
+                    if raw_model.spin_descriptor is not None:
+                        best_true_loss = avg_loss
                     _save_best()
             elif new_min or epoch == num_epochs or stop_now:
-                t_loss, _te, _tf, _tv = _evaluate_true_loss(
-                    data_store, batch_size, raw_model,
+                t_loss, _te, _tf, _tv, _ts, _tm, _tt = _evaluate_true_loss(
+                    data_store, eval_batch_size, raw_model,
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
-                    cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                    cur_pref_e, cur_pref_f, cur_pref_v,
+                    cur_pref_m, cur_pref_tau, dtype, dev)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()
@@ -2218,11 +2358,11 @@ def train_nep(
                 # Silent interim predict — reuses data_store's preprocessed
                 # neighbor lists + basis (no xyz re-read, no recompute).
                 predict_from_store(raw_model, data_store, output_dir,
-                                   batch_size=batch_size, backend=backend,
+                                   batch_size=eval_batch_size, backend=backend,
                                    verbose=False)
                 if valid_store is not None:
                     predict_from_store(raw_model, valid_store, output_dir,
-                                       batch_size=batch_size,
+                                       batch_size=eval_batch_size,
                                        backend=backend, verbose=False,
                                        suffix="test")
 
@@ -2271,11 +2411,11 @@ def train_nep(
     _log("\nRunning prediction on training set (final-epoch model)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
-                       batch_size=batch_size, backend=backend,
+                       batch_size=eval_batch_size, backend=backend,
                        verbose=False)
     if valid_store is not None:
         predict_from_store(raw_model, valid_store, output_dir,
-                           batch_size=batch_size, backend=backend,
+                           batch_size=eval_batch_size, backend=backend,
                            verbose=False, suffix="test")
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 

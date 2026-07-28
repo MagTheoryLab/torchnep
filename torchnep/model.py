@@ -334,7 +334,7 @@ class NEPModel(nn.Module):
                            struct_idx, num_structures,
                            need_forces=True, need_virial=False,
                            backend: str = "loop", spins=None,
-                           need_mforce=False,
+                           need_mforce=False, need_tau=False,
                            rij_spin=None, pi_spin=None, pj_spin=None,
                            create_graph: bool | None = None):
         """Compute energy, forces, virial (autograd-through-rij path)."""
@@ -351,7 +351,7 @@ class NEPModel(nn.Module):
         if self.spin_descriptor is not None:
             if spins is None:
                 raise ValueError("spin_mode requires per-atom spins")
-            if need_mforce:
+            if need_mforce or need_tau:
                 spins = spins.detach().requires_grad_(True)
 
         Ei = self.forward(rij_rad, rij_ang, pi_rad, pj_rad,
@@ -384,7 +384,7 @@ class NEPModel(nn.Module):
             grads = torch.autograd.grad(
                 Ei.sum(), grad_inputs,
                 create_graph=derivative_graph,
-                retain_graph=derivative_graph or need_mforce,
+                retain_graph=derivative_graph or need_mforce or need_tau,
                 allow_unused=True)
             g_rad = grads[0] if grads[0] is not None else torch.zeros_like(rij_rad)
             g_ang = grads[1] if grads[1] is not None else torch.zeros_like(rij_ang)
@@ -415,7 +415,7 @@ class NEPModel(nn.Module):
             if need_virial:
                 result["virial"] = virial
 
-        if self.spin_descriptor is not None and need_mforce:
+        if self.spin_descriptor is not None and (need_mforce or need_tau):
             grad_spin = torch.autograd.grad(
                 Ei.sum(), spins,
                 create_graph=derivative_graph,
@@ -426,7 +426,11 @@ class NEPModel(nn.Module):
                 grad_spin = torch.zeros_like(spins)
             mforces = -grad_spin
             active = self.spin_dof_type_active[atom_types].unsqueeze(-1)
-            result["mforces"] = mforces * active.to(mforces.dtype)
+            mforces = mforces * active.to(mforces.dtype)
+            if need_mforce:
+                result["mforces"] = mforces
+            if need_tau:
+                result["tau"] = torch.cross(spins, mforces, dim=-1)
 
         return result
 
@@ -460,6 +464,7 @@ class NEPModel(nn.Module):
                     backend=backend,
                     spins=batch.get("spins"),
                     need_mforce=batch.get("need_mforce", False),
+                    need_tau=batch.get("need_tau", False),
                     rij_spin=batch.get("rij_spin"),
                     pi_spin=batch.get("pair_i_spin"),
                     pj_spin=batch.get("pair_j_spin"),

@@ -67,11 +67,20 @@ def test_nep_in_spin_protocol_selects_lite_and_rejects_descriptor(tmp_path):
         "spin_dof_type Fe\n"
         "spin_env_type Fe Ge\n"
         "lambda_m 0.7\n"
+        "lambda_tau 0.2\n"
+        "eval_batch 3\n"
+        "stage2 1\n"
+        "stage2_lambda_m 0.4\n"
+        "stage2_lambda_tau 0.1\n"
     )
     config = parse_nep_in(path)
     assert config["spin_mode"] == 1
     assert config["spin_chiral"] == 1
     assert config["lambda_m"] == pytest.approx(0.7)
+    assert config["lambda_tau"] == pytest.approx(0.2)
+    assert config["eval_batch_size"] == 3
+    assert config["stage2_pref_m"] == pytest.approx(0.4)
+    assert config["stage2_pref_tau"] == pytest.approx(0.1)
     assert isinstance(
         NEPModel(config).spin_descriptor, SpinNEPLiteChiralDescriptor)
 
@@ -184,7 +193,13 @@ def test_spin_nep_txt_roundtrip_uses_counted_protocol(tmp_path, chiral):
     assert result["energy"].shape == (4,)
     assert result["forces"].shape == (4, 3)
     assert result["mforces"].shape == (4, 3)
+    assert result["tau"].shape == (4, 3)
     assert torch.isfinite(result["mforces"]).all()
+    torch.testing.assert_close(
+        result["tau"],
+        torch.cross(torch.as_tensor(spins, dtype=torch.float64),
+                    result["mforces"], dim=-1),
+    )
     assert torch.count_nonzero(result["mforces"][1::2]) == 0
 
 
@@ -199,6 +214,7 @@ def test_xyz_parser_reads_spin_and_mforce_aliases(tmp_path):
     frame = read_xyz(path)[0]
     np.testing.assert_allclose(frame["spins"], [[1, 2, 3]])
     np.testing.assert_allclose(frame["mforces"], [[4, 5, 6]])
+    np.testing.assert_allclose(frame["tau"], [[-3, 6, -3]])
 
 
 def test_single_device_training_smoke_with_mforce(tmp_path):
@@ -221,9 +237,15 @@ def test_single_device_training_smoke_with_mforce(tmp_path):
         "lambda_f 0\n"
         "lambda_v 0\n"
         "lambda_m 1\n"
+        "lambda_tau 0.2\n"
         "batch 1\n"
-        "epoch 1\n"
+        "eval_batch 1\n"
+        "epoch 2\n"
         "lr 0.001\n"
+        "stage2 1\n"
+        "start_stage2 2\n"
+        "stage2_lambda_m 0.5\n"
+        "stage2_lambda_tau 0.1\n"
     )
     xyz = tmp_path / "train.xyz"
     xyz.write_text(
@@ -245,7 +267,18 @@ def test_single_device_training_smoke_with_mforce(tmp_path):
         str(config), str(xyz), output_dir=str(output),
         device="cpu", precision="float64", restart=False,
         prediction_interval=0, use_gpumd_qscaler=False, run_seed=1,
+        valid_file=str(xyz),
     )
     assert (output / "nep_final.txt").exists()
     assert (output / "mforce_train.out").exists()
+    assert (output / "tau_train.out").exists()
+    assert (output / "mforce_test.out").exists()
+    assert (output / "tau_test.out").exists()
+    header = (output / "loss.out").read_text().splitlines()[0]
+    assert "rmse_tau(eV)" in header
+    assert "rmse_m_test(eV/muB)" in header
+    assert "rmse_tau_test(eV)" in header
+    tau = np.loadtxt(output / "tau_train.out")
+    assert tau.shape == (6, 6)
+    assert np.isfinite(tau[:, :3]).all()
     assert "spin_descriptor" not in (output / "nep_final.txt").read_text()

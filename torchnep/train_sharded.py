@@ -1148,12 +1148,13 @@ def train_nep_sharded(
                     raw_model.compute_properties, _shim._compute_cached,
                     use_autograd_forces, train_backend,
                     valid_has_forces and cur_pref_f > 0,
-                    valid_has_virial and cur_pref_v > 0, dtype, dev)
+                    valid_has_virial and cur_pref_v > 0,
+                    False, False, dtype, dev)
                 v_sums_t = torch.tensor(v_sums, device=dev,
                                         dtype=torch.float64)
                 dist.all_reduce(v_sums_t)
-                (v_le, v_lf, v_lv, v_ls,
-                 v_ne, v_nf, v_nv, _) = v_sums_t.tolist()
+                (v_le, v_lf, v_lv, v_ls, _v_lm, _v_lt,
+                 v_ne, v_nf, v_nv, _v_nm, _v_nt, _) = v_sums_t.tolist()
                 v_mse_e = v_le / max(v_ne, 1.0)
                 v_mse_f = v_lf / max(v_nf, 1.0)
                 v_mse_v = v_lv / max(v_nv, 1.0)
@@ -1252,12 +1253,12 @@ def train_nep_sharded(
                     data_store, batch_size, raw_model,
                     raw_model.compute_properties, _shim._compute_cached,
                     use_autograd_forces, train_backend,
-                    has_forces, has_virial, dtype, dev)
+                    has_forces, has_virial, False, False, dtype, dev)
                 sums_t = torch.tensor(local_sums, device=dev,
                                       dtype=torch.float64)
                 dist.all_reduce(sums_t)
-                (s_le, s_lf, s_lv, _s_ls,
-                 n_e, n_f, n_v, s_e_resid) = sums_t.tolist()
+                (s_le, s_lf, s_lv, _s_ls, _s_lm, _s_lt,
+                 n_e, n_f, n_v, _n_m, _n_t, s_e_resid) = sums_t.tolist()
                 # Exact optimal b1 for these frozen weights, from the global
                 # (all-reduced) residual — identical on every rank.
                 delta = s_e_resid / n_e if n_e > 0 else 0.0

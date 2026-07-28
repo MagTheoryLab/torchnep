@@ -125,6 +125,10 @@ def _parse_frame_block(block, energy_key="energy"):
         "mforce", "mforces", "force_mag", "forces_mag",
         "magnetic_force", "magnetic_forces",
     ), "mforces")
+    # Torque is a derived target, not an additional dataset requirement.
+    # Keep the convention used by the spin model: tau = spin x mforce.
+    if "spins" in frame and "mforces" in frame:
+        frame["tau"] = np.cross(frame["spins"], frame["mforces"])
     return frame
 
 
@@ -317,8 +321,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_f"] = float(parts[1])
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
-            elif key == "lambda_m":
+            elif key in ("lambda_m", "lambda_mforce"):
                 params["lambda_m"] = float(parts[1])
+            elif key == "lambda_tau":
+                params["lambda_tau"] = float(parts[1])
             elif key == "lambda_2":
                 params["lambda_2"] = float(parts[1])
             elif key == "spin_descriptor":
@@ -359,6 +365,8 @@ def parse_nep_in(filename: str) -> Dict:
                     "spin_dof_type and optional spin_env_type")
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
+            elif key == "eval_batch":
+                params["eval_batch_size"] = int(parts[1])
             elif key == "save_potential":
                 params["save_interval"] = int(parts[1])
                 if len(parts) > 2:
@@ -399,6 +407,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["stage2_pref_f"] = float(parts[1])
             elif key == "stage2_lambda_v":
                 params["stage2_pref_v"] = float(parts[1])
+            elif key in ("stage2_lambda_m", "stage2_lambda_mforce"):
+                params["stage2_pref_m"] = float(parts[1])
+            elif key == "stage2_lambda_tau":
+                params["stage2_pref_tau"] = float(parts[1])
             elif key == "stage2_scheduler_patience":
                 params["stage2_scheduler_patience"] = int(parts[1])
             elif key == "stage2_scheduler_factor":
@@ -423,6 +435,7 @@ def parse_nep_in(filename: str) -> Dict:
     # Defaults — training hyperparameters (match train_nep / train_nep_sharded)
     params.setdefault("num_epochs", 600)
     params.setdefault("batch_size", 32)
+    params.setdefault("eval_batch_size", params["batch_size"])
     params.setdefault("lr", 0.01)
     params.setdefault("stop_lr", 1e-6)
     params.setdefault("scheduler_patience", 15)
@@ -434,6 +447,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
     params.setdefault("lambda_m", 1.0)
+    params.setdefault("lambda_tau", 0.0)
     params.setdefault("lambda_1", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
@@ -465,6 +479,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 0.05)
     params.setdefault("stage2_pref_v", 0.1)
+    params.setdefault("stage2_pref_m", params["lambda_m"])
+    params.setdefault("stage2_pref_tau", params["lambda_tau"])
     # start_stage2 defaults to 0.5 * num_epochs if not set — handled in trainer
 
     # Stash explicit-key set in the dict itself; consumers can read it (and

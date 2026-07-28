@@ -375,8 +375,10 @@ class NEPCalculator:
 
         Returns
         -------
-        dict with 'energy', 'forces', 'virial', optionally 'descriptor' and
-        (if ``return_components``) the per-contribution breakdown above.
+        dict with 'energy', 'forces', 'virial', optionally 'descriptor';
+        spin models also return 'mforces' and ``tau = spin x mforce``.
+        If ``return_components`` is set, the per-contribution breakdown above
+        is included for non-spin models.
         """
         atom_types = torch.tensor(
             [self.type_names.index(s) for s in species],
@@ -533,8 +535,10 @@ class NEPCalculator:
             if grad_spin is None:
                 grad_spin = torch.zeros_like(spin_tensor)
             active = self.spin_dof_type_active[atom_types].unsqueeze(-1)
-            result["mforces"] = (
-                -grad_spin * active.to(dtype=grad_spin.dtype)).detach()
+            mforces = -grad_spin * active.to(dtype=grad_spin.dtype)
+            result["mforces"] = mforces.detach()
+            result["tau"] = torch.cross(
+                spin_tensor.detach(), mforces, dim=-1).detach()
         return result
 
     def compute_batch(self, batch: Dict, backend: str = "loop") -> Dict:
@@ -738,6 +742,7 @@ class NEPCalculator:
         active = self.spin_dof_type_active[
             batch["atom_types"]].unsqueeze(-1)
         mforces = -grad_spin * active.to(dtype=grad_spin.dtype)
+        tau = torch.cross(spins.detach(), mforces, dim=-1)
         Etot = torch.zeros(
             batch["num_structures"], dtype=dtype, device=device)
         Etot.scatter_add_(0, batch["struct_idx"], Ei.detach())
@@ -747,6 +752,7 @@ class NEPCalculator:
             "forces": forces,
             "virial": virial,
             "mforces": mforces.detach(),
+            "tau": tau.detach(),
             "descriptor": q_scaled.detach(),
         }
 

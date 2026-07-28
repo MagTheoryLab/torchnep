@@ -66,6 +66,9 @@ fields and silently ignores everything else (e.g. `Z:I:1`):
 - `mforce:R:3`, `mforces:R:3`, or `magnetic_force:R:3` — reference
   magnetic force in eV/μB (optional).
 
+Torque is not an extra dataset column. When both `spin` and `mforce` are
+present, TorchNEP derives the target as `tau = spin × mforce`.
+
 ---
 
 ## Training Parameters
@@ -99,6 +102,7 @@ spin_cutoff 6 5
 spin_dof_type Fe
 spin_env_type Fe Ge
 lambda_m 1.0
+lambda_tau 0.0
 ```
 
 `spin_dof_type` selects atoms whose magnetic force is trained and returned.
@@ -113,12 +117,14 @@ Exported potentials use a counted `nep4_spin1` metadata block in `nep.txt`.
 |-----------|---------|-------------|
 | `epoch` | `600` | Total training epochs |
 | `batch` | `32` | Structures per gradient step |
+| `eval_batch` | `batch` | Structures per frozen train/validation evaluation and prediction batch |
 | `lr` | `0.01` | Initial learning rate |
 | `stop_lr` | `1e-6` | Minimum learning rate (scheduler floor) |
 | `lambda_e` | `0.01` | Energy loss weight |
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
 | `lambda_m` | `1.0` | Magnetic-force loss weight (Spin NEP Lite) |
+| `lambda_tau` | `0.0` | Torque loss weight; targets are derived from `spin × mforce` |
 | `lambda_1` | `0.0` | L1 regularisation weight |
 | `lambda_2` | `0.0` | L2 regularisation weight |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
@@ -134,6 +140,8 @@ Exported potentials use a counted `nep4_spin1` metadata block in `nep.txt`.
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
 | `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
+| `stage2_lambda_m` | `lambda_m` | Stage 2 magnetic-force weight |
+| `stage2_lambda_tau` | `lambda_tau` | Stage 2 torque weight |
 
 ### Runtime arguments
 
@@ -178,6 +186,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `energy_train.out` | Per-frame predicted vs reference E/atom (eV/atom) |
 | `force_train.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
 | `mforce_train.out` | Per-atom predicted vs reference magnetic force (eV/μB; spin models only) |
+| `tau_train.out` | Per-atom predicted vs derived reference torque (`spin × mforce`; spin models only) |
 | `virial_train.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
 | `stress_train.out` | Per-frame predicted vs reference stress (GPa) |
 | `*_test.out` | Same four files for the validation set (GPUMD `test.xyz` naming/format); only written when `valid_file`/`valid_ratio` is used |
@@ -261,9 +270,9 @@ train_nep("nep.in", "train.xyz", output_dir="output",
 | Parameter | Safe to change? | Notes |
 |-----------|----------------|-------|
 | `epoch` | Yes | Extend training by increasing this |
-| `lambda_e` / `lambda_f` / `lambda_v` | Yes | New weights take effect next epoch. |
-| `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. |
-| `batch` | Yes | — |
+| `lambda_e` / `lambda_f` / `lambda_v` / `lambda_m` / `lambda_tau` | Yes | New weights take effect next epoch. |
+| `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` / `stage2_lambda_m` / `stage2_lambda_tau` | Yes | Same auto-reset rule. |
+| `batch` / `eval_batch` | Yes | `eval_batch` changes only frozen evaluation and prediction memory use. |
 | `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it, or push it later |
 | `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. To re-enter Stage 2 with a new LR, `resume_from=".../checkpoint_stage1.pt"`. |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
