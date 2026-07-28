@@ -20,6 +20,7 @@ from torchnep.train import (
 from torchnep.spin import (
     SpinNEPLiteChiralDescriptor,
     SpinNEPLiteDescriptor,
+    _type_pair_radial_mixing,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -65,6 +66,58 @@ def _geometry(dtype=torch.float64):
         positions,
         cell,
     )
+
+
+def test_type_pair_radial_mixing_matches_gather_bmm_gradients():
+    torch.manual_seed(7)
+    pair_i = torch.tensor([0, 0, 1, 2, 2, 3], dtype=torch.long)
+    pair_j = torch.tensor([1, 2, 3, 0, 3, 1], dtype=torch.long)
+    atom_types = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+    rb = torch.randn(6, 4, dtype=torch.float64, requires_grad=True)
+    coeff = torch.randn(2, 2, 3, 4, dtype=torch.float64,
+                        requires_grad=True)
+    grad_out = torch.randn(6, 3, dtype=torch.float64)
+
+    actual = _type_pair_radial_mixing(
+        rb, pair_i, pair_j, atom_types, coeff)
+    actual_grads = torch.autograd.grad(
+        actual, (rb, coeff), grad_outputs=grad_out)
+
+    rb_ref = rb.detach().requires_grad_(True)
+    coeff_ref = coeff.detach().requires_grad_(True)
+    ti = atom_types[pair_i]
+    tj = atom_types[pair_j]
+    expected = torch.bmm(
+        coeff_ref[ti, tj], rb_ref.unsqueeze(-1)).squeeze(-1)
+    expected_grads = torch.autograd.grad(
+        expected, (rb_ref, coeff_ref), grad_outputs=grad_out)
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_grads[0], expected_grads[0])
+    torch.testing.assert_close(actual_grads[1], expected_grads[1])
+
+    grad_weight = torch.randn(
+        6, 3, dtype=torch.float64, requires_grad=True)
+    coeff_vjp = torch.randn(
+        2, 2, 3, 4, dtype=torch.float64, requires_grad=True)
+    grad_rb_out = torch.randn(6, 4, dtype=torch.float64)
+    actual_vjp = _type_pair_radial_mixing(
+        grad_weight, pair_i, pair_j, atom_types,
+        coeff_vjp.transpose(-1, -2))
+    actual_vjp_grads = torch.autograd.grad(
+        actual_vjp, (grad_weight, coeff_vjp), grad_outputs=grad_rb_out)
+
+    grad_weight_ref = grad_weight.detach().requires_grad_(True)
+    coeff_vjp_ref = coeff_vjp.detach().requires_grad_(True)
+    expected_vjp = torch.einsum(
+        "es,esk->ek", grad_weight_ref, coeff_vjp_ref[ti, tj])
+    expected_vjp_grads = torch.autograd.grad(
+        expected_vjp, (grad_weight_ref, coeff_vjp_ref),
+        grad_outputs=grad_rb_out)
+
+    torch.testing.assert_close(actual_vjp, expected_vjp)
+    torch.testing.assert_close(actual_vjp_grads[0], expected_vjp_grads[0])
+    torch.testing.assert_close(actual_vjp_grads[1], expected_vjp_grads[1])
 
 
 def test_nep_in_spin_protocol_selects_lite_and_rejects_descriptor(tmp_path):

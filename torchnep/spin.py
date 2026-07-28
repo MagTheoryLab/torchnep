@@ -866,9 +866,9 @@ class SpinNEPLiteDescriptor(torch.nn.Module):
             grad_rb[:, :self.spin_compress] = grad_weight
         else:
             atom_types = cache["atom_types"]
-            ti = atom_types[cache["pair_i"]]
-            tj = atom_types[cache["pair_j"]]
-            grad_rb = torch.einsum("es,esk->ek", grad_weight, coeff[ti, tj])
+            grad_rb = _type_pair_radial_mixing(
+                grad_weight, cache["pair_i"], cache["pair_j"], atom_types,
+                coeff.transpose(-1, -2))
         pair_scale = cache["pair_scale"]
         if pair_scale is not None:
             grad_rb = grad_rb * pair_scale.unsqueeze(-1)
@@ -1619,6 +1619,9 @@ def _stf_outer_pair_vjp(grad_stf: torch.Tensor,
 def _type_pair_radial_mixing(rb: torch.Tensor, pair_i: torch.Tensor,
                              pair_j: torch.Tensor, atom_types: torch.Tensor,
                              coeff: torch.Tensor) -> torch.Tensor:
+    if coeff.shape[0] < 8:
+        return ops._type_contraction_loop(
+            rb, pair_i, pair_j, atom_types, coeff)
     ti = atom_types[pair_i]
     tj = atom_types[pair_j]
     c_pair = coeff[ti, tj]
