@@ -35,6 +35,7 @@ pytest.importorskip("ase")
 from ase import Atoms                                   # noqa: E402
 
 from torchnep.ase_calculator import NEP                 # noqa: E402
+from torchnep.model import NEPModel                     # noqa: E402
 from torchnep.nep import NEPCalculator                  # noqa: E402
 from torchnep.data import read_xyz                      # noqa: E402
 from _common import FIXTURES, load_reference            # noqa: E402
@@ -48,6 +49,56 @@ def _atoms_from_frame(fr):
     return Atoms(symbols=list(fr["species"]),
                  positions=np.asarray(fr["positions"]),
                  cell=np.asarray(fr["cell"]), pbc=True)
+
+
+@pytest.fixture
+def spin_model(tmp_path):
+    config = {
+        "num_types": 2,
+        "type_names": ["Fe", "Ge"],
+        "cutoff_radial": 4.5,
+        "cutoff_angular": 4.0,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 2,
+        "basis_size_angular": 2,
+        "l_max": [2, 0, 0],
+        "neuron": 6,
+        "spin_mode": 1,
+        "spin_chiral": 1,
+        "spin_compress": 2,
+        "spin_n_max": [1, 0],
+        "spin_basis_size": [2, 2],
+        "spin_l_max": [2, 0, 0],
+        "spin_cutoff": [4.5, 4.0],
+        "spin_dof_type": ["Fe"],
+        "spin_env_type": ["Fe", "Ge"],
+    }
+    path = tmp_path / "spin-nep.txt"
+    torch.manual_seed(7)
+    NEPModel(config).double().save_nep_txt(path, 16, 16)
+    return path
+
+
+def _spin_atoms():
+    atoms = Atoms(
+        symbols=["Fe", "Ge", "Fe", "Ge"],
+        positions=[
+            [1.0, 1.0, 1.0],
+            [2.2, 1.1, 1.0],
+            [1.3, 2.0, 1.4],
+            [0.8, 1.5, 2.1],
+        ],
+        cell=np.eye(3) * 8.0,
+        pbc=True,
+    )
+    atoms.set_array("spins", np.array([
+        [0.8, 0.1, 0.2],
+        [0.2, 0.9, -0.1],
+        [-0.3, 0.4, 0.7],
+        [0.5, -0.2, 0.6],
+    ]))
+    return atoms
 
 
 def test_matches_core_and_gpumd_reference():
@@ -149,3 +200,58 @@ def test_non_periodic_has_no_stress():
     assert np.isfinite(e)
     assert np.isfinite(f).all()
     assert "stress" not in atoms.calc.results
+
+
+def test_spin_results_match_core(spin_model):
+    atoms = _spin_atoms()
+    atoms.calc = NEP(str(spin_model), dtype="float64")
+
+    energy = atoms.get_potential_energy()
+    forces = atoms.get_forces()
+    mforces = atoms.calc.get_magnetic_forces(atoms)
+    tau = atoms.calc.get_spin_torques(atoms)
+
+    core = NEPCalculator(str(spin_model), dtype=torch.float64)
+    expected = core.compute(
+        atoms.get_chemical_symbols(), atoms.get_positions(),
+        np.asarray(atoms.cell), spins=atoms.arrays["spins"])
+    assert energy == pytest.approx(float(expected["energy"].sum()), abs=1e-10)
+    assert np.allclose(forces, expected["forces"].numpy(), atol=1e-10)
+    assert np.allclose(mforces, expected["mforces"].numpy(), atol=1e-10)
+    assert np.allclose(tau, expected["tau"].numpy(), atol=1e-10)
+    assert np.allclose(tau, np.cross(atoms.arrays["spins"], mforces))
+    assert np.allclose(mforces[[1, 3]], 0.0)
+
+
+def test_spin_array_change_invalidates_ase_cache(spin_model):
+    atoms = _spin_atoms()
+    atoms.calc = NEP(str(spin_model), dtype="float64")
+    first = atoms.calc.get_magnetic_forces(atoms)
+
+    atoms.arrays["spins"][0, 0] += 0.25
+    second = atoms.calc.get_magnetic_forces(atoms)
+
+    assert not np.allclose(first, second)
+    assert np.array_equal(
+        atoms.calc.atoms.arrays["spins"], atoms.arrays["spins"])
+
+
+def test_spin_input_conventions_and_tiled_boundary(spin_model):
+    atoms = _spin_atoms()
+    spins = atoms.arrays.pop("spins")
+    atoms.set_initial_magnetic_moments(spins[:, 2])
+    atoms.calc = NEP(str(spin_model), dtype="float64", tiled="auto")
+    atoms.calc.tiled_threshold = 0
+    assert np.isfinite(atoms.get_potential_energy())
+    expected_spins = np.column_stack((
+        np.zeros(len(atoms)), np.zeros(len(atoms)), spins[:, 2]))
+    assert np.array_equal(atoms.calc._spin_vectors(atoms), expected_spins)
+
+    atoms.calc = NEP(str(spin_model), dtype="float64", tiled=True)
+    with pytest.raises(NotImplementedError, match="tiled=True"):
+        atoms.get_potential_energy()
+
+    atoms.set_initial_magnetic_moments(None)
+    atoms.calc = NEP(str(spin_model), dtype="float64")
+    with pytest.raises(ValueError, match="requires per-atom moments"):
+        atoms.get_potential_energy()

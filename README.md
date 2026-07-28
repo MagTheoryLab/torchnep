@@ -366,6 +366,25 @@ parts = atoms.calc.get_components()
 print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 ```
 
+For a Spin NEP Lite model, provide one three-component moment per atom through
+an ASE array named `spins`, `spin`, `moments`, or `moment`. ASE
+`initial_magmoms` are also accepted; scalar collinear moments are interpreted
+along the z axis:
+
+```python
+atoms.set_array("spins", spin_vectors)  # shape (N, 3), magnetic moments
+atoms.calc = NEP("nep.txt", dtype="float32", device="cuda")
+
+print(atoms.get_potential_energy())
+print(atoms.get_forces())
+print(atoms.calc.get_magnetic_forces(atoms))  # -dE/dspin
+print(atoms.calc.get_spin_torques(atoms))     # spin x mforce
+```
+
+Changing the spin array invalidates ASE's calculator cache. `tiled="auto"`
+uses the regular autograd path for spin models; explicitly requesting
+`tiled=True` is unsupported until the analytical tiled spin kernels exist.
+
 ### Full-dataset prediction
 
 Runs batched GPU inference on an entire `.xyz` file and writes GPUMD-compatible output files.
