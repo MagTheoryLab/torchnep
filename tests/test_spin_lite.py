@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pytest
 import os
@@ -15,6 +16,8 @@ from torchnep.spin import (
     SpinNEPLiteChiralDescriptor,
     SpinNEPLiteDescriptor,
 )
+
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 def _config(chiral=0):
@@ -206,6 +209,33 @@ def test_spin_nep_txt_roundtrip_uses_counted_protocol(tmp_path, chiral):
                     result["mforces"], dim=-1),
     )
     assert torch.count_nonzero(result["mforces"][1::2]) == 0
+
+
+def test_spin_lite_chiral_matches_pre_migration_numeric_oracle():
+    """Pin the standalone migration to the old Lite/chiral implementation."""
+    oracle = json.loads(
+        (DATA_DIR / "spin_lite_chiral_oracle.json").read_text())
+    assert oracle["provenance"]["commit"] == (
+        "4cf46779a66294e0ed3bd54f60ae88b3b4e708ae")
+
+    calculator = NEPCalculator(
+        DATA_DIR / "nep_spin_lite_chiral_oracle.txt",
+        dtype=torch.float64,
+        device="cpu",
+    )
+    result = calculator.compute(
+        oracle["species"],
+        np.asarray(oracle["positions"]),
+        np.asarray(oracle["cell"]),
+        spins=np.asarray(oracle["spins"]),
+        compute_descriptor=True,
+    )
+
+    for name in (
+            "energy", "forces", "virial", "mforces", "tau", "descriptor"):
+        actual = result[name].detach().cpu().numpy()
+        expected = np.asarray(oracle[name])
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-15)
 
 
 def test_xyz_parser_reads_spin_and_mforce_aliases(tmp_path):

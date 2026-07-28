@@ -30,6 +30,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from torchnep.data import read_xyz
 from torchnep.model import NEPModel
 from torchnep.nep import NEPCalculator
 
@@ -80,3 +81,38 @@ def test_legacy_3field_nep_txt_loads():
     # Sanity on derived dim:
     # radial (n_max_r+1=9) + 3-body (9*4=36) + q_222 (9) + q_1111 (9) = 63
     assert calc.dim == 63
+
+
+@pytest.mark.parametrize("assignment", [
+    "energy=-1.25",
+    "energy =-1.25",
+    "energy= -1.25",
+    "energy = -1.25",
+    "ENERGY \t= \t-1.25",
+])
+def test_extxyz_scalar_energy_accepts_whitespace_around_equals(
+        tmp_path, assignment):
+    xyz = tmp_path / "energy-whitespace.xyz"
+    xyz.write_text(
+        "1\n"
+        f'Lattice="5 0 0 0 5 0 0 0 5" {assignment} '
+        'Properties=species:S:1:pos:R:3\n'
+        "X 0 0 0\n"
+    )
+
+    frame = read_xyz(xyz)[0]
+    assert frame["energy"] == pytest.approx(-1.25)
+
+
+def test_extxyz_energy_does_not_match_atomization_energy(tmp_path):
+    xyz = tmp_path / "energy-key-boundary.xyz"
+    xyz.write_text(
+        "1\n"
+        'Lattice="5 0 0 0 5 0 0 0 5" atomization_energy = -2.5 '
+        'Properties=species:S:1:pos:R:3\n'
+        "X 0 0 0\n"
+    )
+
+    assert "energy" not in read_xyz(xyz)[0]
+    assert read_xyz(xyz, energy_key="atomization_energy")[0][
+        "energy"] == pytest.approx(-2.5)

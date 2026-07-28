@@ -17,6 +17,8 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
+import re
+
 import numpy as np
 from typing import Dict, List
 
@@ -186,24 +188,14 @@ def _find_quoted(comment: str, key: str):
 def _find_scalar(comment: str, key: str):
     """Return the string value after ``key=`` (unquoted) or None if absent.
 
-    Matches ``key`` case-insensitively. Only returns a match when ``key=``
-    is preceded by whitespace or start of string — prevents
+    Matches ``key`` case-insensitively and accepts whitespace around ``=``.
+    Only returns a match when ``key`` is preceded by whitespace or start of
+    string — prevents
     ``atomization_energy=`` from matching ``energy=``.
     """
-    low = comment.lower()
-    needle = key.lower() + "="
-    start = 0
-    while True:
-        i = low.find(needle, start)
-        if i < 0:
-            return None
-        if i == 0 or low[i - 1] in (" ", "\t"):
-            i += len(needle)
-            j = i
-            while j < len(comment) and comment[j] not in (" ", "\t", '"'):
-                j += 1
-            return comment[i:j]
-        start = i + 1
+    pattern = rf"(?<!\S){re.escape(key)}\s*=\s*([^\s\"]+)"
+    match = re.search(pattern, comment, flags=re.IGNORECASE)
+    return None if match is None else match.group(1)
 
 
 def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dict:
