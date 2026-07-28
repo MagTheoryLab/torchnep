@@ -439,41 +439,21 @@ class NEPModel(nn.Module):
                                    create_graph: bool | None = None):
         """Compute energy, forces, virial using precomputed basis.
 
-        Uses fully analytical force computation — no create_graph=True needed.
-        Forces are differentiable through c2, c3 (via Fp->NN weights and via s->c3).
+        Uses the analytical structural chain and cached analytical spin VJPs
+        for both plain and chiral Spin NEP Lite. Forces remain differentiable
+        through descriptor and fitting parameters.
 
         ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
         """
         dtype = self.q_scaler.dtype
         device = self.q_scaler.device
         N = batch["N"]
-
-        # Spin training uses the autograd path so forces and magnetic forces
-        # remain differentiable through the descriptor. The structural-only
-        # model keeps the fast analytical path below unchanged.
-        if self.spin_descriptor is not None:
-            with torch.enable_grad():
-                return self.compute_properties(
-                    batch["rij_rad"], batch["rij_ang"],
-                    batch["pair_i_rad"], batch["pair_j_rad"],
-                    batch["pair_i_ang"], batch["pair_j_ang"],
-                    batch["atom_types"], N,
-                    batch["struct_idx"], batch["num_structures"],
-                    need_forces=need_forces,
-                    need_virial=need_virial,
-                    backend=backend,
-                    spins=batch.get("spins"),
-                    need_mforce=batch.get("need_mforce", False),
-                    need_tau=batch.get("need_tau", False),
-                    rij_spin=batch.get("rij_spin"),
-                    pi_spin=batch.get("pair_i_spin"),
-                    pj_spin=batch.get("pair_j_spin"),
-                    create_graph=create_graph,
-                )
+        need_mforce = batch.get("need_mforce", False)
+        need_tau = batch.get("need_tau", False)
 
         # Descriptors from cached basis.
         # When forces needed: return intermediates (s, gn_ang) for analytical force.
-        if need_forces:
+        if need_forces or need_virial:
             q, s, gn_ang = ops.compute_descriptors_cached(
                 batch["fk_rad"], batch["fk_ang"], batch["blm"],
                 batch["pair_i_rad"], batch["pair_j_rad"],
@@ -507,6 +487,36 @@ class NEPModel(nn.Module):
             has_q_134=self.has_q_134,
             )
             s = gn_ang = None
+
+        spin_cache = None
+        if self.spin_descriptor is not None:
+            spins = batch.get("spins")
+            if spins is None:
+                raise ValueError("spin_mode requires per-atom spins")
+            rij_spin = batch.get("rij_spin", batch["rij_rad"])
+            pi_spin = batch.get("pair_i_spin", batch["pair_i_rad"])
+            pj_spin = batch.get("pair_j_spin", batch["pair_j_rad"])
+            need_spin_vjp = (
+                need_forces or need_virial or need_mforce or need_tau)
+            if need_spin_vjp:
+                q_spin, spin_cache = self.spin_descriptor.forward_with_cache(
+                    rij_spin, pi_spin, pj_spin,
+                    spins, N, batch["atom_types"], self.c_param_spin,
+                    None, self.spin_dof_type_active,
+                    self.spin_env_type_active,
+                    rij_coupled=batch["rij_ang"],
+                    pair_i_coupled=batch["pair_i_ang"],
+                    pair_j_coupled=batch["pair_j_ang"])
+            else:
+                q_spin = self.spin_descriptor(
+                    rij_spin, pi_spin, pj_spin,
+                    spins, N, batch["atom_types"], self.c_param_spin,
+                    None, self.spin_dof_type_active,
+                    self.spin_env_type_active,
+                    rij_coupled=batch["rij_ang"],
+                    pair_i_coupled=batch["pair_i_ang"],
+                    pair_j_coupled=batch["pair_j_ang"])
+            q = torch.cat([q, q_spin], dim=-1)
 
         q_scaled = q * self.q_scaler
 
@@ -545,6 +555,7 @@ class NEPModel(nn.Module):
         # Nail the unused-type gradient path into Ei without changing its value.
         Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1  # subtract shared output bias
+        Ei = Ei + self.energy_baseline[batch["atom_types"]]
 
         # ZBL energy + forces (no trainable params; local autograd on rij_ang).
         # enable_grad: end-of-training predict_from_store wraps this call in
@@ -561,7 +572,7 @@ class NEPModel(nn.Module):
                     self.zbl_rc_inner, self.zbl_rc_outer, self.zbl_typewise_factor,
                     getattr(self, "zbl_rc_inner_per_type", None),
                     getattr(self, "zbl_rc_outer_per_type", None), dtype, device)
-                if need_forces and Ei_zbl.requires_grad:
+                if (need_forces or need_virial) and Ei_zbl.requires_grad:
                     g_zbl = torch.autograd.grad(Ei_zbl.sum(), rij_zbl,
                                                 allow_unused=True)[0]
                 else:
@@ -582,9 +593,8 @@ class NEPModel(nn.Module):
 
         result = {"Ei": Ei, "Etot": Etot}
 
-        if need_forces:
-            # Analytical forces: fully differentiable through c2/c3 and NN weights (Fp).
-            # No create_graph=True needed — chain rule is computed explicitly.
+        if need_forces or need_virial:
+            # Structural and spin forces use explicit chain rules.
             forces, virial = ops.compute_analytical_forces(
                 Fp, batch["atom_types"], N,
                 self.c_param_2, self.c_param_3,
@@ -609,9 +619,40 @@ class NEPModel(nn.Module):
                 forces = forces + zbl_forces
                 if need_virial:
                     virial = virial + zbl_virial
-            result["forces"] = forces
+            if self.spin_descriptor is not None:
+                grad_rij_spin, grad_rij_coupled = (
+                    self.spin_descriptor.rij_vjps_from_cache(
+                        Fp[:, self.struct_dim:], spin_cache)
+                )
+                rij_spin = batch.get("rij_spin", batch["rij_rad"])
+                pi_spin = batch.get("pair_i_spin", batch["pair_i_rad"])
+                pj_spin = batch.get("pair_j_spin", batch["pair_j_rad"])
+                spin_forces, spin_virial = ops.accumulate_forces_virial(
+                    N,
+                    pi_spin, pj_spin, rij_spin, grad_rij_spin,
+                    batch["pair_i_ang"], batch["pair_j_ang"],
+                    batch["rij_ang"], grad_rij_coupled,
+                    dtype, device)
+                forces = forces + spin_forces
+                if need_virial:
+                    virial = virial + spin_virial
+            if need_forces:
+                result["forces"] = forces
             if need_virial and virial is not None:
                 result["virial"] = virial
+
+        if self.spin_descriptor is not None and (need_mforce or need_tau):
+            grad_spin = self.spin_descriptor.spin_vjp_from_cache(
+                Fp[:, self.struct_dim:], spin_cache)
+            mforces = -grad_spin
+            active = self.spin_dof_type_active[
+                batch["atom_types"]].to(dtype=mforces.dtype).unsqueeze(-1)
+            mforces = mforces * active
+            if need_mforce:
+                result["mforces"] = mforces
+            if need_tau:
+                result["tau"] = torch.cross(
+                    batch["spins"], mforces, dim=-1)
 
         return result
 

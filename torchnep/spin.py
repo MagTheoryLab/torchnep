@@ -192,7 +192,6 @@ class SpinNEPLiteDescriptor(torch.nn.Module):
         self.basis_size_radial = int(basis_size_radial)
         self.cutoff_radial = float(cutoff_radial)
         self.eps = float(eps)
-        self.requires_autograd_forces = False
         self.spin_l_max = int(spin_l_max)
         self.split_l1_dot = bool(split_l1_dot)
         self.schema = build_spin_nep_lite_schema(
@@ -436,17 +435,11 @@ class SpinNEPLiteDescriptor(torch.nn.Module):
             spin_env_type_active, rij_coupled)
 
     def spin_vjp_from_cache(self, Fp_spin: torch.Tensor, cache) -> torch.Tensor:
-        if cache.get("autograd_vjp", False):
-            return self._cached_autograd_vjps(Fp_spin, cache, need_rij=False)[1]
         return self._cached_manual_vjps(Fp_spin, cache, need_rij=False)[1]
 
     def rij_vjps_from_cache(self, Fp_spin: torch.Tensor, cache):
-        if cache.get("autograd_vjp", False):
-            grad_rij = self._cached_autograd_vjps(
-                Fp_spin, cache, need_rij=True)[0]
-        else:
-            grad_rij = self._cached_manual_vjps(
-                Fp_spin, cache, need_rij=True)[0]
+        grad_rij = self._cached_manual_vjps(
+            Fp_spin, cache, need_rij=True)[0]
         rij_coupled = cache.get("rij_coupled")
         grad_coupled = (
             grad_rij.new_zeros((0, 3))
@@ -660,46 +653,6 @@ class SpinNEPLiteDescriptor(torch.nn.Module):
             Fp_spin, cache, need_rij=need_rij)
         cache["_manual_vjps"] = {
             "fp_key": fp_key,
-            "has_rij": need_rij,
-            "grad_rij": grad_rij,
-            "grad_spins": grad_spins,
-        }
-        return grad_rij, grad_spins
-
-    def _cached_autograd_vjps(self, Fp_spin: torch.Tensor, cache,
-                              need_rij: bool):
-        cached = cache.get("_autograd_vjps")
-        fp_key = self._vjp_tensor_key(Fp_spin)
-        create_graph = bool(cache.get(
-            "_torchnep_create_graph", self.training,
-        ))
-        if (cached is not None and cached["fp_key"] == fp_key
-                and cached["create_graph"] is create_graph):
-            if cached["has_rij"] or not need_rij:
-                return cached["grad_rij"], cached["grad_spins"]
-        q = cache["q"]
-        if not q.requires_grad:
-            grad_rij = torch.zeros_like(cache["rij"])
-            grad_spins = torch.zeros_like(cache["spins"])
-        else:
-            tensors = (
-                (cache["rij"], cache["spins"])
-                if need_rij else (cache["spins"],)
-            )
-            grads = torch.autograd.grad(
-                q, tensors, grad_outputs=Fp_spin, retain_graph=True,
-                create_graph=create_graph, allow_unused=True)
-            if need_rij:
-                grad_rij, grad_spins = grads
-            else:
-                grad_rij, grad_spins = None, grads[0]
-            if grad_rij is None:
-                grad_rij = torch.zeros_like(cache["rij"])
-            if grad_spins is None:
-                grad_spins = torch.zeros_like(cache["spins"])
-        cache["_autograd_vjps"] = {
-            "fp_key": fp_key,
-            "create_graph": create_graph,
             "has_rij": need_rij,
             "grad_rij": grad_rij,
             "grad_spins": grad_spins,
@@ -1208,7 +1161,7 @@ class SpinNEPLiteChiralDescriptor(SpinNEPLiteDescriptor):
             self.spin_compress, self.spin_l_max, self.split_l1_dot)
         self.dim = self.schema[-1].stop if self.schema else 0
         self.chi_compress = min(2, self.spin_compress)
-        combos3, combos4, m4_from_m3, m4_coord, m3, m4, eps_tensor = (
+        combos3, _, m4_from_m3, m4_coord, m3, m4, eps_tensor = (
             _spin_lite_chiral_packed_constants())
         self.register_buffer(
             "_chiral_m3_index", torch.tensor(combos3, dtype=torch.long),
@@ -1239,21 +1192,11 @@ class SpinNEPLiteChiralDescriptor(SpinNEPLiteDescriptor):
                            rij_coupled: torch.Tensor = None,
                            pair_i_coupled: torch.Tensor = None,
                            pair_j_coupled: torch.Tensor = None):
-        del c_spin_3body, pair_i_coupled, pair_j_coupled
-        with torch.enable_grad():
-            rij_leaf = rij.detach().requires_grad_(True)
-            spins_leaf = spins.detach().requires_grad_(True)
-            q = self.forward(
-                rij_leaf, pair_i, pair_j, spins_leaf, N, atom_types,
-                c_spin_2body, None, spin_dof_type_active,
-                spin_env_type_active)
-        return q, {
-            "q": q,
-            "rij": rij_leaf,
-            "spins": spins_leaf,
-            "rij_coupled": rij_coupled,
-            "autograd_vjp": True,
-        }
+        del pair_i_coupled, pair_j_coupled
+        return self._forward_with_manual_cache(
+            rij, pair_i, pair_j, spins, N, atom_types,
+            c_spin_2body, c_spin_3body, spin_dof_type_active,
+            spin_env_type_active, rij_coupled)
 
     def _extra_blocks_cached(
             self, rhat: torch.Tensor,
@@ -1328,9 +1271,9 @@ class SpinNEPLiteChiralDescriptor(SpinNEPLiteDescriptor):
             structs = geom_rank2
             polars = self._edge_density(rhat, weights, pair_i, N)
 
-        chirals = self._bulk_chirality(
+        chirals, bulk_cache = self._bulk_chirality(
             weights[:, :self.chi_compress], rhat, pair_i, N,
-            structs[:, :self.chi_compress])
+            structs[:, :self.chi_compress], return_cache=True)
         struct_r = (
             structs[pair_i] * rhat[:, None, None, :]
         ).sum(dim=-1)
@@ -1348,11 +1291,14 @@ class SpinNEPLiteChiralDescriptor(SpinNEPLiteDescriptor):
             "polars": polars,
             "chirals": chirals,
             "pseudodevs": pseudodevs,
+            "bulk": bulk_cache,
+            "struct_r": struct_r,
+            "pseudo_edge": pseudo_edge,
         }
 
     def _bulk_chirality(self, weights: torch.Tensor, rhat: torch.Tensor,
                         pair_i: torch.Tensor, N: int,
-                        Q: torch.Tensor = None):
+                        Q: torch.Tensor = None, return_cache: bool = False):
         num_channels = weights.shape[1]
         u = rhat
 
@@ -1380,10 +1326,242 @@ class SpinNEPLiteChiralDescriptor(SpinNEPLiteDescriptor):
         q_vec = Q.transpose(-1, -2)
         o_vec = O.permute(0, 1, 3, 4, 2)
         h_vec = H.permute(0, 1, 3, 4, 5, 2)
-        return (torch.cross(
+        chirals = (torch.cross(
             q_vec[:, :, :, None, None, :],
             o_vec[:, :, None, :, :, :],
             dim=-1) * h_vec).sum(dim=(-1, -2, -3, -4))
+        if not return_cache:
+            return chirals
+        return chirals, {
+            "m3": m3,
+            "m4": m4,
+            "O": O,
+            "H": H,
+        }
+
+    def _extra_vjp(self, Fp_spin: torch.Tensor, cache, grad_state,
+                   need_rij: bool):
+        del need_rij
+        offset = grad_state["offset"]
+        grad_weight = grad_state["grad_weight"]
+        grad_rhat = grad_state["grad_rhat"]
+        grad_si = grad_state["grad_si"]
+        grad_sj = grad_state["grad_sj"]
+        pair_i = cache["pair_i"]
+        weights = cache["weights"]
+        rhat = cache["rhat"]
+        si = cache["si"]
+        sj = cache["sj"]
+        fields = cache["lite_chiral_fields"]
+        C = self.spin_compress
+        chiC = self.chi_compress
+
+        spin_chiral = torch.cross(si, sj, dim=-1)
+        grad_chiral = torch.zeros_like(spin_chiral)
+        grad_chi = fields["chirals"].new_zeros(fields["chirals"].shape)
+        grad_polar = fields["polars"].new_zeros(fields["polars"].shape)
+        grad_pseudodev = fields["pseudodevs"].new_zeros(
+            fields["pseudodevs"].shape)
+
+        alpha = Fp_spin[pair_i, offset:offset + chiC]
+        chi_i = fields["chirals"][pair_i]
+        xu = (spin_chiral * rhat).sum(dim=-1)
+        grad_weight_chi = alpha * xu.unsqueeze(-1) * chi_i
+        grad_weight = torch.cat((
+            grad_weight[:, :chiC] + grad_weight_chi,
+            grad_weight[:, chiC:],
+        ), dim=-1)
+        aw = alpha * weights[:, :chiC]
+        grad_chi = grad_chi.index_add_(
+            0, pair_i, aw * xu.unsqueeze(-1))
+        grad_chiral = grad_chiral + (
+            aw * chi_i).sum(dim=-1, keepdim=True) * rhat
+        grad_rhat = grad_rhat + (
+            aw * chi_i).sum(dim=-1, keepdim=True) * spin_chiral
+        offset += chiC
+
+        alpha = Fp_spin[pair_i, offset:offset + C]
+        polar_i = fields["polars"][pair_i]
+        polar_axis = torch.cross(polar_i, rhat.unsqueeze(1), dim=-1)
+        xa = (spin_chiral.unsqueeze(1) * polar_axis).sum(dim=-1)
+        grad_weight = grad_weight + alpha * xa
+        aw = alpha * weights
+        grad_chiral = grad_chiral + (
+            aw.unsqueeze(-1) * polar_axis).sum(dim=1)
+        grad_axis = aw.unsqueeze(-1) * spin_chiral.unsqueeze(1)
+        grad_polar = grad_polar.index_add_(
+            0, pair_i,
+            torch.cross(
+                rhat.unsqueeze(1).expand_as(grad_axis),
+                grad_axis, dim=-1))
+        grad_rhat = grad_rhat + torch.cross(
+            grad_axis, polar_i, dim=-1).sum(dim=1)
+        offset += C
+
+        alpha = Fp_spin[pair_i, offset:offset + C]
+        pseudodev_i = fields["pseudodevs"][pair_i]
+        pseudo_axis = torch.matmul(
+            pseudodev_i, rhat[:, None, :, None]).squeeze(-1)
+        xa = (spin_chiral.unsqueeze(1) * pseudo_axis).sum(dim=-1)
+        grad_weight = grad_weight + alpha * xa
+        aw = alpha * weights
+        grad_chiral = grad_chiral + (
+            aw.unsqueeze(-1) * pseudo_axis).sum(dim=1)
+        grad_axis = aw.unsqueeze(-1) * spin_chiral.unsqueeze(1)
+        grad_pseudodev = grad_pseudodev.index_add_(
+            0, pair_i,
+            grad_axis.unsqueeze(-1) * rhat[:, None, None, :])
+        grad_rhat = grad_rhat + torch.matmul(
+            pseudodev_i.transpose(-1, -2),
+            grad_axis.unsqueeze(-1)).squeeze(-1).sum(dim=1)
+        offset += C
+
+        grad_si = grad_si + torch.cross(sj, grad_chiral, dim=-1)
+        grad_sj = grad_sj + torch.cross(grad_chiral, si, dim=-1)
+
+        grad_Q = torch.zeros_like(fields["structs"])
+        grad_O, grad_H, grad_Q_chi = self._bulk_chirality_vjp(
+            grad_chi, fields)
+        grad_Q = torch.cat((
+            grad_Q[:, :chiC] + grad_Q_chi,
+            grad_Q[:, chiC:],
+        ), dim=1)
+
+        grad_weight, grad_rhat = self._polar_density_vjp(
+            cache, grad_polar, grad_weight, grad_rhat)
+        grad_weight, grad_rhat, grad_Q_pseudo = self._pseudodev_vjp(
+            cache, fields, grad_pseudodev, grad_weight, grad_rhat)
+        grad_Q = grad_Q + grad_Q_pseudo
+        grad_weight, grad_rhat = self._qoh_density_vjp(
+            cache, fields, grad_Q, grad_O, grad_H,
+            grad_weight, grad_rhat)
+
+        grad_state.update({
+            "offset": offset,
+            "grad_weight": grad_weight,
+            "grad_rhat": grad_rhat,
+            "grad_si": grad_si,
+            "grad_sj": grad_sj,
+        })
+        return grad_state
+
+    def _bulk_chirality_vjp(self, grad_chi, fields):
+        bulk = fields["bulk"]
+        Q = fields["structs"][:, :self.chi_compress]
+        O = bulk["O"]
+        H = bulk["H"]
+        eps = self._chiral_eps.to(dtype=Q.dtype, device=Q.device)
+        grad_Q = torch.einsum(
+            "xab,nkbef,nkxdef,nk->nkad", eps, O, H, grad_chi)
+        grad_O = torch.einsum(
+            "xab,nkad,nkxdef,nk->nkbef", eps, Q, H, grad_chi)
+        grad_H = torch.einsum(
+            "xab,nkad,nkbef,nk->nkxdef", eps, Q, O, grad_chi)
+        return grad_O, grad_H, grad_Q
+
+    def _pseudodev_vjp(self, cache, fields, grad_pseudodev,
+                       grad_weight, grad_rhat):
+        pair_i = cache["pair_i"]
+        weights = cache["weights"]
+        rhat = cache["rhat"]
+        structs_i = fields["structs"][pair_i]
+        struct_r = fields["struct_r"]
+        pseudo_edge = fields["pseudo_edge"]
+        grad_center = grad_pseudodev[pair_i]
+
+        grad_weight = grad_weight + (
+            grad_center * pseudo_edge).sum(dim=(-1, -2))
+        grad_stf = grad_center * weights[:, :, None, None]
+        pseudo_axis = torch.cross(
+            rhat.unsqueeze(1), struct_r, dim=-1)
+        grad_axis = _stf_outer_pair_vjp(
+            grad_stf.reshape(-1, 3, 3),
+            rhat[:, None, :].expand_as(struct_r).reshape(-1, 3),
+        ).reshape_as(struct_r)
+        grad_u = _stf_outer_pair_vjp(
+            grad_stf.reshape(-1, 3, 3),
+            pseudo_axis.reshape(-1, 3),
+        ).reshape_as(struct_r)
+
+        grad_u = grad_u + torch.cross(struct_r, grad_axis, dim=-1)
+        grad_struct_r = torch.cross(
+            grad_axis,
+            rhat.unsqueeze(1).expand_as(struct_r), dim=-1)
+        grad_Q_edge = (
+            grad_struct_r.unsqueeze(-1)
+            * rhat[:, None, None, :])
+        grad_Q = fields["structs"].new_zeros(fields["structs"].shape)
+        grad_Q = grad_Q.index_add_(0, pair_i, grad_Q_edge)
+        grad_u = grad_u + torch.matmul(
+            structs_i.transpose(-1, -2),
+            grad_struct_r.unsqueeze(-1)).squeeze(-1)
+        grad_rhat = grad_rhat + grad_u.sum(dim=1)
+        return grad_weight, grad_rhat, grad_Q
+
+    def _qoh_density_vjp(self, cache, fields, grad_Q, grad_O, grad_H,
+                         grad_weight, grad_rhat):
+        pair_i = cache["pair_i"]
+        weights = cache["weights"]
+        rhat = cache["rhat"]
+        chiC = self.chi_compress
+
+        stf_rr = cache["stf_rr_edge"].reshape(-1, 3, 3)
+        grad_Q_edge = grad_Q[pair_i]
+        grad_weight = grad_weight + (
+            grad_Q_edge * stf_rr[:, None]).sum(dim=(-1, -2))
+        grad_rhat = grad_rhat + _stf_outer_vjp(
+            (grad_Q_edge * weights[:, :, None, None]).sum(dim=1),
+            rhat)
+
+        unpack3 = self._chiral_m3_unpack.to(
+            dtype=grad_O.dtype, device=grad_O.device)
+        unpack4 = self._chiral_m4_unpack.to(
+            dtype=grad_H.dtype, device=grad_H.device)
+        grad_p3 = torch.matmul(
+            grad_O.reshape(-1, 27), unpack3.transpose(0, 1)).reshape(
+                grad_O.shape[0], chiC, -1)
+        grad_p4 = torch.matmul(
+            grad_H.reshape(-1, 81), unpack4.transpose(0, 1)).reshape(
+                grad_H.shape[0], chiC, -1)
+        g3 = grad_p3[pair_i]
+        g4 = grad_p4[pair_i]
+        m3 = fields["bulk"]["m3"]
+        m4 = fields["bulk"]["m4"]
+        grad_weight_qoh = (
+            (g3 * m3[:, None, :]).sum(dim=-1)
+            + (g4 * m4[:, None, :]).sum(dim=-1))
+        grad_weight = torch.cat((
+            grad_weight[:, :chiC] + grad_weight_qoh,
+            grad_weight[:, chiC:],
+        ), dim=-1)
+        grad_m3 = (g3 * weights[:, :chiC, None]).sum(dim=1)
+        grad_m4 = (g4 * weights[:, :chiC, None]).sum(dim=1)
+        grad_rhat = grad_rhat + self._monomial34_vjp(
+            rhat, m3, grad_m3, grad_m4)
+        return grad_weight, grad_rhat
+
+    def _monomial34_vjp(self, rhat, m3, grad_m3, grad_m4):
+        E = rhat.shape[0]
+        from_m3 = self._chiral_m4_from_m3
+        coord4 = self._chiral_m4_coord
+        grad_m3 = grad_m3.scatter_add(
+            1, from_m3.unsqueeze(0).expand(E, -1),
+            grad_m4 * rhat[:, coord4])
+        grad_rhat = torch.zeros_like(rhat)
+        grad_rhat = grad_rhat.scatter_add(
+            1, coord4.unsqueeze(0).expand(E, -1),
+            grad_m4 * m3[:, from_m3])
+
+        index3 = self._chiral_m3_index
+        for slot in range(3):
+            other0 = index3[:, (slot + 1) % 3]
+            other1 = index3[:, (slot + 2) % 3]
+            contribution = (
+                grad_m3 * rhat[:, other0] * rhat[:, other1])
+            grad_rhat = grad_rhat.scatter_add(
+                1, index3[:, slot].unsqueeze(0).expand(E, -1),
+                contribution)
+        return grad_rhat
 
     def _bulk_chirality_loop(self, weights: torch.Tensor, rhat: torch.Tensor,
                              pair_i: torch.Tensor, N: int):

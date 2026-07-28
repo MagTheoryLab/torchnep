@@ -1317,12 +1317,11 @@ def train_nep(
         standard); False (default) -> analytical chain rule.
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` at the end.
-    use_compile : torch.compile the analytical compute method (~1.3x faster per
-        epoch after a one-time first-epoch compilation cost; needs Triton, which
-        ships with the CUDA PyTorch build). Ignored on the autograd force path
-        (incompatible with its double-backward). For an extra ~1.3x when memory
-        allows, also pass backend="bmm" (faster under compile but higher peak
-        memory — see docs/torch_compile.md).
+    use_compile : torch.compile the analytical compute method after a one-time
+        first-epoch compilation cost (needs Triton on CUDA). Supported by the
+        structural, Spin NEP Lite, and Spin NEP Lite chiral analytical paths;
+        ignored by autograd forces because they require double backward.
+        ``backend="auto"`` selects the compile-friendly bmm contractions.
     print_interval : log a line to screen every N epochs (all epochs still
         land in output.log).
     restart : on fresh output_dir, write new log; otherwise resume from
@@ -1693,12 +1692,18 @@ def train_nep(
         ok, msg = _compile_check(dev)
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
-        elif use_autograd_forces or model.spin_descriptor is not None:
+        elif use_autograd_forces:
             compile_msg = ("  torch.compile: skipped — incompatible with "
                            "autograd double-backward forces")
         else:
             compile_on = True
-            compile_msg = "  torch.compile: enabled (analytical compute method)"
+            method = (
+                "Spin NEP Lite chiral analytical compute method"
+                if model.spin_descriptor is not None and model.spin_chiral
+                else "Spin NEP Lite analytical compute method"
+                if model.spin_descriptor is not None
+                else "analytical compute method")
+            compile_msg = f"  torch.compile: enabled ({method})"
 
     # Resolve "auto" backend. ``backend`` is the eager backend for the one-shot
     # q_scaler pass (num_types-based: loop for few types, bmm for >=8).
@@ -1710,10 +1715,10 @@ def train_nep(
     backend = _resolve_backend(orig_backend, num_types=model.num_types)
     train_backend = _resolve_backend(
         orig_backend, num_types=model.num_types, use_compile=compile_on)
-    force_str = (
-        "autograd" if (use_autograd_forces
-                       or model.spin_descriptor is not None)
-        else "analytical")
+    if use_autograd_forces:
+        force_str = "autograd"
+    else:
+        force_str = "analytical"
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
              f"forces: {force_str}")

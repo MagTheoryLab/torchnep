@@ -696,7 +696,13 @@ def train_nep_sharded(
                            "autograd double-backward forces")
         else:
             compile_on = True
-            compile_msg = "  torch.compile: enabled (analytical compute method)"
+            method = (
+                "Spin NEP Lite chiral analytical compute method"
+                if model.spin_descriptor is not None and model.spin_chiral
+                else "Spin NEP Lite analytical compute method"
+                if model.spin_descriptor is not None
+                else "analytical compute method")
+            compile_msg = f"  torch.compile: enabled ({method})"
 
     # ``backend`` is the eager backend for the one-shot q_scaler pass
     # (num_types-based); ``train_backend`` is what the per-batch compute uses —
@@ -706,7 +712,10 @@ def train_nep_sharded(
     backend = _resolve_backend(orig_backend, num_types=model.num_types)
     train_backend = _resolve_backend(
         orig_backend, num_types=model.num_types, use_compile=compile_on)
-    force_str = "autograd" if use_autograd_forces else "analytical"
+    if use_autograd_forces:
+        force_str = "autograd"
+    else:
+        force_str = "analytical"
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
              f"forces: {force_str}")

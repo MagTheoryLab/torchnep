@@ -11,7 +11,7 @@ import torch
 from torchnep.data import build_neighbor_list_np, parse_nep_in, read_xyz
 from torchnep.model import NEPModel
 from torchnep.nep import NEPCalculator
-from torchnep.train import train_nep
+from torchnep.train import GPUDataStore, preprocess_structures, train_nep
 from torchnep.spin import (
     SpinNEPLiteChiralDescriptor,
     SpinNEPLiteDescriptor,
@@ -165,6 +165,231 @@ def test_spin_model_force_and_mforce_support_double_backward():
      + result["mforces"].square().mean()).backward()
     assert model.c_param_spin.grad is not None
     assert torch.isfinite(model.c_param_spin.grad).all()
+
+
+def _cached_spin_batch(chiral, spin_compress=2, spin_l_max=2):
+    config = dict(_config(chiral=chiral))
+    config["spin_compress"] = spin_compress
+    config["spin_n_max"] = [spin_compress - 1, 0]
+    config["spin_basis_size"] = [spin_compress - 1, spin_compress - 1]
+    config["spin_l_max"] = [spin_l_max, 0, 0]
+    config["spin_cutoff"] = [5.2, 4.0]
+    frame = {
+        "natoms": 4,
+        "species": ["Fe", "Ge", "Fe", "Ge"],
+        "cell": np.eye(3) * 12.0,
+        "positions": np.array([
+            [1.0, 1.0, 1.0],
+            [2.2, 1.1, 1.0],
+            [1.3, 2.0, 1.4],
+            [5.9, 1.0, 1.0],
+        ], dtype=np.float64),
+        "energy": 0.0,
+        "spins": np.array([
+            [0.8, 0.1, 0.2],
+            [0.2, 0.9, -0.1],
+            [-0.3, 0.4, 0.7],
+            [0.5, -0.2, 0.6],
+        ], dtype=np.float64),
+    }
+    structures = preprocess_structures(
+        [frame], config, dtype=np.float64, n_workers=1)
+    store = GPUDataStore(
+        structures, torch.device("cpu"), torch.float64, config=config)
+    batch = store.collate([0])
+    batch["need_mforce"] = True
+    batch["need_tau"] = True
+    return config, frame, batch
+
+
+def _autograd_spin_properties(model, batch):
+    return model.compute_properties(
+        batch["rij_rad"], batch["rij_ang"],
+        batch["pair_i_rad"], batch["pair_j_rad"],
+        batch["pair_i_ang"], batch["pair_j_ang"],
+        batch["atom_types"], batch["N"],
+        batch["struct_idx"], batch["num_structures"],
+        need_forces=True, need_virial=True,
+        spins=batch["spins"], need_mforce=True, need_tau=True,
+        rij_spin=batch["rij_spin"],
+        pi_spin=batch["pair_i_spin"],
+        pj_spin=batch["pair_j_spin"],
+    )
+
+
+def _spin_training_loss(result):
+    return sum(
+        result[name].square().mean()
+        for name in ("Etot", "forces", "virial", "mforces", "tau")
+    )
+
+
+@pytest.mark.parametrize("chiral", [0, 1])
+def test_cached_spin_chain_matches_autograd_outputs_and_training_grads(chiral):
+    torch.manual_seed(11)
+    config, _, batch = _cached_spin_batch(chiral)
+    model = NEPModel(config).double().train()
+    model.set_energy_baseline(torch.tensor([-1.25, 0.4]))
+
+    assert batch["rij_spin"].shape[0] > batch["rij_rad"].shape[0]
+
+    auto = _autograd_spin_properties(model, batch)
+    _spin_training_loss(auto).backward()
+    auto_grads = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+
+    model.zero_grad(set_to_none=True)
+    cached = model.compute_properties_cached(
+        batch, need_forces=True, need_virial=True)
+    _spin_training_loss(cached).backward()
+    cached_grads = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+
+    for name in ("Ei", "Etot", "forces", "virial", "mforces", "tau"):
+        torch.testing.assert_close(
+            cached[name], auto[name], atol=2e-9, rtol=2e-8)
+    assert cached_grads.keys() == auto_grads.keys()
+    for name in cached_grads:
+        torch.testing.assert_close(
+            cached_grads[name], auto_grads[name], atol=2e-8, rtol=2e-7,
+            msg=lambda message, name=name: f"{name}: {message}")
+
+
+@pytest.mark.parametrize(
+    ("spin_compress", "spin_l_max"), [(1, 0), (3, 3), (4, 4)])
+def test_chiral_analytical_vjp_matches_autograd_across_protocol_shapes(
+        spin_compress, spin_l_max):
+    torch.manual_seed(19)
+    config, _, batch = _cached_spin_batch(
+        1, spin_compress=spin_compress, spin_l_max=spin_l_max)
+    model = NEPModel(config).double().train()
+
+    auto = _autograd_spin_properties(model, batch)
+    _spin_training_loss(auto).backward()
+    auto_grads = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+
+    model.zero_grad(set_to_none=True)
+    cached = model.compute_properties_cached(
+        batch, need_forces=True, need_virial=True)
+    _spin_training_loss(cached).backward()
+    cached_grads = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+
+    for name in ("Ei", "Etot", "forces", "virial", "mforces", "tau"):
+        torch.testing.assert_close(
+            cached[name], auto[name], atol=3e-9, rtol=3e-8)
+    assert cached_grads.keys() == auto_grads.keys()
+    for name in cached_grads:
+        torch.testing.assert_close(
+            cached_grads[name], auto_grads[name], atol=3e-8, rtol=3e-7,
+            msg=lambda message, name=name: f"{name}: {message}")
+
+
+@pytest.mark.parametrize("chiral", [0, 1])
+def test_cached_spin_chain_does_not_call_whole_model_autograd(
+        monkeypatch, chiral):
+    config, _, batch = _cached_spin_batch(chiral)
+    model = NEPModel(config).double().train()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("cached spin training used whole-model autograd")
+
+    monkeypatch.setattr(model, "compute_properties", fail)
+    with monkeypatch.context() as local_patch:
+        local_patch.setattr(torch.autograd, "grad", fail)
+        result = model.compute_properties_cached(
+            batch, need_forces=True, need_virial=True)
+    _spin_training_loss(result).backward()
+    assert torch.isfinite(result["forces"]).all()
+    assert torch.isfinite(result["mforces"]).all()
+
+
+@pytest.mark.parametrize("chiral", [0, 1])
+def test_cached_spin_chain_supports_virial_without_force_output(chiral):
+    config, _, batch = _cached_spin_batch(chiral)
+    batch["need_mforce"] = False
+    batch["need_tau"] = False
+    model = NEPModel(config).double().eval()
+
+    cached = model.compute_properties_cached(
+        batch, need_forces=False, need_virial=True,
+        create_graph=False)
+    auto = model.compute_properties(
+        batch["rij_rad"], batch["rij_ang"],
+        batch["pair_i_rad"], batch["pair_j_rad"],
+        batch["pair_i_ang"], batch["pair_j_ang"],
+        batch["atom_types"], batch["N"],
+        batch["struct_idx"], batch["num_structures"],
+        need_forces=False, need_virial=True,
+        spins=batch["spins"], rij_spin=batch["rij_spin"],
+        pi_spin=batch["pair_i_spin"], pj_spin=batch["pair_j_spin"],
+        create_graph=False,
+    )
+
+    assert "forces" not in cached
+    torch.testing.assert_close(
+        cached["virial"], auto["virial"], atol=2e-9, rtol=2e-8)
+
+
+@pytest.mark.parametrize("chiral", [0, 1])
+def test_cached_spin_force_and_mforce_match_finite_differences(chiral):
+    config, frame, batch = _cached_spin_batch(chiral)
+    model = NEPModel(config).double().eval()
+    result = model.compute_properties_cached(
+        batch, need_forces=True, need_virial=True,
+        create_graph=False)
+    eps = 1.0e-6
+
+    def energy_at_positions(positions):
+        displaced = dict(frame)
+        displaced["positions"] = positions
+        structures = preprocess_structures(
+            [displaced], config, dtype=np.float64, n_workers=1)
+        store = GPUDataStore(
+            structures, torch.device("cpu"), torch.float64, config=config)
+        local_batch = store.collate([0])
+        return model.compute_properties_cached(
+            local_batch, need_forces=False)["Etot"][0]
+
+    positions_plus = frame["positions"].copy()
+    positions_minus = frame["positions"].copy()
+    positions_plus[1, 0] += eps
+    positions_minus[1, 0] -= eps
+    force_fd = -(
+        energy_at_positions(positions_plus)
+        - energy_at_positions(positions_minus)
+    ) / (2.0 * eps)
+    torch.testing.assert_close(
+        result["forces"][1, 0], force_fd, atol=2e-8, rtol=2e-7)
+
+    def energy_at_spins(spins):
+        local_batch = dict(batch)
+        local_batch["spins"] = spins
+        return model.compute_properties_cached(
+            local_batch, need_forces=False)["Etot"][0]
+
+    spins_plus = batch["spins"].clone()
+    spins_minus = batch["spins"].clone()
+    spins_plus[0, 1] += eps
+    spins_minus[0, 1] -= eps
+    mforce_fd = -(
+        energy_at_spins(spins_plus) - energy_at_spins(spins_minus)
+    ) / (2.0 * eps)
+    torch.testing.assert_close(
+        result["mforces"][0, 1], mforce_fd, atol=2e-8, rtol=2e-7)
 
 
 @pytest.mark.parametrize("chiral", [0, 1])
