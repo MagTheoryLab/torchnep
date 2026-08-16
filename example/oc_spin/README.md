@@ -1,0 +1,93 @@
+# O/C 磁势生产框架
+
+## 模型
+
+O/C 表示两个截断参数：
+
+- O（order）：局域磁集团的相关阶数；
+- C（compression）：所有收缩路径共享的径向秩。
+
+磁性侧的生产默认是 O3-C2（51D）；本示例通过 `n_max 4 4` 和
+`l_max 4 2 0` 配置了 30D 结构描述符。O2-C2 是 O3-C2 的严格
+37D 磁通道前缀；提高 C 会统一增加径向分辨率，而不是追加某个指定
+哈密顿量通道。
+
+每个原子的结构描述符和磁描述符进入同一个元素条件化非线性能量
+网络。总能量是唯一的学习输出，原子力、virial、磁力和力矩均由它
+求导得到，因此不会引入彼此不一致的独立响应 head。O/C 的全部磁
+通道在零磁矩时严格为零；每元素最小二乘能量 baseline 只负责移除
+总能量中的成分偏置。
+
+当前模型格式为 nep4_spin3。O/C 的 Python reference/training 路径
+使用 autograd 导数；下游 CUDA reader 在发布前仍需通过相同模型、
+输入和精度下的能量及全部导数 parity gate。
+
+## 训练日程
+
+O3-C2 默认启用内部 O2 到 O3 curriculum：
+
+1. Stage 1 前半段只更新 O2 前缀；
+2. Stage 1 后半段线性释放 O3 的 14 个新增输入行；
+3. 进入 Stage 2 的首个 epoch 时 O3 完全打开；
+4. Stage 2 保留 E/F/V/MF/Tau 监督，不把磁响应权重清零。
+
+600 epoch、Stage 2 从 400 epoch 开始时，对应 1--200 epoch 的
+O2 warm-up、201--399 epoch 的 O3 ramp，以及从 400 epoch 开始的
+完整 O3-C2 响应微调。curriculum 只改变训练路径，不写入模型格式，
+也不增加推理成本。
+
+O/C 使用由实际初始描述符统计得到的 self-consistent q-scaler。
+训练入口应保持 use_gpumd_qscaler=False；全一径向系数不适用于该
+描述符。
+
+## 受控响应结构
+
+受控结构仍然需要，但它们属于数据辨识和科学验收协议，不属于
+描述符输入，也不是新的模型参数。
+
+- J-like：同一几何下改变相对自旋夹角，并包含 reference 和
+  正负小角度分支；
+- D-like：同一几何下构造相反旋向的非共线分支，用奇偶组合隔离
+  反对称响应；
+- 磁各向异性：固定内部自旋拓扑，整体旋转自旋相对于晶格的方向；
+- 磁弹和体积响应：对同一组自旋 probe 重复对称的小应变或体积网格，
+  用 difference-of-differences 隔离混合导数。
+
+普通独立结构仍是主体，受控组不能替代结构和化学环境多样性。推荐
+在 extxyz 注释中使用以下通用字段：
+
+- response_group：同一基础结构及其全部 probe 的组标识；
+- response_probe：rotation、chirality、strain 或 volume；
+- response_coordinate：角度、应变或体积坐标；
+- response_branch：reference、plus 或 minus。
+- 每原子的 spin_tangent：该扫描点的 dS/dtheta，写入 extxyz 的
+  Properties 列。
+
+使用 valid_ratio 时，训练器按 response_group 整组划分，避免同一
+扫描轨迹同时进入训练和验证。最终验收还应保留完全未参与训练的
+基础结构或晶胞扫描。
+
+这些结构不要求额外提供 J 或 D 标签。对 rotation 组，三个以上不同
+response_coordinate、MF 和 spin_tangent 会在 Stage 2 自动启用稳健的
+磁力生成元曲线监督：每帧直接计算
+sum_i MF_i dot dS_i/dtheta，同时拟合组均值和中心化形状。这既保留
+常数响应分量，又避开能量二阶差分的 h^-2 噪声放大；训练仍只使用
+同一个标量能量 ANN。
+
+训练仍使用 DFT 的 E/F/MF/Tau；J-like、D-like 和磁弹量由成组预测的
+偶/奇响应及导数计算。
+当数据没有这些受控方向时，低总 RMSE 不能作为已经学准 J、D 或
+磁弹的证据。
+
+当前生产训练器实现了 rotation 生成元曲线监督及整组 train/valid
+隔离。chirality、strain、volume 仍作为普通绝对量监督和独立验收；
+尚未把它们硬编码成模型输出或专门 loss，因此不能据此宣称所有
+J/D/磁弹切片都已自动学准。
+
+## 当前不纳入生产面的策略
+
+- 额外线性响应 head 和最小二乘 warm-start；
+- freeze/unfreeze 的实验分支；
+- 写死 J、D 或某种 DMI 形式的输出 head；
+- 未经真实数据 gate 的双网络零磁态 residual；
+- 描述符内部 block 开关和 campaign 专用 callback。

@@ -206,7 +206,7 @@ def test_train_nep_b1_not_in_optimizer_and_analytic(tmp_path):
 
 
 def test_nep_best_not_worse_than_final(tmp_path):
-    """nep_best's energy fit must not be worse than nep_final's.
+    """nep_best's selected objective must not be worse than nep_final's.
 
     Both are saved with their own exact analytical b1 and the final epoch is
     always a best candidate, so nep_best can never end up worse than nep_final.
@@ -217,24 +217,40 @@ def test_nep_best_not_worse_than_final(tmp_path):
     train_nep(config_file=str(tmp_path / "nep.in"), data_file=xyz,
               output_dir=str(out), device="cpu", precision="float64",
               print_interval=100, restart=False, checkpoint_interval=10000,
-              prediction_interval=10000)
+              prediction_interval=10000, run_seed=1)
 
     cfg = parse_nep_in(str(tmp_path / "nep.in"))
     ds = _store(cfg)
 
-    def energy_mse(path):
+    def selected_objective(path):
         m = NEPModel(cfg).to(torch.float64)
         m.load_weights_from_nep_txt(path)
-        sq, n = 0.0, 0
+        sum_e = sum_f = 0.0
+        n_e = n_f = 0
         with torch.no_grad():
             for s in range(0, ds.n, 1000):
                 b = ds.collate(list(range(s, min(s + 1000, ds.n))))
-                r = m.compute_properties_cached(b, need_forces=False, backend="loop")
-                d = (r["Etot"] / b["natoms"] - b["energy"] / b["natoms"])[b["energy_mask"]]
-                sq += float((d ** 2).sum()); n += int(b["energy_mask"].sum())
-        return sq / max(n, 1)
+                r = m.compute_properties_cached(
+                    b, need_forces=True, backend="loop")
+                e_mask = b["energy_mask"]
+                e_diff = (
+                    r["Etot"] / b["natoms"]
+                    - b["energy"] / b["natoms"]
+                )[e_mask]
+                sum_e += float((e_diff ** 2).sum())
+                n_e += int(e_mask.sum())
+                f_mask = b["force_mask"]
+                f_diff = r["forces"][f_mask] - b["forces"][f_mask]
+                sum_f += float((f_diff ** 2).mean(dim=1).sum())
+                n_f += int(f_mask.sum())
+        return (
+            cfg["lambda_e"] * sum_e / max(n_e, 1)
+            + cfg["lambda_f"] * sum_f / max(n_f, 1)
+        )
 
-    assert energy_mse(str(out / "nep_best.txt")) <= energy_mse(str(out / "nep_final.txt")) + 1e-9
+    best = selected_objective(str(out / "nep_best.txt"))
+    final = selected_objective(str(out / "nep_final.txt"))
+    assert best <= final + 1e-9
 
 
 def test_train_nep_use_gpumd_qscaler(tmp_path):

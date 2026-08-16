@@ -36,7 +36,11 @@ inside ASE.  This is also why ``NEP`` is intentionally not re-exported from
 import numpy as np
 
 try:
-    from ase.calculators.calculator import Calculator, all_changes
+    from ase.calculators.calculator import (
+        Calculator,
+        PropertyNotImplementedError,
+        all_changes,
+    )
     from ase.stress import full_3x3_to_voigt_6_stress
 except ModuleNotFoundError as exc:  # pragma: no cover - exercised only sans ase
     raise ModuleNotFoundError(
@@ -78,8 +82,10 @@ class NEP(Calculator):
     atom sees a periodic image within the model cutoff.
     """
 
-    implemented_properties = ["energy", "energies", "free_energy",
-                              "forces", "stress"]
+    implemented_properties = [
+        "energy", "energies", "free_energy", "forces", "stress",
+        "mforces", "tau",
+    ]
 
     def __init__(self, model_file, dtype="float64", device="cpu",
                  tiled="auto", block_size="auto", compile=False, **kwargs):
@@ -109,9 +115,60 @@ class NEP(Calculator):
             return np.asarray(atoms.get_cell()[:], dtype=float), True
         pos = atoms.get_positions()
         rc = max(self.nep.rc_radial, self.nep.rc_angular)
+        if self.nep.spin_mode:
+            rc = max(rc, self.nep.spin_cutoff[0])
         span = pos.max(axis=0) - pos.min(axis=0) if len(pos) else np.zeros(3)
         box = np.diag(span + 4.0 * rc + 1.0)
         return box, False
+
+    def _spin_vectors(self, atoms):
+        """Return ASE magnetic moments as an ``(N, 3)`` spin array.
+
+        Vector arrays named ``spins``, ``spin``, ``moments``, or ``moment``
+        take precedence. ASE's standard ``initial_magmoms`` array is also
+        accepted; scalar collinear moments are interpreted as z-axis vectors.
+        """
+        spins = None
+        for name in ("spins", "spin", "moments", "moment"):
+            if atoms.has(name):
+                spins = np.asarray(atoms.get_array(name), dtype=float)
+                break
+        if spins is None and atoms.has("initial_magmoms"):
+            spins = np.asarray(
+                atoms.get_initial_magnetic_moments(), dtype=float)
+            if spins.ndim == 1:
+                spins = np.column_stack((
+                    np.zeros_like(spins), np.zeros_like(spins), spins))
+        if spins is None:
+            raise ValueError(
+                "Spin NEP requires per-atom moments. Set an (N, 3) ASE array "
+                "named 'spins', 'spin', 'moments', or 'moment', or call "
+                "atoms.set_initial_magnetic_moments(...).")
+        expected = (len(atoms), 3)
+        if spins.shape != expected:
+            raise ValueError(
+                f"ASE spin moments must have shape {expected}, got "
+                f"{spins.shape}")
+        if not np.isfinite(spins).all():
+            raise ValueError("ASE spin moments must contain only finite values")
+        return spins
+
+    def check_state(self, atoms, tol=1e-15):
+        """Include custom ASE spin arrays in calculator cache invalidation."""
+        changes = super().check_state(atoms, tol=tol)
+        if not self.nep.spin_mode or self.atoms is None:
+            return changes
+        try:
+            previous = self._spin_vectors(self.atoms)
+            current = self._spin_vectors(atoms)
+            spin_changed = (
+                previous.shape != current.shape
+                or not np.allclose(previous, current, rtol=0.0, atol=tol))
+        except ValueError:
+            spin_changed = True
+        if spin_changed and "spins" not in changes:
+            changes.append("spins")
+        return changes
 
     # -- ASE entry point ------------------------------------------------------
     def calculate(self, atoms=None, properties=("energy",),
@@ -121,15 +178,24 @@ class NEP(Calculator):
 
         cell, periodic = self._cell_for_neighbors(atoms)
         species = atoms.get_chemical_symbols()
+        spins = self._spin_vectors(atoms) if self.nep.spin_mode else None
         use_tiled = (self.tiled is True or
                      (self.tiled == "auto" and len(species) >= self.tiled_threshold))
+        if self.nep.spin_mode and self.tiled is True:
+            raise NotImplementedError(
+                "tiled=True is not supported for O/C spin models; use "
+                "tiled=False or tiled='auto'")
+        if self.nep.spin_mode:
+            # The analytical tiled kernels do not yet implement spin.
+            use_tiled = False
         if use_tiled:
             res = self.nep.compute_tiled(
                 species=species, positions=atoms.get_positions(),
                 cell=cell, block_size=self.block_size, compile=self.compile)
         else:
             res = self.nep.compute(
-                species=species, positions=atoms.get_positions(), cell=cell)
+                species=species, positions=atoms.get_positions(), cell=cell,
+                spins=spins)
         energies = res["energy"].detach().cpu().numpy()
         forces = res["forces"].detach().cpu().numpy()
 
@@ -137,10 +203,28 @@ class NEP(Calculator):
         self.results["energy"] = float(energies.sum())
         self.results["free_energy"] = self.results["energy"]
         self.results["forces"] = forces
+        if self.nep.spin_mode:
+            self.results["mforces"] = (
+                res["mforces"].detach().cpu().numpy())
+            self.results["tau"] = res["tau"].detach().cpu().numpy()
 
         if periodic:
             self.results["stress"] = self._stress_from_virial(
                 res["virial"], atoms.get_volume())
+
+    def get_magnetic_forces(self, atoms=None):
+        """Return magnetic forces ``-dE/dspin`` as an ``(N, 3)`` array."""
+        if not self.nep.spin_mode:
+            raise PropertyNotImplementedError(
+                "magnetic forces are only available for spin models")
+        return self.get_property("mforces", atoms)
+
+    def get_spin_torques(self, atoms=None):
+        """Return per-atom ``tau = spin x mforce`` as an ``(N, 3)`` array."""
+        if not self.nep.spin_mode:
+            raise PropertyNotImplementedError(
+                "spin torques are only available for spin models")
+        return self.get_property("tau", atoms)
 
     @staticmethod
     def _stress_from_virial(virial, volume):
@@ -175,6 +259,10 @@ class NEP(Calculator):
             atoms = self.atoms
         if atoms is None:
             raise ValueError("No atoms supplied and none attached to the calculator.")
+        if self.nep.spin_mode:
+            raise NotImplementedError(
+                "NEP/ZBL component splitting is not implemented for "
+                "O/C spin models")
 
         cell, periodic = self._cell_for_neighbors(atoms)
         res = self.nep.compute(

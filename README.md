@@ -4,11 +4,15 @@ A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (
 
 ## Features
 
-- **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
+- **GPUMD-compatible structural NEP4** — nonmagnetic output `nep.txt` files
+  load directly into GPUMD. Versioned `nep4_spin3` files use the O/C extension;
+  its downstream CUDA reader still requires a separate parity gate
 - **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
 - **Multi-GPU training** — distributed data parallel (DDP) across on one node or multiple nodes
 - **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to do fine-tuning; optionally slim the model to only the element types present in the new dataset
 - **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
+- **O/C magnetic potentials** — order-nested, radially compressed spin
+  descriptors with conservative magnetic forces and torques
 
 ---
 
@@ -51,16 +55,28 @@ enforced, and violations raise on load.
   Must have exactly 9 components. Positive = stretched, negative =
   compressed — opposite sign to virial. If both `virial` and `stress` are
   present, `virial` wins.
+- `response_group`, `response_probe`, `response_coordinate`, and
+  `response_branch` — optional controlled-response metadata. Validation
+  splitting keeps every `response_group` intact. For
+  `response_probe=rotation`, three or more distinct coordinates plus
+  `spin_tangent` activate the internal Stage-2 generator-curve objective.
 
 ### Per-atom columns
 
-The `Properties=...` schema declares column layout. TorchNEP reads only
-three fields and silently ignores everything else (e.g. `Z:I:1`):
+The `Properties=...` schema declares column layout. TorchNEP recognizes:
 
 - `species:S:1` — chemical symbol (case-sensitive; must match the
   `type` list in `nep.in`).
 - `pos:R:3` — Cartesian position in Å.
 - `force:R:3` or `forces:R:3` — reference force in eV/Å (optional).
+- `spin:R:3`, `spins:R:3`, `moment:R:3`, or `moments:R:3` — atomic
+  magnetic moment vector.
+- `mforce:R:3`, `mforces:R:3`, or `magnetic_force:R:3` — magnetic
+  force reference. Torque is derived as `spin x mforce`.
+- `spin_tangent:R:3` or `response_tangent:R:3` — the controlled rotation
+  tangent `dS/dtheta`. Together with rotation response metadata and magnetic
+  forces, this supervises both the group mean and centered shape of
+  `sum_i mforce_i dot dS_i/dtheta`; no explicit J or D label is required.
 
 ---
 
@@ -78,6 +94,21 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `neuron` | `30` | Neurons in the (single) hidden layer |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
+| `spin_mode` | `0` | Set to `3` for the versioned O/C magnetic model |
+| `spin_order` | `3` | Magnetic correlation order O (`1`–`3`) |
+| `spin_compress` | `2` | Shared magnetic radial rank C (`1`–`9` with the fixed B8 basis) |
+| `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
+| `spin_cutoff` | `6` | Magnetic neighbor cutoff (Å) |
+| `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
+| `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
+| `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
+
+For O/C spin models set `spin_mode 3`. The production default is O3-C2:
+`spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
+`spin_soc 1`. O3 training automatically uses the internal O2-to-O3
+curriculum; it is not a model or user parameter. See
+[the production design and response-data contract](example/oc_spin/README.md) and
+[the complete example](example/oc_spin/nep.in).
 
 ### Training hyperparameters
 
@@ -90,6 +121,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `lambda_e` | `0.01` | Energy loss weight |
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
+| `lambda_m` | `1.0` | Magnetic-force loss weight |
+| `lambda_tau` | `0.0` | Spin-torque loss weight |
 | `lambda_1` | `0.0` | L1 regularisation weight |
 | `lambda_2` | `0.0` | L2 regularisation weight |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
@@ -105,6 +138,8 @@ three fields and silently ignores everything else (e.g. `Z:I:1`):
 | `stage2_lambda_e` | `1.0` | Stage 2 energy weight |
 | `stage2_lambda_f` | `0.05` | Stage 2 force weight |
 | `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
+| `stage2_lambda_m` | `lambda_m` | Stage 2 magnetic-force weight |
+| `stage2_lambda_tau` | `lambda_tau` | Stage 2 torque weight |
 
 ### Runtime arguments
 
@@ -116,8 +151,8 @@ function (`train_nep` / `train_nep_sharded`):
 | `device` | auto | `"cuda"` / `"xpu"` / `"mps"` / `"cpu"`; any other stream-based PyTorch accelerator should also work if passed explicitly |
 | `precision` | `"float32"` | dtype for training + store, `"float32"` or `"float64"` |
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` |
-| `use_autograd_forces` | `False` | autograd-through-rij |
-| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
+| `use_autograd_forces` | `False` | autograd-through-rij; O/C spin models select the full autograd E/F/V/MF/Tau path automatically |
+| `use_swa` | `False` | with Stage 2, maintain an SWA-averaged model and save `nep_average.txt`; no Stage 2 means no SWA accumulator/output |
 | `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
 | `print_interval` | `10` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
@@ -128,7 +163,7 @@ function (`train_nep` / `train_nep_sharded`):
 | `recompute_q_scaler` | `False` | only with `finetune_from`: recompute the descriptor scaler on the new data instead of keeping the source model's |
 | `slim_types` | `False` | drop element types absent from the dataset |
 | `energy_key` | `"energy"` | comment-line tag read as reference energy (e.g. `"atomization_energy"`) |
-| `use_gpumd_qscaler` | `True` | reproduce GPUMD's init (SNES `mu`): re-init every parameter — descriptor coeffs **and** NN weights — uniform(−1,1), and compute `q_scaler` with coeffs `c=1`. Fresh training only |
+| `use_gpumd_qscaler` | `None` | Descriptor-aware default. O/C models use self-consistent scaling (`False`); non-spin GPUMD-compatible models retain the generation-0 convention |
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
@@ -145,12 +180,14 @@ function (`train_nep` / `train_nep_sharded`):
 | `checkpoint.pt`    | Full training state |
 | `checkpoint_stage1.pt` | Full end-of-Stage-1 checkpoint |
 | `output.log`       | Full console log |
-| `loss.out`         | Per-epoch: epoch, loss, RMSE_E (eV/atom), RMSE_F (eV/Å), RMSE_V, RMSE_stress (GPa); with a validation set, four more columns (test RMSE_E/F/V/stress) and the loss column is the validation loss |
+| `loss.out`         | Per-epoch: epoch, loss, RMSE_E/F/V/stress and, for spin models, RMSE_MF/Tau; a validation set appends the matching test columns and makes validation loss the monitored loss |
 | `energy_train.out` | Per-frame predicted vs reference E/atom (eV/atom) |
 | `force_train.out` | Per-atom predicted vs reference Fx Fy Fz (eV/Å) |
 | `virial_train.out` | Per-frame predicted vs reference virial xx yy zz xy yz zx (eV/atom) |
 | `stress_train.out` | Per-frame predicted vs reference stress (GPa) |
-| `*_test.out` | Same four files for the validation set (GPUMD `test.xyz` naming/format); only written when `valid_file`/`valid_ratio` is used |
+| `mforce_train.out` | Spin models: per-atom predicted vs reference magnetic force |
+| `tau_train.out` | Spin models: per-atom predicted vs reference spin torque |
+| `*_test.out` | Matching E/F/V/stress and, for spin models, MF/Tau files for the validation set; only written with `valid_file`/`valid_ratio` |
 
 ---
 
@@ -174,7 +211,10 @@ python run_train.py
 
 ### Multi-GPU, single node — `train_nep_sharded`
 
-Each rank loads only `1/N` of the structures, so total GPU memory for the data store scales as `1/N`.
+Each rank keeps only `1/N` of the preprocessed structures in its GPU data
+store, so device data memory scales as `1/N`. The current implementation still
+parses the complete XYZ on every rank before releasing non-local host frames;
+peak host memory is therefore not yet `1/N`.
 
 ```python
 # run_train.py
@@ -230,19 +270,24 @@ train_nep("nep.in", "train.xyz", output_dir="output",
 
 | Parameter | Safe to change? | Notes |
 |-----------|----------------|-------|
-| `epoch` | Yes | Extend training by increasing this |
+| `epoch` | Conditional | Extending a nonmagnetic run is safe. O3 curriculum/automatic Stage 2 boundaries depend on the total epoch count, so resume O3 with explicit `start_stage2` and an unchanged completed curriculum, or start a new run. |
 | `lambda_e` / `lambda_f` / `lambda_v` | Yes | New weights take effect next epoch. |
 | `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. |
 | `batch` | Yes | — |
-| `stage2`, `start_stage2` | Yes | Add Stage 2 to a run that did not have it, or push it later |
+| `stage2`, `start_stage2` | Conditional | An unfinished O2→O3 curriculum keeps its original boundary. After O3 is fully open but before Stage 2, a future Stage-2 boundary may be added. Once a checkpoint is in Stage 2, both settings must remain unchanged. To redo Stage 2, resume from `checkpoint_stage1.pt` |
 | `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. To re-enter Stage 2 with a new LR, `resume_from=".../checkpoint_stage1.pt"`. |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
 | `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |
 | `stage2_scheduler_patience` / `stage2_scheduler_factor` | Yes | Applied immediately to the Stage 2 scheduler |
 | `lr` (Stage 1) | **No** | Resume keeps the checkpoint's LR |
 | `run_seed` | **No** (ignored) | The checkpoint's saved seed wins on resume — keeps the shuffle stream and the `valid_ratio` split unchanged |
-| `valid_file` / `valid_ratio` | Not recommended | Changing them on resume changes the train/valid split — a warning is logged and the best-validation gate resets |
+| `valid_file` / `valid_ratio` / data contents | **No** | Checkpoints store SHA-256 data lineage; resume fails closed if training/validation content or split settings change. Start a new run or fine-tune instead |
 | Architecture (`neuron`, `cutoff`, `n_max`, `basis_size`, `l_max`, `type`) | **No** | Dimensions are fixed in the saved weights |
+
+For a bitwise-comparable DDP continuation, also keep world size, per-rank
+batch size, precision, and software/runtime versions unchanged. The checkpoint
+guards scientific model/data/schedule semantics; it cannot make a changed
+distributed reduction order numerically identical.
 
 ---
 
@@ -263,7 +308,8 @@ train_nep(
 ```
 
 `finetune_from` accepts:
-- `nep.txt` — GPUMD text format (works with models trained by GPUMD or TorchNEP)
+- `nep.txt` — structural GPUMD text models or versioned TorchNEP
+  `nep4_spin3` models, with full semantic architecture validation
 - `checkpoint.pt` — full checkpoint (weights are extracted automatically)
 
 If the new dataset contains fewer element types than the original model, `slim_types=True` removes the unused types **before training begins**, shrinking the model and speeding up training.
@@ -307,6 +353,21 @@ result = calc.compute(..., return_components=True)
 print(result["energy_nep"], result["energy_zbl"])   # sum == result["energy"]
 ```
 
+For an O/C model, pass the per-atom moment vectors and read the conservative
+magnetic derivatives from the same scalar energy:
+
+```python
+spins = np.array([[0, 0, 2.2], [0.3, 0, 2.1], [0, 0.2, 0.1]])
+result = calc.compute(
+    species=["Cr", "Cr", "Ni"],
+    positions=np.array([[0,0,0],[1.5,0,0],[3,0,0]]),
+    cell=np.eye(3) * 6.0,
+    spins=spins,
+)
+print(result["mforces"])  # -dE/dS
+print(result["tau"])      # S x mforce
+```
+
 ### ASE calculator
 
 If ASE is installed, any ASE workflow (relaxation, MD, EOS, …) can drive a trained model:
@@ -326,6 +387,10 @@ parts = atoms.calc.get_components()
 print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 ```
 
+For `nep4_spin3`, attach an `(N,3)` `spins` array before evaluation;
+`atoms.calc.results["mforces"]` and `atoms.calc.results["tau"]` are then
+available. The NEP/ZBL component-split helper is currently nonmagnetic-only.
+
 ### Full-dataset prediction
 
 Runs batched GPU inference on an entire `.xyz` file and writes GPUMD-compatible output files.
@@ -341,8 +406,8 @@ predict_dataset(
     batch_size=500,
     output_descriptor=0,   # 0=off, 1=per-frame mean, 2=per-atom (matches GPUMD)
 )
-# writes energy_train.out, force_train.out, virial_train.out,
-# stress_train.out, and (when output_descriptor != 0) descriptor.out
+# writes energy/force/virial/stress_train.out; spin models also write
+# mforce/tau_train.out; descriptor.out is optional
 ```
 
 ---

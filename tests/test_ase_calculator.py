@@ -24,6 +24,7 @@ installed.  Coverage:
 """
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -149,3 +150,21 @@ def test_non_periodic_has_no_stress():
     assert np.isfinite(e)
     assert np.isfinite(f).all()
     assert "stress" not in atoms.calc.results
+
+
+def test_non_periodic_vacuum_uses_largest_spin_cutoff():
+    calc = NEP.__new__(NEP)
+    calc.nep = SimpleNamespace(
+        rc_radial=3.0,
+        rc_angular=4.0,
+        spin_mode=3,
+        spin_cutoff=[7.0, 7.0],
+    )
+    atoms = Atoms(
+        symbols=["Fe", "Fe"],
+        positions=[[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]],
+        pbc=False,
+    )
+    cell, periodic = calc._cell_for_neighbors(atoms)
+    assert periodic is False
+    np.testing.assert_allclose(np.diag(cell), [30.0, 31.0, 32.0])

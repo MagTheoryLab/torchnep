@@ -152,6 +152,9 @@ def predict_dataset(
     # 1) Read xyz
     t0 = time.time()
     frames = read_xyz(xyz_file, energy_key=energy_key)
+    if calc.spin_mode and any("spins" not in frame for frame in frames):
+        raise ValueError(
+            "spin model requires a spin/moment vector for every atom")
     n_struct = len(frames)
     _log(f"  read_xyz:    {time.time() - t0:5.1f}s   ({n_struct} frames, "
          f"energy label: {energy_key})")
@@ -164,6 +167,8 @@ def predict_dataset(
         "cutoff_radial": rc_rad,
         "cutoff_angular": rc_ang,
         "type_names": calc.type_names,
+        "spin_mode": calc.spin_mode,
+        "spin_cutoff": calc.spin_cutoff,
     }
     structures = preprocess_structures(frames, pp_config, np_dtype)
     del frames
@@ -178,9 +183,18 @@ def predict_dataset(
                           dtype=np.int64)
     nang_arr = np.asarray([len(s["pair_i_ang"]) for s in structures],
                           dtype=np.int64)
+    nspin_arr = (
+        np.asarray([len(s["pair_i_spin"]) for s in structures],
+                   dtype=np.int64)
+        if calc.spin_mode else None
+    )
     nat_cum = np.concatenate([[0], np.cumsum(natoms_arr)])
     nrad_cum = np.concatenate([[0], np.cumsum(nrad_arr)])
     nang_cum = np.concatenate([[0], np.cumsum(nang_arr)])
+    nspin_cum = (
+        np.concatenate([[0], np.cumsum(nspin_arr)])
+        if calc.spin_mode else None
+    )
     N_atoms_total = int(nat_cum[-1])
 
     # Pair indices are global (atom positions in the concatenation), so a
@@ -196,6 +210,15 @@ def predict_dataset(
     all_pj_a = np.concatenate(
         [s["pair_j_ang"] + nat_cum[i] for i, s in enumerate(structures)])
     all_rij_a = np.concatenate([s["rij_ang"] for s in structures])
+    if calc.spin_mode:
+        all_pi_s = np.concatenate(
+            [s["pair_i_spin"] + nat_cum[i]
+             for i, s in enumerate(structures)])
+        all_pj_s = np.concatenate(
+            [s["pair_j_spin"] + nat_cum[i]
+             for i, s in enumerate(structures)])
+        all_rij_s = np.concatenate([s["rij_spin"] for s in structures])
+        all_spins = np.concatenate([s["spins"] for s in structures])
 
     energy_ref = np.array(
         [s["energy"] if s.get("energy") is not None else np.nan
@@ -210,6 +233,23 @@ def predict_dataset(
             if f is not None:
                 forces_ref[nat_cum[i]:nat_cum[i + 1]] = \
                     np.asarray(f).reshape(-1, 3)
+
+    has_mforces_global = any(
+        s.get("mforces") is not None for s in structures)
+    mforces_ref = None
+    tau_ref = None
+    if calc.spin_mode:
+        mforces_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        tau_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        for i, s in enumerate(structures):
+            magnetic_force = s.get("mforces")
+            if magnetic_force is not None:
+                a_lo, a_hi = nat_cum[i], nat_cum[i + 1]
+                mforces_ref[a_lo:a_hi] = np.asarray(
+                    magnetic_force).reshape(-1, 3)
+                tau_ref[a_lo:a_hi] = np.asarray(s["tau"]).reshape(-1, 3)
 
     has_virial_global = any(s.get("virial") is not None for s in structures)
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
@@ -247,17 +287,33 @@ def predict_dataset(
     pi_a_gpu  = torch.from_numpy(all_pi_a).to(device=device)
     pj_a_gpu  = torch.from_numpy(all_pj_a).to(device=device)
     rij_a_gpu = torch.from_numpy(all_rij_a).to(device=device, dtype=dt)
+    if calc.spin_mode:
+        pi_s_gpu = torch.from_numpy(all_pi_s).to(device=device)
+        pj_s_gpu = torch.from_numpy(all_pj_s).to(device=device)
+        rij_s_gpu = torch.from_numpy(all_rij_s).to(device=device, dtype=dt)
+        spins_gpu = torch.from_numpy(all_spins).to(device=device, dtype=dt)
     natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     _log(f"  upload:      {time.time() - t0:5.1f}s")
-    del all_at, all_pi_r, all_pj_r, all_rij_r, all_pi_a, all_pj_a, all_rij_a
+    del (all_at, all_pi_r, all_pj_r, all_rij_r,
+         all_pi_a, all_pj_a, all_rij_a)
+    if calc.spin_mode:
+        del all_pi_s, all_pj_s, all_rij_s, all_spins
 
     # 4) Batched compute loop ------------------------------------------------
     e_pred_arr = np.empty(n_struct, dtype=np.float64)
-    f_pred_arr = (np.empty((N_atoms_total, 3), dtype=np.float64)
-                  if has_forces_global else None)
+    # Predictions are independent of whether the input carries reference
+    # labels.  In particular, an unlabeled inference XYZ must still produce
+    # the model force rather than a zero-filled placeholder.
+    f_pred_arr = np.empty((N_atoms_total, 3), dtype=np.float64)
     v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
+    m_pred_arr = (
+        np.empty((N_atoms_total, 3), dtype=np.float64)
+        if calc.spin_mode else None)
+    t_pred_arr = (
+        np.empty((N_atoms_total, 3), dtype=np.float64)
+        if calc.spin_mode else None)
 
     # Descriptor buffer (only allocated when requested).
     #   mode 1 -> (n_struct, dim)         per-frame averaged scaled descriptor
@@ -285,7 +341,6 @@ def predict_dataset(
             pi_a = pi_a_gpu[g_lo:g_hi] - a_lo
             pj_a = pj_a_gpu[g_lo:g_hi] - a_lo
             rij_a = rij_a_gpu[g_lo:g_hi]
-
             struct_idx = torch.repeat_interleave(
                 torch.arange(B, device=device, dtype=torch.long),
                 natoms_gpu[start:end])
@@ -319,6 +374,15 @@ def predict_dataset(
                 "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
                 "blm": blm,
             }
+            if calc.spin_mode:
+                s_lo = int(nspin_cum[start])
+                s_hi = int(nspin_cum[end])
+                batch.update({
+                    "pair_i_spin": pi_s_gpu[s_lo:s_hi] - a_lo,
+                    "pair_j_spin": pj_s_gpu[s_lo:s_hi] - a_lo,
+                    "rij_spin": rij_s_gpu[s_lo:s_hi],
+                    "spins": spins_gpu[a_lo:a_hi],
+                })
             result = calc.compute_batch(batch, backend=backend)
 
             Etot = result["Etot"]
@@ -334,8 +398,10 @@ def predict_dataset(
             v_pred = _virial9_to_6(v_np) / nat_slice[:, None]
             v_pred_arr[start:end] = v_pred
 
-            if f_pred_arr is not None:
-                f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
+            f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
+            if m_pred_arr is not None:
+                m_pred_arr[a_lo:a_hi] = result["mforces"].cpu().numpy()
+                t_pred_arr[a_lo:a_hi] = result["tau"].cpu().numpy()
 
             if output_descriptor:
                 # ``compute_batch`` already returns ``q * q_scaler``.
@@ -363,10 +429,19 @@ def predict_dataset(
 
     if forces_ref is None:
         forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-    if f_pred_arr is None:
-        f_pred_arr = np.zeros((N_atoms_total, 3), dtype=np.float64)
     np.savetxt(os.path.join(output_dir, "force_train.out"),
                np.column_stack([f_pred_arr, forces_ref]), fmt="%.10g")
+    if m_pred_arr is not None:
+        np.savetxt(
+            os.path.join(output_dir, "mforce_train.out"),
+            np.column_stack([m_pred_arr, mforces_ref]),
+            fmt="%.10g",
+        )
+        np.savetxt(
+            os.path.join(output_dir, "tau_train.out"),
+            np.column_stack([t_pred_arr, tau_ref]),
+            fmt="%.10g",
+        )
 
     np.savetxt(os.path.join(output_dir, "virial_train.out"),
                np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
@@ -413,6 +488,8 @@ def predict_from_store(model, data_store, output_dir: str,
       energy_train.out  — per-frame (pred, ref) in eV/atom
       force_train.out   — per-atom (fx,fy,fz pred, ref) in eV/A
       virial_train.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
+      mforce_train.out  — spin models: per-atom magnetic force (pred, ref)
+      tau_train.out     — spin models: per-atom spin x mforce (pred, ref)
 
     ``suffix`` picks the file-name tail: "train" (default) for the training
     set, "test" for the validation set (GPUMD's *_test.out naming).
@@ -432,6 +509,12 @@ def predict_from_store(model, data_store, output_dir: str,
 
     e_pred = np.empty(n_struct, dtype=np.float64)
     f_pred = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+    m_pred = (
+        np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+        if model.spin_descriptor is not None else None)
+    t_pred = (
+        np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+        if model.spin_descriptor is not None else None)
     v_pred = np.empty((n_struct, 6), dtype=np.float64)
 
     was_training = model.training
@@ -443,8 +526,43 @@ def predict_from_store(model, data_store, output_dir: str,
             idx = list(range(start, end))
             B = end - start
             batch = data_store.collate(idx)
-            r = model.compute_properties_cached(
-                batch, need_forces=True, need_virial=True, backend=backend)
+            batch["need_mforce"] = model.spin_descriptor is not None
+            batch["need_tau"] = model.spin_descriptor is not None
+            if model.spin_mode == 3:
+                with torch.enable_grad():
+                    r = model.compute_properties(
+                        batch["rij_rad"],
+                        batch["rij_ang"],
+                        batch["pair_i_rad"],
+                        batch["pair_j_rad"],
+                        batch["pair_i_ang"],
+                        batch["pair_j_ang"],
+                        batch["atom_types"],
+                        batch["N"],
+                        batch["struct_idx"],
+                        batch["num_structures"],
+                        need_forces=True,
+                        need_virial=True,
+                        backend=backend,
+                        spins=batch["spins"],
+                        need_mforce=True,
+                        need_tau=True,
+                        rij_spin=batch.get("rij_spin"),
+                        pi_spin=batch.get("pair_i_spin"),
+                        pj_spin=batch.get("pair_j_spin"),
+                        create_graph=False,
+                    )
+                r = {
+                    key: value.detach()
+                    for key, value in r.items()
+                }
+            else:
+                r = model.compute_properties_cached(
+                    batch,
+                    need_forces=True,
+                    need_virial=True,
+                    backend=backend,
+                )
 
             nat_slice = nat_arr[start:end].astype(np.float64)
             e_pred[start:end] = r["Etot"].cpu().numpy() / nat_slice
@@ -458,6 +576,9 @@ def predict_from_store(model, data_store, output_dir: str,
 
             a_lo = int(nat_cum[start]); a_hi = int(nat_cum[end])
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
+            if m_pred is not None:
+                m_pred[a_lo:a_hi] = r["mforces"].cpu().numpy()
+                t_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
     if was_training:
         model.train()
     if dev.type == "cuda":
@@ -497,6 +618,23 @@ def predict_from_store(model, data_store, output_dir: str,
                np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
                np.column_stack([f_pred, forces_ref]), fmt="%.10g")
+    if m_pred is not None:
+        mforces_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        tau_ref = np.full(
+            (N_atoms_total, 3), np.nan, dtype=np.float64)
+        for i in range(n_struct):
+            if data_store.has_mforces_flag[i]:
+                a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
+                mforces_ref[a_lo:a_hi] = (
+                    data_store.mforces[i].cpu().numpy())
+                tau_ref[a_lo:a_hi] = data_store.tau[i].cpu().numpy()
+        np.savetxt(
+            os.path.join(output_dir, f"mforce_{suffix}.out"),
+            np.column_stack([m_pred, mforces_ref]), fmt="%.10g")
+        np.savetxt(
+            os.path.join(output_dir, f"tau_{suffix}.out"),
+            np.column_stack([t_pred, tau_ref]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
 
@@ -512,8 +650,9 @@ def predict_from_store(model, data_store, output_dir: str,
     np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
+    extra = "|mforce|tau" if model.spin_descriptor is not None else ""
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
+         f"-> {output_dir}/(energy|force|virial|stress{extra})_{suffix}.out")
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +679,12 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
     e_pred = np.zeros(n_struct, dtype=np.float64)
     f_pred = np.zeros((N_atoms_local, 3), dtype=np.float64)
     v_pred = np.zeros((n_struct, 6), dtype=np.float64)
+    m_pred = (
+        np.zeros((N_atoms_local, 3), dtype=np.float64)
+        if model.spin_descriptor is not None else None)
+    t_pred = (
+        np.zeros((N_atoms_local, 3), dtype=np.float64)
+        if model.spin_descriptor is not None else None)
 
     was_training = model.training
     model.eval()
@@ -548,8 +693,40 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
             end = min(start + batch_size, n_struct)
             B = end - start
             batch = data_store.collate(list(range(start, end)))
-            r = model.compute_properties_cached(
-                batch, need_forces=True, need_virial=True, backend=backend)
+            batch["need_mforce"] = model.spin_descriptor is not None
+            batch["need_tau"] = model.spin_descriptor is not None
+            if model.spin_mode == 3:
+                # The systematic magnetic-polynomial path currently obtains
+                # geometry and spin derivatives from autograd.  End-of-run
+                # prediction is normally under no_grad, so re-enable it only
+                # for this descriptor and detach the completed observables.
+                with torch.enable_grad():
+                    r = model.compute_properties(
+                        batch["rij_rad"],
+                        batch["rij_ang"],
+                        batch["pair_i_rad"],
+                        batch["pair_j_rad"],
+                        batch["pair_i_ang"],
+                        batch["pair_j_ang"],
+                        batch["atom_types"],
+                        batch["N"],
+                        batch["struct_idx"],
+                        batch["num_structures"],
+                        need_forces=True,
+                        need_virial=True,
+                        backend=backend,
+                        spins=batch["spins"],
+                        need_mforce=True,
+                        need_tau=True,
+                        rij_spin=batch.get("rij_spin"),
+                        pi_spin=batch.get("pair_i_spin"),
+                        pj_spin=batch.get("pair_j_spin"),
+                        create_graph=False,
+                    )
+                r = {key: value.detach() for key, value in r.items()}
+            else:
+                r = model.compute_properties_cached(
+                    batch, need_forces=True, need_virial=True, backend=backend)
 
             nat_slice = nat_arr[start:end].astype(np.float64)
             e_pred[start:end] = r["Etot"].cpu().numpy() / nat_slice
@@ -562,6 +739,9 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
 
             a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
+            if m_pred is not None:
+                m_pred[a_lo:a_hi] = r["mforces"].cpu().numpy()
+                t_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
     if was_training:
         model.train()
     if dev.type == "cuda":
@@ -574,10 +754,19 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
     e_ref_pa = energy_ref / nat_arr.astype(np.float64)
 
     forces_ref = np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
+    mforces_ref = (
+        np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
+        if model.spin_descriptor is not None else None)
+    tau_ref = (
+        np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
+        if model.spin_descriptor is not None else None)
     for i in range(n_struct):
+        a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
         if data_store.has_forces_flag[i]:
-            a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
             forces_ref[a_lo:a_hi] = data_store.forces[i].cpu().numpy()
+        if mforces_ref is not None and data_store.has_mforces_flag[i]:
+            mforces_ref[a_lo:a_hi] = data_store.mforces[i].cpu().numpy()
+            tau_ref[a_lo:a_hi] = data_store.tau[i].cpu().numpy()
 
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
     for i in range(n_struct):
@@ -594,12 +783,15 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
         "e_pred":    e_pred,    "e_ref":    e_ref_pa,
         "f_pred":    f_pred,    "f_ref":    forces_ref,
         "v_pred":    v_pred,    "v_ref":    virial_ref,
+        "m_pred":    m_pred,    "m_ref":    mforces_ref,
+        "t_pred":    t_pred,    "t_ref":    tau_ref,
     }
 
 
 def _write_predictions(output_dir: str, n_total_frames: int,
                        natoms, volumes,
                        e_pred, e_ref, f_pred, f_ref, v_pred, v_ref,
+                       m_pred=None, m_ref=None, t_pred=None, t_ref=None,
                        suffix: str = "train"):
     """Write the four *_{suffix}.out files in frame-order. All arrays are
     already in global input-xyz order (frame 0 first)."""
@@ -611,6 +803,11 @@ def _write_predictions(output_dir: str, n_total_frames: int,
                np.column_stack([f_pred, f_ref]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, v_ref]), fmt="%.10g")
+    if m_pred is not None:
+        np.savetxt(os.path.join(output_dir, f"mforce_{suffix}.out"),
+                   np.column_stack([m_pred, m_ref]), fmt="%.10g")
+        np.savetxt(os.path.join(output_dir, f"tau_{suffix}.out"),
+                   np.column_stack([t_pred, t_ref]), fmt="%.10g")
 
     # Stress (GPa), GPUMD sign (+virial/V); missing refs keep -1e6 unscaled.
     nat_col = natoms.astype(np.float64)[:, None]
@@ -628,10 +825,12 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                                 batch_size: int = 1000,
                                 backend: str = "auto",
                                 verbose: bool = True,
-                                suffix: str = "train"):
+                                suffix: str = "train",
+                                local_real_flags=None):
     """DDP equivalent of ``predict_from_store``: each rank predicts its local
-    data-store shard, arrays are gathered to rank 0, rank 0 writes the four
-    ``*_{suffix}.out`` files in input-xyz order ("train" or "test").
+    data-store shard, arrays are gathered to rank 0, and rank 0 writes the
+    structural files plus magnetic-force/torque files for spin models in
+    input-xyz order ("train" or "test").
 
     No xyz re-read, no neighbor-list rebuild, no temp nep.txt model file.
 
@@ -656,6 +855,13 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     t_compute = time.time()
     local = _compute_local_predictions(model, data_store, batch_size, backend)
     local["global_idx"] = np.asarray(local_global_idx, dtype=np.int64)
+    local["is_real"] = np.asarray(
+        ([True] * len(local_global_idx)
+         if local_real_flags is None else local_real_flags),
+        dtype=bool,
+    )
+    if local["is_real"].shape != local["global_idx"].shape:
+        raise ValueError("local_real_flags must match local_global_idx")
     _log(f"  compute:  {time.time() - t_compute:5.1f}s")
 
     # Gather per-rank arrays onto rank 0. all_gather_object stays on the
@@ -673,11 +879,10 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     if not is_main:
         return
 
-    # Allocate global arrays and scatter each rank's contribution into the
-    # slots given by its global_idx. Padding duplicates (added in
-    # train_nep_sharded so n_total divides evenly across ranks) write the
-    # same value twice into the same slot — harmless. Every input frame
-    # appears in some rank, so the output has no NaN rows.
+    # Allocate global arrays and scatter each rank's REAL contribution into
+    # the slots given by its global_idx. Padding copies have their labels
+    # removed for loss fairness; they must be skipped here too, otherwise
+    # their NaN references overwrite the real frame's reference columns.
     natoms_g = np.zeros(n_total_frames, dtype=np.int64)
     volumes_g = np.zeros(n_total_frames, dtype=np.float64)
     e_pred_g = np.full(n_total_frames, np.nan)
@@ -686,14 +891,23 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     v_ref_g  = np.full((n_total_frames, 6), _MISSING_VIRIAL)
 
     # First pass: frame-level arrays + natoms (to size the atom-level arrays).
+    seen_real = np.zeros(n_total_frames, dtype=bool)
     for part in gathered:
-        gi = part["global_idx"]
-        natoms_g[gi]  = part["natoms"]
-        volumes_g[gi] = part["volumes"]
-        e_pred_g[gi]  = part["e_pred"]
-        e_ref_g[gi]   = part["e_ref"]
-        v_pred_g[gi]  = part["v_pred"]
-        v_ref_g[gi]   = part["v_ref"]
+        real = part["is_real"]
+        gi = part["global_idx"][real]
+        if seen_real[gi].any():
+            raise ValueError("duplicate real frame in sharded prediction")
+        seen_real[gi] = True
+        natoms_g[gi]  = part["natoms"][real]
+        volumes_g[gi] = part["volumes"][real]
+        e_pred_g[gi]  = part["e_pred"][real]
+        e_ref_g[gi]   = part["e_ref"][real]
+        v_pred_g[gi]  = part["v_pred"][real]
+        v_ref_g[gi]   = part["v_ref"][real]
+    if not seen_real.all():
+        missing = np.flatnonzero(~seen_real)
+        raise ValueError(
+            f"sharded prediction is missing real frames: {missing[:5]}")
 
     # Global per-atom offsets are determined by input-xyz order so they match
     # what predict_dataset / predict_from_store would emit.
@@ -701,6 +915,15 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     N_atoms_global = int(nat_cum_g[-1])
     f_pred_g = np.full((N_atoms_global, 3), np.nan)
     f_ref_g  = np.full((N_atoms_global, 3), np.nan)
+    has_spin = gathered[0]["m_pred"] is not None
+    m_pred_g = (
+        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    m_ref_g = (
+        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    t_pred_g = (
+        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    t_ref_g = (
+        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
 
     for part in gathered:
         gi = part["global_idx"]
@@ -708,16 +931,27 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
         nat_part = part["natoms"]
         part_cum = np.concatenate([[0], np.cumsum(nat_part)])
         for li, gidx in enumerate(gi):
+            if not part["is_real"][li]:
+                continue
             la, lb = int(part_cum[li]),  int(part_cum[li + 1])
             ga, gb = int(nat_cum_g[gidx]), int(nat_cum_g[gidx + 1])
             f_pred_g[ga:gb] = part["f_pred"][la:lb]
             f_ref_g[ga:gb]  = part["f_ref"][la:lb]
+            if has_spin:
+                m_pred_g[ga:gb] = part["m_pred"][la:lb]
+                m_ref_g[ga:gb] = part["m_ref"][la:lb]
+                t_pred_g[ga:gb] = part["t_pred"][la:lb]
+                t_ref_g[ga:gb] = part["t_ref"][la:lb]
 
     t_write = time.time()
     _write_predictions(output_dir, n_total_frames,
                        natoms_g, volumes_g,
                        e_pred_g, e_ref_g,
                        f_pred_g, f_ref_g,
-                       v_pred_g, v_ref_g, suffix=suffix)
+                       v_pred_g, v_ref_g,
+                       m_pred=m_pred_g, m_ref=m_ref_g,
+                       t_pred=t_pred_g, t_ref=t_ref_g,
+                       suffix=suffix)
+    extra = "|mforce|tau" if has_spin else ""
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
+         f"-> {output_dir}/(energy|force|virial|stress{extra})_{suffix}.out")

@@ -378,3 +378,34 @@ def test_output_parity_with_gpumd(device, tmp_path):
     assert np.all(t_str[1, 6:] == -1e6)
     # Explicit sign check: predicted stress shares the predicted virial's sign.
     assert np.array_equal(np.sign(t_str[:, :6]), np.sign(t_vir[:, :6]))
+
+
+def test_unlabelled_prediction_still_writes_model_forces(tmp_path):
+    """Reference labels control only the reference columns, not prediction."""
+    model_file = DATA_DIR / "nep_CrCoNi.txt"
+    frame = read_xyz(str(DATA_DIR / "CrCoNi.xyz"))[0]
+    positions = np.asarray(frame["positions"])
+    cell = np.asarray(frame["cell"])
+    species = list(frame["species"])
+    cell_text = " ".join(f"{value:.10f}" for value in cell.reshape(-1))
+    lines = [
+        str(len(species)),
+        (f'pbc="T T T" Lattice="{cell_text}" '
+         'Properties=species:S:1:pos:R:3'),
+    ]
+    lines.extend(
+        f"{symbol} {x:.10f} {y:.10f} {z:.10f}"
+        for symbol, (x, y, z) in zip(species, positions)
+    )
+    xyz = tmp_path / "unlabelled.xyz"
+    xyz.write_text("\n".join(lines) + "\n")
+
+    reference = NEPCalculator(model_file, dtype=torch.float64).compute(
+        species, positions, cell)["forces"].numpy()
+    predict_dataset(
+        str(model_file), str(xyz), output_dir=str(tmp_path),
+        dtype="float64", device="cpu", verbose=False,
+    )
+    output = np.loadtxt(tmp_path / "force_train.out").reshape(-1, 6)
+    np.testing.assert_allclose(output[:, :3], reference, rtol=2e-9, atol=2e-9)
+    assert np.isnan(output[:, 3:]).all()

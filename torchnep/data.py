@@ -17,6 +17,8 @@ Data loading utilities for NEP training and prediction.
 Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
+import re
+
 import numpy as np
 from typing import Dict, List
 
@@ -57,11 +59,11 @@ def _parse_properties_schema(comment: str):
 def _parse_frame_block(block, energy_key="energy"):
     """Parse one frame from a list of text lines (picklable for mp.Pool).
 
-    Reads extended XYZ with a ``Properties=...`` schema. Only
-    ``species:S:1``, ``pos:R:3``, and ``force:R:3`` / ``forces:R:3`` are
-    consumed — any other columns are silently ignored. Energy / virial /
-    stress / lattice come from the comment-line key=value tags; see
-    ``_parse_comment`` for strict-mode validation rules.
+    Reads extended XYZ with a ``Properties=...`` schema. In addition to the
+    structural fields, ``spin``/``spins``/``moment`` and
+    ``mforce``/``mforces``/``magnetic_force`` vector fields are recognized.
+    Energy / virial / stress / lattice come from the comment-line key=value
+    tags; see ``_parse_comment`` for strict-mode validation rules.
     """
     natoms = int(block[0].strip())
     comment = block[1].strip()
@@ -108,6 +110,30 @@ def _parse_frame_block(block, energy_key="energy"):
         _, f_col, f_w = schema[force_key]
         f_off = _numeric_offset(f_col)
         frame["forces"] = arr[:, f_off:f_off + f_w].copy()
+
+    def _read_vector(aliases, output_key):
+        field = next((name for name in aliases if name in schema), None)
+        if field is None:
+            return
+        _, col, width = schema[field]
+        if width != 3:
+            raise ValueError(
+                f"{field} must have exactly 3 components, got {width}")
+        offset = _numeric_offset(col)
+        frame[output_key] = arr[:, offset:offset + width].copy()
+
+    _read_vector(("spin", "spins", "moment", "moments"), "spins")
+    _read_vector((
+        "mforce", "mforces", "force_mag", "forces_mag",
+        "magnetic_force", "magnetic_forces",
+    ), "mforces")
+    _read_vector(
+        ("spin_tangent", "response_tangent"), "spin_tangent"
+    )
+    # Torque is a derived target, not an additional dataset requirement.
+    # Keep the convention used by the spin model: tau = spin x mforce.
+    if "spins" in frame and "mforces" in frame:
+        frame["tau"] = np.cross(frame["spins"], frame["mforces"])
     return frame
 
 
@@ -165,24 +191,14 @@ def _find_quoted(comment: str, key: str):
 def _find_scalar(comment: str, key: str):
     """Return the string value after ``key=`` (unquoted) or None if absent.
 
-    Matches ``key`` case-insensitively. Only returns a match when ``key=``
-    is preceded by whitespace or start of string — prevents
+    Matches ``key`` case-insensitively and accepts whitespace around ``=``.
+    Only returns a match when ``key`` is preceded by whitespace or start of
+    string — prevents
     ``atomization_energy=`` from matching ``energy=``.
     """
-    low = comment.lower()
-    needle = key.lower() + "="
-    start = 0
-    while True:
-        i = low.find(needle, start)
-        if i < 0:
-            return None
-        if i == 0 or low[i - 1] in (" ", "\t"):
-            i += len(needle)
-            j = i
-            while j < len(comment) and comment[j] not in (" ", "\t", '"'):
-                j += 1
-            return comment[i:j]
-        start = i + 1
+    pattern = rf"(?<!\S){re.escape(key)}\s*=\s*([^\s\"]+)"
+    match = re.search(pattern, comment, flags=re.IGNORECASE)
+    return None if match is None else match.group(1)
 
 
 def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dict:
@@ -236,6 +252,22 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
                     f"{len(stress_vals)}; comment: " + comment[:160])
             volume = abs(float(np.linalg.det(frame["cell"])))
             frame["virial"] = -np.array(stress_vals) * volume
+
+    # Optional response metadata.  These fields describe controlled groups
+    # such as the same geometry under reference/plus/minus spin probes or
+    # strain points.  The descriptor never consumes them; trainers use the
+    # group id only to prevent validation leakage, while response evaluators
+    # may use the remaining labels.
+    for key in ("response_group", "response_probe", "response_branch"):
+        value = _find_scalar(comment, key)
+        if value is not None:
+            frame[key] = value
+    coordinate = _find_scalar(comment, "response_coordinate")
+    if coordinate is not None:
+        try:
+            frame["response_coordinate"] = float(coordinate)
+        except ValueError:
+            frame["response_coordinate"] = coordinate
 
     return frame
 
@@ -300,10 +332,44 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_f"] = float(parts[1])
             elif key == "lambda_v":
                 params["lambda_v"] = float(parts[1])
+            elif key in ("lambda_m", "lambda_mforce"):
+                params["lambda_m"] = float(parts[1])
+            elif key == "lambda_tau":
+                params["lambda_tau"] = float(parts[1])
             elif key == "lambda_2":
                 params["lambda_2"] = float(parts[1])
+            elif key == "spin_descriptor":
+                raise ValueError(
+                    "spin_descriptor is not part of the TorchNEP protocol; "
+                    "use spin_mode 3 for the O/C descriptor")
+            elif key == "spin_mode":
+                params["spin_mode"] = int(parts[1])
+            elif key == "spin_compress":
+                params["spin_compress"] = int(parts[1])
+            elif key == "spin_l_max":
+                if len(parts) != 2:
+                    raise ValueError("spin_l_max requires one value")
+                params["spin_l_max"] = [int(parts[1]), 0, 0]
+            elif key == "spin_order":
+                params["spin_order"] = int(parts[1])
+            elif key == "spin_soc":
+                params["spin_soc"] = int(parts[1])
+            elif key == "spin_cutoff":
+                if len(parts) != 2:
+                    raise ValueError("spin_cutoff requires one value")
+                params["spin_cutoff"] = [float(parts[1]), float(parts[1])]
+            elif key in ("spin_dof_type", "spin_env_type"):
+                params[key] = parts[1:]
+            elif key == "spin_type":
+                raise ValueError(
+                    "spin_type was replaced by spin_dof_type; use "
+                    "spin_dof_type and optional spin_env_type")
+            elif key.startswith("spin_"):
+                raise ValueError(f"unsupported O/C spin parameter: {key}")
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
+            elif key == "eval_batch":
+                params["eval_batch_size"] = int(parts[1])
             elif key == "save_potential":
                 params["save_interval"] = int(parts[1])
                 if len(parts) > 2:
@@ -344,6 +410,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["stage2_pref_f"] = float(parts[1])
             elif key == "stage2_lambda_v":
                 params["stage2_pref_v"] = float(parts[1])
+            elif key in ("stage2_lambda_m", "stage2_lambda_mforce"):
+                params["stage2_pref_m"] = float(parts[1])
+            elif key == "stage2_lambda_tau":
+                params["stage2_pref_tau"] = float(parts[1])
             elif key == "stage2_scheduler_patience":
                 params["stage2_scheduler_patience"] = int(parts[1])
             elif key == "stage2_scheduler_factor":
@@ -353,6 +423,20 @@ def parse_nep_in(filename: str) -> Dict:
     # trainer can report which values came from nep.in vs which fell back
     # to a default.
     explicit = set(params.keys())
+
+    declared_spin_mode = int(params.get("spin_mode", 0))
+    if declared_spin_mode not in (0, 3):
+        raise ValueError("spin_mode must be 0 or 3")
+    spin_only_keys = {
+        "spin_compress", "spin_l_max", "spin_order", "spin_soc",
+        "spin_cutoff", "spin_dof_type", "spin_env_type",
+    }
+    ignored_spin_keys = sorted(explicit & spin_only_keys)
+    if declared_spin_mode != 3 and ignored_spin_keys:
+        raise ValueError(
+            "O/C spin parameters require 'spin_mode 3'; otherwise they "
+            "would be silently ignored: " + ", ".join(ignored_spin_keys)
+        )
 
     # Defaults — model architecture
     params.setdefault("version", 4)
@@ -368,6 +452,7 @@ def parse_nep_in(filename: str) -> Dict:
     # Defaults — training hyperparameters (match train_nep / train_nep_sharded)
     params.setdefault("num_epochs", 600)
     params.setdefault("batch_size", 32)
+    params.setdefault("eval_batch_size", params["batch_size"])
     params.setdefault("lr", 0.01)
     params.setdefault("stop_lr", 1e-6)
     params.setdefault("scheduler_patience", 15)
@@ -378,15 +463,60 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_e", 0.01)
     params.setdefault("lambda_f", 1.0)
     params.setdefault("lambda_v", 0.01)
+    params.setdefault("lambda_m", 1.0)
+    params.setdefault("lambda_tau", 0.0)
     params.setdefault("lambda_1", 0.0)
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
 
+    # spin_mode 3 is the order/compression (O/C) magnetic descriptor.
+    params.setdefault("spin_mode", 0)
+    if params["spin_mode"] == 3:
+        params.setdefault("spin_compress", 2)
+        params.setdefault("spin_basis_size", [8, 0])
+        params.setdefault("spin_l_max", [2, 0, 0])
+        params.setdefault("spin_order", 3)
+        params.setdefault("spin_soc", 1)
+        params.setdefault("spin_curriculum", params["spin_order"] == 3)
+    else:
+        params.setdefault("spin_compress", 2)
+        params.setdefault("spin_basis_size", [8, 0])
+        params.setdefault("spin_l_max", [2, 0, 0])
+        params.setdefault("spin_order", 1)
+        params.setdefault("spin_soc", 0)
+        params.setdefault("spin_curriculum", False)
+    params.setdefault(
+        "spin_cutoff",
+        (
+            [6.0, 6.0]
+            if params["spin_mode"] == 3
+            else [params["cutoff_radial"], params["cutoff_angular"]]
+        ),
+    )
+    params.setdefault("spin_dof_type", None)
+    params.setdefault("spin_env_type", None)
+
+    if params["spin_mode"] == 3:
+        max_spin_compress = params["spin_basis_size"][0] + 1
+        if not 1 <= params["spin_compress"] <= max_spin_compress:
+            raise ValueError(
+                "spin_compress must be in [1, "
+                f"{max_spin_compress}] for the fixed magnetic radial "
+                f"basis B={params['spin_basis_size'][0]}"
+            )
+        if params["spin_order"] not in (1, 2, 3):
+            raise ValueError("spin_order must be 1, 2, or 3")
+        if params["spin_soc"] not in (0, 1):
+            raise ValueError("spin_soc must be 0 or 1")
+        if params["spin_curriculum"] and params["spin_order"] != 3:
+            raise ValueError("spin_curriculum requires spin_order 3")
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)
     params.setdefault("stage2_pref_f", 0.05)
     params.setdefault("stage2_pref_v", 0.1)
+    params.setdefault("stage2_pref_m", params["lambda_m"])
+    params.setdefault("stage2_pref_tau", params["lambda_tau"])
     # start_stage2 defaults to 0.5 * num_epochs if not set — handled in trainer
 
     # Stash explicit-key set in the dict itself; consumers can read it (and

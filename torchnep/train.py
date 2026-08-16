@@ -31,9 +31,11 @@ card's memory.
 """
 
 import contextlib
+import hashlib
 import os
 import platform
 import time
+import warnings
 import torch
 import numpy as np
 from datetime import datetime
@@ -45,6 +47,16 @@ from .data import read_xyz, parse_nep_in, build_neighbor_list_np
 from . import ops
 from . import __version__
 from .predict import predict_from_store
+from .spin_schema import resolve_gpumd_qscaler
+from .response_training import (
+    GENERATOR_CURVE_HUBER_DELTA,
+    GENERATOR_CURVE_MEAN_WEIGHT,
+    GENERATOR_CURVE_SCHEMA,
+    GENERATOR_CURVE_WEIGHT,
+    complete_group_batches,
+    generator_curve_loss,
+    select_generator_curve_frames,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,12 +169,34 @@ def format_config_summary(config: dict) -> List[str]:
         if config.get("typewise_cutoff_zbl_factor") is not None:
             zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
         lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
+    if config.get("spin_mode", 0):
+        mode = config["spin_mode"]
+        family = "O/C magnetic polynomial"
+        lines.append(
+            f"  {tag('spin_mode'):10}  spin_mode    {mode} ({family})"
+        )
+        lines.append(f"  {tag('spin_compress'):10}  spin_compress "
+                     f"{config['spin_compress']}")
+        lines.append(f"  {tag('spin_basis_size'):10}  spin_basis_size "
+                     f"{config['spin_basis_size'][0]}")
+        lines.append(f"  {tag('spin_l_max'):10}  spin_l_max  "
+                     f"{config['spin_l_max'][0]}")
+        lines.append(f"  {tag('spin_order'):10}  spin_order  "
+                     f"{config['spin_order']}")
+        lines.append(f"  {tag('spin_soc'):10}  spin_soc     "
+                     f"{config['spin_soc']}")
+        lines.append(f"  {tag('spin_cutoff'):10}  spin_cutoff "
+                     f"{config['spin_cutoff'][0]}")
+        lines.append(f"  {tag('spin_curriculum'):10}  spin_curriculum "
+                     f"{int(config['spin_curriculum'])}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
     lines.append("---------------------------")
     lines.append(f"  {tag('num_epochs'):10}  epoch        {config['num_epochs']}")
     lines.append(f"  {tag('batch_size'):10}  batch        {config['batch_size']}")
+    lines.append(f"  {tag('eval_batch_size'):10}  eval_batch   "
+                 f"{config['eval_batch_size']}")
     lines.append(f"  {tag('lr'):10}  lr           {config['lr']}")
     lines.append(f"  {tag('stop_lr'):10}  stop_lr      {config['stop_lr']}")
     lines.append(f"  {tag('lr_scheduler'):10}  lr_scheduler {config['lr_scheduler']}")
@@ -179,6 +213,11 @@ def format_config_summary(config: dict) -> List[str]:
     lines.append(f"  {tag('lambda_e'):10}  lambda_e     {config['lambda_e']}")
     lines.append(f"  {tag('lambda_f'):10}  lambda_f     {config['lambda_f']}")
     lines.append(f"  {tag('lambda_v'):10}  lambda_v     {config['lambda_v']}")
+    if config.get("spin_mode", 0):
+        lines.append(f"  {tag('lambda_m'):10}  lambda_m     "
+                     f"{config['lambda_m']}")
+        lines.append(f"  {tag('lambda_tau'):10}  lambda_tau   "
+                     f"{config['lambda_tau']}")
     if config.get("lambda_1", 0.0) or config.get("lambda_2", 0.0):
         lines.append(f"  {tag('lambda_1'):10}  lambda_1     {config['lambda_1']}")
         lines.append(f"  {tag('lambda_2'):10}  lambda_2     {config['lambda_2']}")
@@ -202,6 +241,11 @@ def format_config_summary(config: dict) -> List[str]:
         lines.append(f"  {tag('stage2_pref_e'):10}  stage2_lambda_e {config['stage2_pref_e']}")
         lines.append(f"  {tag('stage2_pref_f'):10}  stage2_lambda_f {config['stage2_pref_f']}")
         lines.append(f"  {tag('stage2_pref_v'):10}  stage2_lambda_v {config['stage2_pref_v']}")
+        if config.get("spin_mode", 0):
+            lines.append(f"  {tag('stage2_pref_m'):10}  stage2_lambda_m "
+                         f"{config['stage2_pref_m']}")
+            lines.append(f"  {tag('stage2_pref_tau'):10}  "
+                         f"stage2_lambda_tau {config['stage2_pref_tau']}")
 
     return lines
 
@@ -267,10 +311,29 @@ class GPUDataStore:
         self.dtype = dtype
         self.n = len(structures)
         self.has_cached_basis = config is not None
+        self.has_spin = bool(config and config.get("spin_mode", 0))
+        if self.has_spin and any("spins" not in s for s in structures):
+            raise ValueError(
+                "spin_mode 3 requires a spin/moment vector for every atom")
 
         n_rad = np.array([len(s["pair_i_rad"]) for s in structures], dtype=np.int64)
         n_ang = np.array([len(s["pair_i_ang"]) for s in structures], dtype=np.int64)
+        n_spin = (
+            np.array(
+                [len(s["pair_i_spin"]) for s in structures],
+                dtype=np.int64,
+            )
+            if self.has_spin else None
+        )
         self.natoms = [int(s["natoms"]) for s in structures]
+        self.type_counts = [
+            np.bincount(
+                s["atom_types"],
+                minlength=(len(config["type_names"]) if config is not None
+                           else int(np.max(s["atom_types"])) + 1),
+            )
+            for s in structures
+        ]
 
         # preprocess_structures already returns arrays with the right dtype
         # (int64 for indices, float32 for rij). Skip the defensive astype —
@@ -282,6 +345,10 @@ class GPUDataStore:
         pi_a_cat = np.concatenate([s["pair_i_ang"]  for s in structures])
         pj_a_cat = np.concatenate([s["pair_j_ang"]  for s in structures])
         rij_a_cat = np.concatenate([s["rij_ang"]    for s in structures])
+        if self.has_spin:
+            pi_s_cat = np.concatenate([s["pair_i_spin"] for s in structures])
+            pj_s_cat = np.concatenate([s["pair_j_spin"] for s in structures])
+            rij_s_cat = np.concatenate([s["rij_spin"] for s in structures])
 
         at_all   = torch.from_numpy(at_cat).to(device=device, non_blocking=True)
 
@@ -293,12 +360,45 @@ class GPUDataStore:
         pj_a_all = torch.from_numpy(pj_a_cat).to(device=device, non_blocking=True)
         rij_a_all = torch.from_numpy(rij_a_cat).to(device=device, dtype=dtype,
                                                     non_blocking=True)
+        if self.has_spin:
+            pi_s_all = torch.from_numpy(pi_s_cat).to(
+                device=device, non_blocking=True)
+            pj_s_all = torch.from_numpy(pj_s_cat).to(
+                device=device, non_blocking=True)
+            rij_s_all = torch.from_numpy(rij_s_cat).to(
+                device=device, dtype=dtype, non_blocking=True)
 
         self.energy = [float(s["energy"]) if "energy" in s else 0.0
                        for s in structures]
         self.has_energy_flag = ["energy" in s for s in structures]
         self.has_forces_flag = ["forces" in s for s in structures]
         self.has_virial_flag = ["virial" in s for s in structures]
+        self.has_spins_flag = [
+            self.has_spin and "spins" in s for s in structures]
+        self.has_mforces_flag = [
+            self.has_spin and "mforces" in s for s in structures]
+        self.has_tau_flag = [
+            self.has_spin and "tau" in s for s in structures]
+        response_names = sorted({
+            str(s["response_group"])
+            for s in structures if "response_group" in s
+        })
+        response_index = {
+            name: index for index, name in enumerate(response_names)
+        }
+        self.response_group_ids = [
+            response_index.get(str(s.get("response_group")), -1)
+            for s in structures
+        ]
+        response_coordinates = np.asarray([
+            float(s.get("response_coordinate", 0.0)) for s in structures
+        ], dtype=np.float32 if dtype == torch.float32 else np.float64)
+        self.response_coordinates = torch.from_numpy(
+            response_coordinates
+        ).to(device=device, dtype=dtype, non_blocking=True)
+        self.has_spin_tangent_flag = [
+            self.has_spin and "spin_tangent" in s for s in structures
+        ]
 
         f_parts = []
         for s in structures:
@@ -310,6 +410,36 @@ class GPUDataStore:
                                                else np.float64, copy=False)
         f_all = torch.from_numpy(f_cat).to(device=device, dtype=dtype,
                                             non_blocking=True)
+
+        if self.has_spin:
+            spin_parts = []
+            mforce_parts = []
+            tau_parts = []
+            tangent_parts = []
+            for s in structures:
+                natoms = s["natoms"]
+                spin_parts.append(np.asarray(
+                    s.get("spins", np.zeros((natoms, 3)))).reshape(-1, 3))
+                mforce_parts.append(np.asarray(
+                    s.get("mforces", np.zeros((natoms, 3)))).reshape(-1, 3))
+                tau_parts.append(np.asarray(
+                    s.get("tau", np.zeros((natoms, 3)))).reshape(-1, 3))
+                tangent_parts.append(np.asarray(
+                    s.get("spin_tangent", np.zeros((natoms, 3)))
+                ).reshape(-1, 3))
+            np_dtype = np.float32 if dtype == torch.float32 else np.float64
+            spins_all = torch.from_numpy(
+                np.concatenate(spin_parts).astype(np_dtype, copy=False)
+            ).to(device=device, dtype=dtype, non_blocking=True)
+            mforces_all = torch.from_numpy(
+                np.concatenate(mforce_parts).astype(np_dtype, copy=False)
+            ).to(device=device, dtype=dtype, non_blocking=True)
+            tau_all = torch.from_numpy(
+                np.concatenate(tau_parts).astype(np_dtype, copy=False)
+            ).to(device=device, dtype=dtype, non_blocking=True)
+            tangent_all = torch.from_numpy(
+                np.concatenate(tangent_parts).astype(np_dtype, copy=False)
+            ).to(device=device, dtype=dtype, non_blocking=True)
 
         v_parts = []
         for s in structures:
@@ -390,6 +520,7 @@ class GPUDataStore:
 
         nr_list = n_rad.tolist()
         na_list = n_ang.tolist()
+        ns_list = n_spin.tolist() if self.has_spin else None
         nat_list = [int(x) for x in self.natoms]
 
         self.atom_types = list(torch.split(at_all, nat_list))
@@ -400,6 +531,14 @@ class GPUDataStore:
         self.pj_ang = list(torch.split(pj_a_all, na_list))
         self.rij_ang = list(torch.split(rij_a_all, na_list))
         self.forces = list(torch.split(f_all, nat_list))
+        if self.has_spin:
+            self.pi_spin = list(torch.split(pi_s_all, ns_list))
+            self.pj_spin = list(torch.split(pj_s_all, ns_list))
+            self.rij_spin = list(torch.split(rij_s_all, ns_list))
+            self.spins = list(torch.split(spins_all, nat_list))
+            self.mforces = list(torch.split(mforces_all, nat_list))
+            self.tau = list(torch.split(tau_all, nat_list))
+            self.spin_tangent = list(torch.split(tangent_all, nat_list))
         self.virial = list(torch.unbind(v_all, dim=0))
 
         if config is not None:
@@ -414,8 +553,19 @@ class GPUDataStore:
         self.n_energy = sum(self.has_energy_flag)
         self.n_forces = sum(self.has_forces_flag)
         self.n_virial = sum(self.has_virial_flag)
+        self.n_mforces = sum(self.has_mforces_flag)
+        self.n_tau = sum(self.has_tau_flag)
         self.has_forces = self.n_forces > 0
         self.has_virial = self.n_virial > 0
+        self.has_mforces = self.n_mforces > 0
+        self.has_tau = self.n_tau > 0
+        self.has_generator_curves = bool(
+            self.has_spin
+            and self.n > 0
+            and all(group >= 0 for group in self.response_group_ids)
+            and all(self.has_spin_tangent_flag)
+            and all(self.has_mforces_flag)
+        )
 
     def collate(self, indices: List[int]) -> Dict:
         """Fast GPU-side batch collation. No CPU->GPU transfer."""
@@ -444,7 +594,6 @@ class GPUDataStore:
         pj_a = torch.cat([self.pj_ang[i] + offsets[k]
                           for k, i in enumerate(indices)])
         rij_a = torch.cat([self.rij_ang[i] for i in indices])
-
         energy = torch.tensor([self.energy[i] for i in indices],
                               dtype=self.dtype, device=self.device)
         natoms = torch.tensor([self.natoms[i] for i in indices],
@@ -460,6 +609,31 @@ class GPUDataStore:
             "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
             "energy": energy, "natoms": natoms, "volumes": volumes,
         }
+        if self.has_spin:
+            batch.update({
+                "pair_i_spin": torch.cat([
+                    self.pi_spin[i] + offsets[k]
+                    for k, i in enumerate(indices)
+                ]),
+                "pair_j_spin": torch.cat([
+                    self.pj_spin[i] + offsets[k]
+                    for k, i in enumerate(indices)
+                ]),
+                "rij_spin": torch.cat([
+                    self.rij_spin[i] for i in indices
+                ]),
+                "spins": torch.cat([self.spins[i] for i in indices]),
+                "spin_tangent": torch.cat([
+                    self.spin_tangent[i] for i in indices
+                ]),
+            })
+            batch["response_group_ids"] = torch.tensor(
+                [self.response_group_ids[i] for i in indices],
+                dtype=torch.long, device=self.device,
+            )
+            batch["response_coordinates"] = self.response_coordinates[
+                torch.as_tensor(indices, dtype=torch.long, device=self.device)
+            ]
 
         batch["energy_mask"] = torch.tensor(
             [self.has_energy_flag[i] for i in indices],
@@ -477,6 +651,23 @@ class GPUDataStore:
         batch["virial_mask"] = torch.tensor(
             [self.has_virial_flag[i] for i in indices],
             dtype=torch.bool, device=self.device)
+
+        if self.has_spin:
+            batch["mforces"] = torch.cat([
+                self.mforces[i] for i in indices])
+            mforce_flags = [self.has_mforces_flag[i] for i in indices]
+            batch["mforce_mask"] = torch.cat([
+                torch.full((self.natoms[indices[k]],), mforce_flags[k],
+                           dtype=torch.bool, device=self.device)
+                for k in range(B)
+            ])
+            batch["tau"] = torch.cat([self.tau[i] for i in indices])
+            tau_flags = [self.has_tau_flag[i] for i in indices]
+            batch["tau_mask"] = torch.cat([
+                torch.full((self.natoms[indices[k]],), tau_flags[k],
+                           dtype=torch.bool, device=self.device)
+                for k in range(B)
+            ])
 
         if self.has_cached_basis:
             batch["fk_rad"] = torch.cat([self.fk_rad[i] for i in indices])
@@ -496,7 +687,7 @@ class GPUDataStore:
 
 def _preprocess_one_frame(args):
     """Worker: build neighbor lists for a single frame. Picklable for mp.Pool."""
-    frame, rc_rad, rc_ang, max_rc, type_names, dtype = args
+    frame, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype = args
     positions = frame["positions"].astype(dtype)
     cell = frame["cell"].astype(dtype)
     atom_types = np.array([type_names.index(s) for s in frame["species"]],
@@ -514,12 +705,33 @@ def _preprocess_one_frame(args):
         "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
         "rij_ang": rij[ang_mask].astype(dtype),
     }
+    if rc_spin is not None:
+        spin_mask = dij < rc_spin
+        s.update({
+            "pair_i_spin": pair_i[spin_mask],
+            "pair_j_spin": pair_j[spin_mask],
+            "rij_spin": rij[spin_mask].astype(dtype),
+        })
     if "energy" in frame:
         s["energy"] = frame["energy"]
     if "forces" in frame:
         s["forces"] = frame["forces"].astype(dtype)
     if "virial" in frame:
         s["virial"] = frame["virial"].astype(dtype)
+    if "spins" in frame:
+        s["spins"] = frame["spins"].astype(dtype)
+    if "mforces" in frame:
+        s["mforces"] = frame["mforces"].astype(dtype)
+    if "tau" in frame:
+        s["tau"] = frame["tau"].astype(dtype)
+    if "spin_tangent" in frame:
+        s["spin_tangent"] = frame["spin_tangent"].astype(dtype)
+    for key in (
+        "response_group", "response_probe", "response_coordinate",
+        "response_branch",
+    ):
+        if key in frame:
+            s[key] = frame[key]
     return s
 
 
@@ -543,8 +755,14 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
     """
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
+    rc_spin = (
+        float(config.get("spin_cutoff", [rc_rad, rc_ang])[0])
+        if config.get("spin_mode", 0) else None)
     type_names = config["type_names"]
-    max_rc = max(rc_rad, rc_ang)
+    max_rc = max(
+        rc_rad, rc_ang,
+        rc_spin if rc_spin is not None else 0.0,
+    )
 
     if n_workers is None:
         cpu_total = os.cpu_count() or 1
@@ -553,7 +771,8 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
         n_workers = int(os.environ.get("TORCHNEP_PREPROC_WORKERS", n_workers))
 
     if n_workers <= 1 or len(frames) < 64:
-        return [_preprocess_one_frame((f, rc_rad, rc_ang, max_rc, type_names, dtype))
+        return [_preprocess_one_frame((
+            f, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype))
                 for f in frames]
 
     import multiprocessing as mp
@@ -563,24 +782,220 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None):
     except ValueError:
         ctx = mp.get_context("spawn")
 
-    args = [(f, rc_rad, rc_ang, max_rc, type_names, dtype) for f in frames]
+    args = [
+        (f, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype)
+        for f in frames
+    ]
     chunksize = max(1, len(frames) // (n_workers * 4))
     with ctx.Pool(n_workers) as pool:
         return pool.map(_preprocess_one_frame, args, chunksize=chunksize)
 
 
 def compute_max_neighbors(structures):
-    """Return (max_NN_radial, max_NN_angular) over all structures."""
+    """Return (max_NN_radial, max_NN_angular) over all structures.
+
+    ``max_NN_radial`` also covers the spin neighbor list because GPUMD uses
+    the first exported capacity for radial/spin storage.
+    """
     max_rad = max_ang = 0
     for s in structures:
         n = s["natoms"]
         if len(s["pair_i_rad"]) > 0:
             counts = np.bincount(s["pair_i_rad"], minlength=n)
             max_rad = max(max_rad, int(counts.max()))
+        if len(s.get("pair_i_spin", ())) > 0:
+            counts = np.bincount(s["pair_i_spin"], minlength=n)
+            max_rad = max(max_rad, int(counts.max()))
         if len(s["pair_i_ang"]) > 0:
             counts = np.bincount(s["pair_i_ang"], minlength=n)
             max_ang = max(max_ang, int(counts.max()))
     return max_rad, max_ang
+
+
+def fit_energy_baseline(structures, num_types):
+    """Per-type baseline for the same per-structure E/N metric as training."""
+    labelled = [structure for structure in structures if "energy" in structure]
+    if not labelled:
+        return np.zeros(num_types, dtype=np.float64)
+    counts = np.stack([
+        np.bincount(structure["atom_types"], minlength=num_types)
+        for structure in labelled
+    ]).astype(np.float64)
+    natoms = np.asarray(
+        [structure["natoms"] for structure in labelled], dtype=np.float64)
+    totals = np.asarray(
+        [structure["energy"] for structure in labelled], dtype=np.float64)
+    baseline, _, rank, _ = np.linalg.lstsq(
+        counts / natoms[:, None], totals / natoms, rcond=None)
+    if rank < num_types and int(os.environ.get("RANK", "0")) == 0:
+        warnings.warn(
+            "per-element spin_baseline is non-unique for this composition "
+            "matrix; it is a conditioning offset, not a physical atomic "
+            "energy",
+            RuntimeWarning,
+        )
+    return baseline
+
+
+def fit_energy_baseline_frames(frames, type_names):
+    """Per-type E/N baseline without building neighbor lists."""
+    labelled = [frame for frame in frames if "energy" in frame]
+    if not labelled:
+        return np.zeros(len(type_names), dtype=np.float64)
+    type_index = {name: index for index, name in enumerate(type_names)}
+    counts = np.zeros((len(labelled), len(type_names)), dtype=np.float64)
+    for row, frame in enumerate(labelled):
+        for species in frame["species"]:
+            counts[row, type_index[species]] += 1.0
+    totals = np.asarray(
+        [frame["energy"] for frame in labelled], dtype=np.float64
+    )
+    natoms = np.asarray(
+        [len(frame["species"]) for frame in labelled], dtype=np.float64)
+    baseline, _, rank, _ = np.linalg.lstsq(
+        counts / natoms[:, None], totals / natoms, rcond=None)
+    if rank < len(type_names) and int(os.environ.get("RANK", "0")) == 0:
+        warnings.warn(
+            "per-element spin_baseline is non-unique for this composition "
+            "matrix; it is a conditioning offset, not a physical atomic "
+            "energy",
+            RuntimeWarning,
+        )
+    return baseline
+
+
+def grouped_validation_indices(frames, valid_ratio, run_seed):
+    """Hold out whole response groups; ungrouped frames remain independent."""
+    groups = {}
+    for index, frame in enumerate(frames):
+        key = frame.get("response_group", ("frame", index))
+        groups.setdefault(key, []).append(index)
+    if len(groups) < 2:
+        raise ValueError(
+            "valid_ratio requires at least two independent response groups; "
+            "use valid_file when one group contains the whole dataset"
+        )
+    keys = list(groups)
+    generator = torch.Generator()
+    generator.manual_seed(run_seed)
+    order = torch.randperm(len(keys), generator=generator).tolist()
+    target = max(1, int(round(valid_ratio * len(frames))))
+    selected = []
+    count = 0
+    for position in order:
+        candidate = groups[keys[position]]
+        if count and count >= target:
+            break
+        if len(selected) + len(candidate) >= len(frames):
+            continue
+        selected.extend(candidate)
+        count += len(candidate)
+    if not selected or len(selected) >= len(frames):
+        raise ValueError(
+            "response-group validation split could not leave both partitions "
+            "non-empty; provide a separate valid_file"
+        )
+    return sorted(selected)
+
+
+def validate_spin_frames(frames, source_name):
+    """Fail closed when an O/C dataset contains frames without spin vectors."""
+    missing = [
+        index for index, frame in enumerate(frames) if "spins" not in frame
+    ]
+    if missing:
+        preview = ", ".join(str(index) for index in missing[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        raise ValueError(
+            f"spin_mode 3 requires spins in every {source_name} frame; "
+            f"missing at indices {preview}{suffix}"
+        )
+
+
+def validate_response_group_disjoint(train_frames, valid_frames):
+    """Reject response trajectories split across explicit train/valid files."""
+    train_groups = {
+        frame["response_group"]
+        for frame in train_frames if "response_group" in frame
+    }
+    valid_groups = {
+        frame["response_group"]
+        for frame in valid_frames if "response_group" in frame
+    }
+    overlap = sorted(train_groups & valid_groups)
+    if overlap:
+        preview = ", ".join(map(str, overlap[:5]))
+        suffix = "..." if len(overlap) > 5 else ""
+        raise ValueError(
+            "train and validation files share response_group values: "
+            f"{preview}{suffix}"
+        )
+
+
+def build_data_lineage(data_file, valid_file, valid_ratio,
+                       energy_key="energy"):
+    """Content-address the data contract saved in a training checkpoint."""
+    def _identity(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        return {
+            "path": os.path.realpath(path),
+            "sha256": digest.hexdigest(),
+        }
+
+    return {
+        "schema": "torchnep-data-lineage-v1",
+        "data": _identity(data_file),
+        "validation": _identity(valid_file) if valid_file is not None else None,
+        "valid_ratio": valid_ratio,
+        "energy_key": energy_key,
+    }
+
+
+def validate_resume_data_lineage(saved, current, require_versioned=False):
+    """Fail closed when resume would silently change a scientific split."""
+    if saved is None:
+        if require_versioned:
+            raise ValueError(
+                "spin checkpoint is missing content-addressed data lineage")
+        return
+    if "data" not in saved:
+        # Backward compatibility for old nonmagnetic checkpoints, which only
+        # recorded the validation path/ratio. Spin3 has no legacy production
+        # checkpoint contract and therefore takes the fail-closed branch.
+        if require_versioned:
+            raise ValueError(
+                "spin checkpoint is missing content-addressed data lineage")
+        legacy_current = {
+            "valid_file": (
+                None if current["validation"] is None
+                else current["validation"]["path"]
+            ),
+            "valid_ratio": current["valid_ratio"],
+        }
+        legacy_saved = {
+            "valid_file": (
+                None if saved.get("valid_file") is None
+                else os.path.realpath(saved["valid_file"])
+            ),
+            "valid_ratio": saved.get("valid_ratio"),
+        }
+        if legacy_saved != legacy_current:
+            raise ValueError(
+                "validation settings changed since the checkpoint was saved")
+        warnings.warn(
+            "legacy checkpoint has no data-content fingerprint; resume can "
+            "only verify its validation path/ratio",
+            RuntimeWarning,
+        )
+        return
+    if saved != current:
+        raise ValueError(
+            "training/validation data content or split changed since the "
+            "checkpoint was saved; start a new run or fine-tune instead. "
+            f"saved={saved}, current={current}")
 
 
 # The 6 unique components of the symmetric virial, picked from the row-major
@@ -621,8 +1036,11 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
         c2 = torch.ones_like(model.c_param_2)
         c3 = (torch.ones_like(model.c_param_3)
               if model.c_param_3 is not None else None)
+        c_spin = (torch.ones_like(model.c_param_spin)
+                  if model.c_param_spin is not None else None)
     else:
         c2, c3 = model.c_param_2, model.c_param_3
+        c_spin = model.c_param_spin
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -640,9 +1058,19 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
             model._c4b2,
             dtype, dev,
             backend=backend,
-            has_q_123=model.has_q_123, has_q_233=model.has_q_233,
+            has_q_123=model.has_q_123,
+            has_q_233=model.has_q_233,
             has_q_134=model.has_q_134,
         )
+        if model.spin_descriptor is not None:
+            q_spin = model.spin_descriptor(
+                batch["rij_spin"], batch["pair_i_spin"],
+                batch["pair_j_spin"], batch["spins"], batch["N"],
+                batch["atom_types"], c_spin, None,
+                model.spin_dof_type_active,
+                model.spin_env_type_active,
+            )
+            q = torch.cat((q, q_spin), dim=-1)
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
 
@@ -735,7 +1163,8 @@ def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
 def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
                      loss_weights=None, in_stage2=False, swa_model=None,
                      best_true_loss=None, run_seed=None,
-                     best_valid_loss=None, valid_info=None):
+                     best_valid_loss=None, valid_info=None,
+                     schedule_state=None, early_stop_state=None):
     """Write a full training checkpoint.
 
     ``scheduler`` must be the ACTIVE one (stage2_scheduler while in stage 2,
@@ -748,6 +1177,7 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         "epoch": epoch,
         "best_loss": best_loss,
         "model_state": m.state_dict(),
+        "model_signature": m.architecture_signature(),
         "optimizer_state": optimizer.state_dict(),
         "in_stage2": in_stage2,
         "run_seed": run_seed,
@@ -764,19 +1194,26 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         state["best_valid_loss"] = best_valid_loss
     if valid_info is not None:
         state["valid_info"] = valid_info
+    if schedule_state is not None:
+        state["schedule_state"] = schedule_state
+    if early_stop_state is not None:
+        state["early_stop_state"] = early_stop_state
+    best_model_path = os.path.join(
+        os.path.dirname(os.path.abspath(path)), "nep_best.txt")
+    if os.path.exists(best_model_path):
+        with open(best_model_path) as stream:
+            state["best_model_text"] = stream.read()
     torch.save(state, path)
 
 
-def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
-                     swa_model, device):
+def _load_checkpoint(path, model, optimizer, swa_model, device):
     """Load a checkpoint so the run continues exactly where it stopped.
 
     The optimizer state carries the lr of the checkpoint moment — nep.in's
-    lr is never re-applied on resume. The scheduler state is restored into
-    the scheduler that was active when the checkpoint was written
-    (``in_stage2`` tag; pre-tag checkpoints fall back to the stage-1
-    scheduler, matching the old behaviour). SWA state is restored when both
-    sides have it.
+    lr is never re-applied on resume. The raw scheduler state is returned so
+    the caller can first decide whether the scheduler configuration changed:
+    identical semantics restore strictly; an intentional config change starts
+    a fresh scheduler. SWA state is restored when both sides have it.
 
     Returns a dict with epoch / best_loss / best_true_loss / loss_weights /
     in_stage2.
@@ -790,24 +1227,32 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
     # into a plain NEPModel (new checkpoints always store plain keys).
     if model_state and all(k.startswith("model.") for k in model_state):
         model_state = {k[len("model."):]: v for k, v in model_state.items()}
+    saved_signature = ckpt.get("model_signature")
+    expected_signature = m.architecture_signature()
+    if saved_signature is None:
+        if m.spin_mode:
+            raise ValueError(
+                "spin checkpoint is missing model_signature; export a "
+                "versioned nep4_spin3 model before fine-tuning")
+        warnings.warn(
+            "legacy checkpoint has no architecture signature; only tensor "
+            "shapes can be checked",
+            RuntimeWarning,
+        )
+    elif saved_signature != expected_signature:
+        raise ValueError(
+            "checkpoint architecture does not match the current config: "
+            f"{saved_signature} != {expected_signature}")
     m.load_state_dict(model_state)
     optimizer.load_state_dict(ckpt["optimizer_state"])
     in_stage2 = ckpt.get("in_stage2", False)
-    target = (stage2_scheduler if (in_stage2 and stage2_scheduler is not None)
-              else lr_scheduler)
-    if target is not None and "scheduler_state" in ckpt:
-        # Scheduler class may have changed between runs (user switched
-        # lr_scheduler mode). Tolerate that by skipping the state load —
-        # scheduler just starts fresh this run.
-        try:
-            target.load_state_dict(ckpt["scheduler_state"])
-        except (KeyError, ValueError, TypeError):
-            pass
     if swa_model is not None and ckpt.get("swa_state") is not None:
         try:
             swa_model.load_state_dict(ckpt["swa_state"])
-        except (KeyError, ValueError, RuntimeError):
-            pass
+        except (KeyError, ValueError, RuntimeError) as error:
+            raise ValueError(
+                "checkpoint SWA state does not match the current model"
+            ) from error
     return {
         "epoch": ckpt["epoch"],
         "best_loss": ckpt["best_loss"],
@@ -817,7 +1262,72 @@ def _load_checkpoint(path, model, optimizer, lr_scheduler, stage2_scheduler,
         "run_seed": ckpt.get("run_seed"),
         "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
         "valid_info": ckpt.get("valid_info"),
+        "schedule_state": ckpt.get("schedule_state"),
+        "early_stop_state": ckpt.get("early_stop_state"),
+        "has_swa_state": ckpt.get("swa_state") is not None,
+        "best_model_text": ckpt.get("best_model_text"),
+        "scheduler_state": ckpt.get("scheduler_state"),
     }
+
+
+def _restore_scheduler_state(info, lr_scheduler, stage2_scheduler,
+                             require_versioned=False):
+    """Strictly restore the active scheduler for an unchanged objective."""
+    target = (
+        stage2_scheduler
+        if info["in_stage2"] and stage2_scheduler is not None
+        else lr_scheduler
+    )
+    state = info.get("scheduler_state")
+    if target is None:
+        return
+    if state is None:
+        if require_versioned:
+            raise ValueError(
+                "spin checkpoint is missing scheduler_state")
+        warnings.warn(
+            "legacy checkpoint has no scheduler_state; scheduler restarts",
+            RuntimeWarning,
+        )
+        return
+    try:
+        target.load_state_dict(state)
+    except (KeyError, ValueError, TypeError) as error:
+        raise ValueError(
+            "checkpoint scheduler_state is incompatible or corrupted"
+        ) from error
+
+
+def _load_finetune_weights(target, path, device):
+    """Load fine-tune weights with the same semantic gate as resume."""
+    if not path.endswith(".pt"):
+        target.load_weights_from_nep_txt(path)
+        return
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if "model_state" in payload:
+        state = payload["model_state"]
+        signature = payload.get("model_signature")
+    else:
+        state = payload
+        signature = None
+    if state and all(key.startswith("model.") for key in state):
+        state = {key[len("model."):]: value for key, value in state.items()}
+    expected = target.architecture_signature()
+    if signature is None:
+        if target.spin_mode:
+            raise ValueError(
+                "spin .pt weights are missing model_signature; use a "
+                "versioned checkpoint or nep4_spin3 text model")
+        warnings.warn(
+            "legacy .pt weights have no architecture signature; only tensor "
+            "shapes can be checked",
+            RuntimeWarning,
+        )
+    elif signature != expected:
+        raise ValueError(
+            "fine-tune architecture does not match the current config: "
+            f"{signature} != {expected}")
+    target.load_state_dict(state, strict=True)
 
 
 def _trim_loss_log(path, last_epoch):
@@ -848,12 +1358,14 @@ def _trim_loss_log(path, last_epoch):
 def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                                compute_props, compute_props_cached,
                                use_autograd_forces, backend,
-                               has_forces, has_virial, dtype, dev):
+                               has_forces, has_virial, has_mforce, has_tau,
+                               dtype, dev):
     """Frozen-weight squared-error sums over the LOCAL data_store.
 
     Mirrors the training-epoch accumulation exactly (same masks, same
     per-sample units), but forward-only on one fixed set of weights.
-    Returns (sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid) so
+    Returns structural/magnetic squared-error sums, sample counts, and the
+    signed energy residual so
     callers can finish the per-sample averaging themselves — the DDP path
     all-reduces these numbers across ranks first, which makes the aggregated
     loss EXACTLY the full-dataset value (a sum of per-shard sums), identical
@@ -865,15 +1377,19 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
     sum_le/n_e − δ².
     """
     sum_le = sum_lf = sum_lv = sum_ls = 0.0
+    sum_lm = sum_lt = 0.0
     sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
-    n_e = n_f = n_v = 0
+    n_e = n_f = n_v = n_m = n_t = 0
 
     was_training = raw_model.training
     raw_model.eval()  # autograd path: .training drives create_graph
     # The analytical path needs no graph at all; the autograd path still
     # needs grad-enabled rij for the force evaluation, so no_grad only
     # wraps the cached (analytical) compute.
-    ctx = contextlib.nullcontext() if use_autograd_forces else torch.no_grad()
+    spin_grad = (raw_model.spin_descriptor is not None
+                 and (has_forces or has_virial or has_mforce or has_tau))
+    ctx = (contextlib.nullcontext()
+           if (use_autograd_forces or spin_grad) else torch.no_grad())
     try:
         with ctx:
             for start in range(0, data_store.n, batch_size):
@@ -888,8 +1404,14 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         batch["atom_types"], batch["N"],
                         batch["struct_idx"], batch["num_structures"],
                         need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
+                        backend=backend, spins=batch.get("spins"),
+                        need_mforce=has_mforce, need_tau=has_tau,
+                        rij_spin=batch.get("rij_spin"),
+                        pi_spin=batch.get("pair_i_spin"),
+                        pj_spin=batch.get("pair_j_spin"))
                 else:
+                    batch["need_mforce"] = has_mforce
+                    batch["need_tau"] = has_tau
                     result = compute_props_cached(
                         batch, need_forces=has_forces,
                         need_virial=has_virial, backend=backend)
@@ -931,17 +1453,38 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         sum_ls += ((v_diff * s_scale) ** 2) \
                             .mean(dim=1).sum().item()
                         n_v += int(v_mask.sum().item())
+
+                if has_mforce and "mforces" in result:
+                    active = raw_model.spin_dof_type_active[
+                        batch["atom_types"]]
+                    m_mask = batch["mforce_mask"] & active
+                    if m_mask.any():
+                        m_diff = (
+                            result["mforces"][m_mask]
+                            - batch["mforces"][m_mask])
+                        sum_lm += (m_diff ** 2).mean(dim=1).sum().item()
+                        n_m += int(m_mask.sum().item())
+
+                if has_tau and "tau" in result:
+                    active = raw_model.spin_dof_type_active[
+                        batch["atom_types"]]
+                    t_mask = batch["tau_mask"] & active
+                    if t_mask.any():
+                        t_diff = result["tau"][t_mask] - batch["tau"][t_mask]
+                        sum_lt += (t_diff ** 2).mean(dim=1).sum().item()
+                        n_t += int(t_mask.sum().item())
     finally:
         if was_training:
             raw_model.train()
 
-    return sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, sum_e_resid
+    return (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
+            n_e, n_f, n_v, n_m, n_t, sum_e_resid)
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, backend,
-                        pref_e, pref_f, pref_v, dtype, dev):
+                        pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
     """Weighted loss + RMSEs of the CURRENT (frozen) weights, full dataset.
 
     Single-GPU wrapper around ``_accumulate_true_loss_sums`` — used to
@@ -953,15 +1496,21 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     agree. This is what keeps nep_best ≤ nep_final: every candidate (the final
     epoch always among them) is judged AND saved with its own exact b1.
 
-    Returns (true_loss, rmse_e, rmse_f, rmse_v) — energy terms offset-corrected.
+    Returns loss and E/F/V/stress/M/tau RMSEs; energy is offset-corrected.
     """
     has_forces = data_store.has_forces and pref_f > 0
     has_virial = data_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, _sum_ls, n_e, n_f, n_v, sum_e_resid = \
-        _accumulate_true_loss_sums(
-            data_store, batch_size, raw_model,
-            compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    has_mforce = (raw_model.spin_descriptor is not None
+                  and data_store.has_mforces and pref_m > 0)
+    has_tau = (raw_model.spin_descriptor is not None
+               and data_store.has_tau and pref_tau > 0)
+    sums = _accumulate_true_loss_sums(
+        data_store, batch_size, raw_model,
+        compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial,
+        has_mforce, has_tau, dtype, dev)
+    (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
+     n_e, n_f, n_v, n_m, n_t, sum_e_resid) = sums
     # Exact optimal b1 for these frozen weights, solved from this same pass.
     delta = sum_e_resid / n_e if n_e > 0 else 0.0
     if n_e > 0:
@@ -972,14 +1521,19 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
-    true_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
-    return true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v)
+    mse_s = sum_ls / max(n_v, 1)
+    mse_m = sum_lm / max(n_m, 1)
+    mse_t = sum_lt / max(n_t, 1)
+    true_loss = (pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+                 + pref_m * mse_m + pref_tau * mse_t)
+    return (true_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
+            np.sqrt(mse_s), np.sqrt(mse_m), np.sqrt(mse_t))
 
 
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
                          compute_props, compute_props_cached,
                          use_autograd_forces, backend,
-                         pref_e, pref_f, pref_v, dtype, dev):
+                         pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
     """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
 
     Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
@@ -988,23 +1542,67 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
     information into the saved model. Energy MSE is therefore the plain
     residual mean square with the current (train-fitted) b1.
 
-    Returns (valid_loss, rmse_e, rmse_f, rmse_v, rmse_stress_gpa).
+    Returns validation loss and E/F/V/stress/M/tau RMSEs.
     """
     from .constants import EV_PER_A3_TO_GPa
     has_forces = valid_store.has_forces and pref_f > 0
     has_virial = valid_store.has_virial and pref_v > 0
-    sum_le, sum_lf, sum_lv, sum_ls, n_e, n_f, n_v, _ = \
-        _accumulate_true_loss_sums(
-            valid_store, batch_size, raw_model,
-            compute_props, compute_props_cached,
-            use_autograd_forces, backend, has_forces, has_virial, dtype, dev)
+    has_mforce = (raw_model.spin_descriptor is not None
+                  and valid_store.has_mforces and pref_m > 0)
+    has_tau = (raw_model.spin_descriptor is not None
+               and valid_store.has_tau and pref_tau > 0)
+    sums = _accumulate_true_loss_sums(
+        valid_store, batch_size, raw_model,
+        compute_props, compute_props_cached,
+        use_autograd_forces, backend, has_forces, has_virial,
+        has_mforce, has_tau, dtype, dev)
+    (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
+     n_e, n_f, n_v, n_m, n_t, _) = sums
     mse_e = sum_le / max(n_e, 1)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
     mse_s = sum_ls / max(n_v, 1)
-    valid_loss = pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+    mse_m = sum_lm / max(n_m, 1)
+    mse_t = sum_lt / max(n_t, 1)
+    valid_loss = (pref_e * mse_e + pref_f * mse_f + pref_v * mse_v
+                  + pref_m * mse_m + pref_tau * mse_t)
     return (valid_loss, np.sqrt(mse_e), np.sqrt(mse_f), np.sqrt(mse_v),
-            np.sqrt(mse_s) * EV_PER_A3_TO_GPa)
+            np.sqrt(mse_s) * EV_PER_A3_TO_GPa,
+            np.sqrt(mse_m), np.sqrt(mse_t))
+
+
+def evaluate_generator_curves(response_store, batch_size, raw_model,
+                              backend):
+    """Evaluate the frozen centered generator-curve objective."""
+    if response_store is None:
+        return None
+    was_training = raw_model.training
+    raw_model.eval()
+    weighted_sum = 0.0
+    n_frames = 0
+    try:
+        with torch.enable_grad():
+            batches = complete_group_batches(
+                response_store.response_group_ids, batch_size, seed=0)
+            for indices in batches:
+                batch = response_store.collate(indices)
+                batch["need_mforce"] = True
+                batch["need_tau"] = False
+                result = raw_model.compute_properties_cached(
+                    batch, need_forces=False, need_virial=False,
+                    backend=backend, create_graph=False)
+                value = generator_curve_loss(
+                    result["mforces"], batch["mforces"],
+                    batch["spin_tangent"], batch["struct_idx"],
+                    batch["response_group_ids"],
+                    batch["response_coordinates"],
+                    batch["num_structures"])
+                weighted_sum += value.item() * len(indices)
+                n_frames += len(indices)
+    finally:
+        if was_training:
+            raw_model.train()
+    return weighted_sum / max(n_frames, 1)
 
 
 def _quiet_compile_logs():
@@ -1078,6 +1676,18 @@ def _compile_check(dev):
 # Unified training entry point (single GPU or torchrun DDP)
 # ---------------------------------------------------------------------------
 
+def spin_curriculum_scale(epoch: int, full_o3_epoch: int) -> float:
+    """O2 warm-up followed by a linear O3 opening before Stage 2."""
+    if full_o3_epoch < 2:
+        raise ValueError("full_o3_epoch must be at least 2")
+    warmup_end = max(1, full_o3_epoch // 2)
+    if epoch <= warmup_end:
+        return 0.0
+    if epoch >= full_o3_epoch:
+        return 1.0
+    return (epoch - warmup_end) / (full_o3_epoch - warmup_end)
+
+
 def train_nep(
     config_file: str,
     data_file: str,
@@ -1097,7 +1707,7 @@ def train_nep(
     recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
-    use_gpumd_qscaler: bool = True,
+    use_gpumd_qscaler: bool = None,
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
@@ -1116,22 +1726,21 @@ def train_nep(
     precision : "float32" (default) or "float64".
     backend : "auto" | "loop" | "bmm" — see torchnep.ops.resolve_backend.
     use_autograd_forces : True -> autograd-through-rij forces (slower, gold
-        standard); False (default) -> analytical chain rule.
+        standard); False (default) -> analytical chain rule. O/C spin models
+        automatically select the full autograd E/F/V/MF/Tau path.
     use_swa : True -> maintain an averaged model during stage 2 and save it
         as ``nep_average.txt`` at the end.
-    use_compile : torch.compile the analytical compute method (~1.3x faster per
-        epoch after a one-time first-epoch compilation cost; needs Triton, which
-        ships with the CUDA PyTorch build). Ignored on the autograd force path
-        (incompatible with its double-backward). For an extra ~1.3x when memory
-        allows, also pass backend="bmm" (faster under compile but higher peak
-        memory — see docs/torch_compile.md).
+    use_compile : torch.compile the analytical compute method after a one-time
+        first-epoch compilation cost (needs Triton on CUDA). Ignored by
+        autograd forces because they require double backward.
+        ``backend="auto"`` selects the compile-friendly bmm contractions.
     print_interval : log a line to screen every N epochs (all epochs still
         land in output.log).
     restart : on fresh output_dir, write new log; otherwise resume from
         checkpoint.pt if present.
     checkpoint_interval : save checkpoint.pt every N epochs.
     prediction_interval : every N epochs, run predict_from_store with the
-        current nep_best weights and overwrite {energy,force,virial}_train.out
+        current-epoch weights and overwrite {energy,force,virial}_train.out
         in output_dir — lets you watch the parity-plot converge live.
         Set to 0 or a negative value to disable.
     finetune_from : path to an existing .pt or nep.txt to load weights from
@@ -1152,14 +1761,18 @@ def train_nep(
     energy_key : name of the comment-line tag read as the reference energy
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
         against atomization energies instead of totals.
-    use_gpumd_qscaler : Default True — reproduce GPUMD's initialization: every
-        parameter is re-initialised uniform(-1, 1) — the descriptor
-        coefficients AND the NN weights (w0/b0/w1), matching SNES's mu init —
-        and the q_scaler is computed with all coefficients = 1.0 (GPUMD's
-        generation-0 ``initial_para``). False leaves torch's default NN init in
-        place and uses the self-consistent q_scaler (computed from the model's
-        actual init coefficients). Only applies to fresh training (ignored
-        under finetune_from).
+    use_gpumd_qscaler : None (default) selects the safe mode by descriptor:
+        self-consistent scaling for spin_mode 3 and GPUMD-compatible scaling
+        otherwise. Explicit True is rejected for spin_mode 3 because its
+        all-one radial state collapses axial channels. For other modes, True
+        reproduces GPUMD's initialization for
+        GPUMD-compatible parameters: descriptor expansion coefficients and
+        fitting-network weights are re-initialised uniform(-1, 1), and the
+        q_scaler is computed with expansion coefficients = 1.0. Descriptor
+        architecture parameters without a GPUMD counterpart retain their
+        designed initialization. False leaves torch's default initialization
+        in place and uses the self-consistent q_scaler. Only applies to fresh
+        training (ignored under finetune_from).
     run_seed : master RNG seed for this run. None (default) -> a fresh random
         seed each run, so repeated runs differ (independent weight init AND
         per-epoch batch shuffle) — the stochastic-testing behaviour. Pass an
@@ -1212,6 +1825,9 @@ def train_nep(
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
+    use_gpumd_qscaler = resolve_gpumd_qscaler(
+        orig_config.get("spin_mode", 0), use_gpumd_qscaler
+    )
     for line in format_config_summary(orig_config):
         _log(line)
     _log("")
@@ -1222,6 +1838,7 @@ def train_nep(
     # Training schedule + loss weights
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
+    eval_batch_size    = config["eval_batch_size"]
     lr                 = config["lr"]
     stop_lr            = config["stop_lr"]
     scheduler_patience = config["scheduler_patience"]
@@ -1232,6 +1849,8 @@ def train_nep(
     pref_e             = config["lambda_e"]
     pref_f             = config["lambda_f"]
     pref_v             = config["lambda_v"]
+    pref_m             = config["lambda_m"]
+    pref_tau           = config["lambda_tau"]
     # Optional stage-2 block
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")  # may be None -> auto 0.5*num_epochs
@@ -1239,6 +1858,8 @@ def train_nep(
     stage2_pref_e      = config["stage2_pref_e"]
     stage2_pref_f      = config["stage2_pref_f"]
     stage2_pref_v      = config["stage2_pref_v"]
+    stage2_pref_m      = config["stage2_pref_m"]
+    stage2_pref_tau    = config["stage2_pref_tau"]
     # Stage 2 can have its own decay schedule (default: same as stage 1).
     # Use this when the two stages span different LR ranges — e.g. stage 1
     # 1e-2 -> 1e-3 (factor 0.794, 10 decays) vs stage 2 1e-3 -> 1e-5
@@ -1279,6 +1900,11 @@ def train_nep(
     # ---- Data ------------------------------------------------------------
     _log("Data")
     _log("----")
+    # Hash the exact input bytes before parsing them. If the file changes
+    # after this point, the saved lineage remains tied to the pre-read
+    # snapshot and a later resume will fail rather than bless new contents.
+    initial_data_lineage = build_data_lineage(
+        data_file, valid_file, valid_ratio, energy_key)
     frames = read_xyz(data_file, energy_key=energy_key)
     _log(f"  read {len(frames)} structures from {data_file} "
          f"(energy label: {energy_key})")
@@ -1292,6 +1918,8 @@ def train_nep(
         raise ValueError("valid_file and valid_ratio are mutually exclusive")
     valid_frames = None
     if valid_file is not None:
+        if os.path.samefile(data_file, valid_file):
+            raise ValueError("valid_file must not be the training data file")
         valid_frames = read_xyz(valid_file, energy_key=energy_key)
         _log(f"  read {len(valid_frames)} validation structures "
              f"from {valid_file}")
@@ -1299,20 +1927,52 @@ def train_nep(
         if not 0.0 < valid_ratio < 1.0:
             raise ValueError(f"valid_ratio must be in (0, 1), "
                              f"got {valid_ratio}")
-        g = torch.Generator()
-        g.manual_seed(run_seed)
-        perm = torch.randperm(len(frames), generator=g).tolist()
-        n_val = max(1, int(round(valid_ratio * len(frames))))
-        if n_val >= len(frames):
-            raise ValueError(f"valid_ratio={valid_ratio} leaves no "
-                             f"training frames ({len(frames)} total)")
-        val_idx = sorted(perm[:n_val])
+        val_idx = grouped_validation_indices(
+            frames, valid_ratio, run_seed
+        )
+        n_val = len(val_idx)
         val_set = set(val_idx)
         valid_frames = [frames[i] for i in val_idx]
         frames = [f for i, f in enumerate(frames) if i not in val_set]
         _log(f"  valid_ratio={valid_ratio}: held out {n_val} frames for "
              f"validation, {len(frames)} remain for training "
-             f"(split drawn from run_seed)")
+             f"(whole response groups, split drawn from run_seed)")
+
+    if config.get("spin_mode", 0):
+        validate_spin_frames(frames, "training")
+        if valid_frames is not None:
+            validate_spin_frames(valid_frames, "validation")
+    if valid_file is not None:
+        validate_response_group_disjoint(frames, valid_frames)
+
+    response_frames = (
+        select_generator_curve_frames(frames)
+        if config.get("spin_mode", 0) == 3 else []
+    )
+    valid_response_frames = (
+        select_generator_curve_frames(valid_frames)
+        if config.get("spin_mode", 0) == 3 and valid_frames is not None
+        else []
+    )
+    response_enabled = bool(response_frames)
+    if valid_response_frames and not response_enabled:
+        raise ValueError(
+            "validation contains rotation response groups but training has "
+            "none; keep at least one complete response scan in each split")
+    if response_enabled and not config["stage2"]:
+        raise ValueError(
+            "rotation response groups require stage2=1; the generator-curve "
+            "objective is intentionally activated only in Stage 2")
+    if response_enabled and valid_frames is not None \
+            and not valid_response_frames:
+        raise ValueError(
+            "training contains rotation response groups but validation has "
+            "none; provide a group-disjoint validation response scan so "
+            "nep_best is selected on the response objective")
+    if response_enabled:
+        _log(f"  generator curves: {len(response_frames)} training frames"
+             + (f", {len(valid_response_frames)} validation frames"
+                if valid_frames is not None else ""))
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
     # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
@@ -1338,6 +1998,15 @@ def train_nep(
             config = dict(orig_config)
             config["type_names"] = keep
             config["num_types"] = len(keep)
+            for key in ("spin_dof_type", "spin_env_type"):
+                if config.get(key) is not None:
+                    config[key] = [
+                        name for name in config[key] if name in keep
+                    ]
+            if (config.get("spin_mode", 0)
+                    and config.get("spin_dof_type") == []):
+                raise ValueError(
+                    "slim_types removed every active spin_dof_type")
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
@@ -1346,20 +2015,35 @@ def train_nep(
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
     structures = preprocess_structures(frames, config, np_dtype)
+    response_structures = (
+        preprocess_structures(response_frames, config, np_dtype)
+        if response_enabled else None
+    )
     _log(f"  built neighbor lists in {time.time() - t0:.1f}s")
 
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
+    energy_baseline_values = (
+        fit_energy_baseline(structures, config["num_types"])
+        if config.get("spin_mode", 0) else None)
 
     t0 = time.time()
     data_store = GPUDataStore(structures, dev, dtype, config=config)
     del structures
+    response_store = (
+        GPUDataStore(response_structures, dev, dtype, config=config)
+        if response_structures is not None else None
+    )
+    del response_structures
     if dev.type == "cuda":
         torch.cuda.synchronize()
     _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
     _log(f"  coverage: {data_store.n_energy} E / "
-         f"{data_store.n_forces} F / {data_store.n_virial} V")
+         f"{data_store.n_forces} F / {data_store.n_virial} V"
+         + (f" / {data_store.n_mforces} M / {data_store.n_tau} T"
+            if config.get("spin_mode", 0) else ""))
 
     valid_store = None
+    valid_response_store = None
     if valid_frames is not None:
         t0 = time.time()
         structures_v = preprocess_structures(valid_frames, config, np_dtype)
@@ -1370,10 +2054,18 @@ def train_nep(
         max_NN_rad = max(max_NN_rad, vNN_rad)
         max_NN_ang = max(max_NN_ang, vNN_ang)
         valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
+        if valid_response_frames:
+            response_structures_v = preprocess_structures(
+                valid_response_frames, config, np_dtype)
+            valid_response_store = GPUDataStore(
+                response_structures_v, dev, dtype, config=config)
+            del response_structures_v
         del structures_v, valid_frames
         _log(f"  validation set ready in {time.time() - t0:.1f}s — "
              f"coverage: {valid_store.n_energy} E / "
-             f"{valid_store.n_forces} F / {valid_store.n_virial} V")
+             f"{valid_store.n_forces} F / {valid_store.n_virial} V"
+             + (f" / {valid_store.n_mforces} M / {valid_store.n_tau} T"
+                if config.get("spin_mode", 0) else ""))
     _log("")
 
     # ---- Master RNG seed -------------------------------------------------
@@ -1390,9 +2082,15 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
+    if model.spin_mode == 3 and not use_autograd_forces:
+        use_autograd_forces = True
+        _log("  spin_mode 3: using the full autograd E/F/V/MF/Tau path")
+    if energy_baseline_values is not None:
+        model.set_energy_baseline(torch.as_tensor(
+            energy_baseline_values, dtype=dtype, device=dev))
 
     # use_gpumd_qscaler: reproduce GPUMD's init for fresh training. GPUMD (SNES
-    # mu init, snes.cu initialize_mu_and_sigma) draws EVERY parameter
+    # mu init, snes.cu initialize_mu_and_sigma) draws every GPUMD parameter
     # uniform(-1, 1) — both the descriptor coefficients and the NN weights — so
     # to stay consistent we re-init both here, paired with the c=1 q_scaler
     # computed below. Re-initialising the descriptor coeffs alone would leave the
@@ -1407,7 +2105,10 @@ def train_nep(
     # b1 (global energy offset) is determined analytically each epoch, not by
     # gradient descent (see recompute_b1_shift) — exclude it from the optimizer.
     model.b1.requires_grad_(False)
-    trainable_params = [p for n, p in model.named_parameters() if n != "b1"]
+    trainable_params = [
+        p for name, p in model.named_parameters()
+        if name != "b1" and p.requires_grad
+    ]
     # Number of trainable variables — the divisor GPUMD uses to turn the raw
     # L1/L2 sums into a mean(|w|) and RMS(w) (see the reg block in the epoch
     # loop). GPUMD's number_of_variables also counts the single global energy
@@ -1429,33 +2130,34 @@ def train_nep(
         # would rescale the NN inputs the weights were trained against.
         ft_path = finetune_from
 
-        def _load_weights(target, path):
-            if path.endswith(".pt"):
-                state = torch.load(path, map_location=dev, weights_only=False)
-                if "model_state" in state:
-                    state = state["model_state"]
-                target.load_state_dict(state, strict=True)
-            else:
-                target.load_weights_from_nep_txt(path)
-
         if _slim_keep is not None:
             # Load full pre-trained model (orig arch), then slim to current config
             full_model = NEPModel(orig_config).to(dtype).to(dev)
-            _load_weights(full_model, ft_path)
+            _load_finetune_weights(full_model, ft_path, dev)
             slimmed = slim_model(full_model, config["type_names"])
             model.load_state_dict(slimmed.state_dict())
             del full_model, slimmed
             _log(f"  fine-tuning from {ft_path}  "
                  f"[{orig_config['num_types']} -> {config['num_types']} types]")
         else:
-            _load_weights(model, ft_path)
+            _load_finetune_weights(model, ft_path, dev)
             _log(f"  fine-tuning from {ft_path}")
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
              f"dim={model.dim}, b1={model.b1.item():.4f}")
     else:
-        mean_epa = np.mean([data_store.energy[i] / data_store.natoms[i]
-                            for i in range(data_store.n)
-                            if data_store.has_energy_flag[i]])
+        baseline_np = (
+            model.energy_baseline.detach().cpu().numpy()
+            if model.energy_baseline is not None
+            else np.zeros(model.num_types, dtype=np.float64)
+        )
+        energy_per_atom = [
+            (data_store.energy[i] - float(
+                data_store.type_counts[i] @ baseline_np))
+            / data_store.natoms[i]
+            for i in range(data_store.n)
+            if data_store.has_energy_flag[i]
+        ]
+        mean_epa = float(np.mean(energy_per_atom)) if energy_per_atom else 0.0
         with torch.no_grad():
             model.b1.fill_(-mean_epa)
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
@@ -1476,7 +2178,8 @@ def train_nep(
                            "autograd double-backward forces")
         else:
             compile_on = True
-            compile_msg = "  torch.compile: enabled (analytical compute method)"
+            method = "analytical compute method"
+            compile_msg = f"  torch.compile: enabled ({method})"
 
     # Resolve "auto" backend. ``backend`` is the eager backend for the one-shot
     # q_scaler pass (num_types-based: loop for few types, bmm for >=8).
@@ -1488,7 +2191,10 @@ def train_nep(
     backend = _resolve_backend(orig_backend, num_types=model.num_types)
     train_backend = _resolve_backend(
         orig_backend, num_types=model.num_types, use_compile=compile_on)
-    force_str = "autograd" if use_autograd_forces else "analytical"
+    if use_autograd_forces:
+        force_str = "autograd"
+    else:
+        force_str = "analytical"
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
              f"forces: {force_str}")
@@ -1537,6 +2243,27 @@ def train_nep(
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
+    if stage2 and not 1 <= start_stage2 <= num_epochs:
+        raise ValueError(
+            "start_stage2 must lie within the training run: "
+            f"1 <= {start_stage2} <= {num_epochs}")
+    curriculum_enabled = (
+        raw_model.spin_curriculum and finetune_from is None
+    )
+    curriculum_end = (
+        start_stage2 if stage2 else max(2, (2 * num_epochs) // 3)
+    )
+    if curriculum_enabled and not 2 <= curriculum_end <= num_epochs:
+        raise ValueError(
+            "spin curriculum requires its full-O3 epoch to lie in the "
+            f"training run: 2 <= {curriculum_end} <= {num_epochs}"
+        )
+    schedule_state = {
+        "stage2_start": start_stage2 if stage2 else None,
+        "curriculum_end": curriculum_end if curriculum_enabled else None,
+        "curriculum_enabled": curriculum_enabled,
+        "use_swa": bool(stage2 and use_swa),
+    }
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -1559,8 +2286,24 @@ def train_nep(
     # old-scale best_loss would keep the new run from ever saving a new best).
     cur_loss_weights = {
         "lambda_e": pref_e, "lambda_f": pref_f, "lambda_v": pref_v,
+        "lambda_m": pref_m, "lambda_tau": pref_tau,
         "stage2_pref_e": stage2_pref_e, "stage2_pref_f": stage2_pref_f,
-        "stage2_pref_v": stage2_pref_v,
+        "stage2_pref_v": stage2_pref_v, "stage2_pref_m": stage2_pref_m,
+        "stage2_pref_tau": stage2_pref_tau,
+        "lr_scheduler_mode": lr_scheduler_mode,
+        "scheduler_factor": scheduler_factor,
+        "scheduler_patience": scheduler_patience,
+        "stage2_scheduler_factor": stage2_scheduler_factor,
+        "stage2_scheduler_patience": stage2_scheduler_patience,
+        "stop_lr": stop_lr,
+        "generator_curve_schema": (
+            GENERATOR_CURVE_SCHEMA if response_enabled else None),
+        "generator_curve_weight": (
+            GENERATOR_CURVE_WEIGHT if response_enabled else 0.0),
+        "generator_curve_huber_delta": (
+            GENERATOR_CURVE_HUBER_DELTA if response_enabled else 0.0),
+        "generator_curve_mean_weight": (
+            GENERATOR_CURVE_MEAN_WEIGHT if response_enabled else 0.0),
     }
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
@@ -1569,24 +2312,73 @@ def train_nep(
     best_loss = float("inf")
     best_true_loss = float("inf")
     best_valid_loss = float("inf")
-    cur_valid_info = {"valid_file": valid_file, "valid_ratio": valid_ratio}
+    cur_valid_info = initial_data_lineage
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
+    resume_early_stop_state = None
     if resume_ckpt is not None:
-        info = _load_checkpoint(resume_ckpt, model, optimizer,
-                                lr_scheduler, stage2_scheduler,
-                                swa_model, dev)
+        info = _load_checkpoint(
+            resume_ckpt, model, optimizer, swa_model, dev)
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
         best_valid_loss = info["best_valid_loss"]
         saved_valid_info = info.get("valid_info")
-        if saved_valid_info is not None and saved_valid_info != cur_valid_info:
-            _log("WARNING: validation settings changed since the checkpoint "
-                 "was saved — the train/valid split is NOT the one this run "
-                 "started with (old validation frames may enter training).")
-            _log(f"  saved:   {saved_valid_info}")
-            _log(f"  current: {cur_valid_info}")
-            best_valid_loss = float("inf")
+        validate_resume_data_lineage(
+            saved_valid_info, cur_valid_info,
+            require_versioned=raw_model.spin_descriptor is not None,
+        )
+        saved_schedule = info.get("schedule_state")
+        if saved_schedule is not None:
+            saved_stage2_start = saved_schedule.get("stage2_start")
+            saved_use_swa = bool(saved_schedule.get("use_swa", False))
+            if info["in_stage2"]:
+                if (not stage2
+                        or saved_stage2_start != schedule_state["stage2_start"]):
+                    raise ValueError(
+                        "a Stage-2 checkpoint must resume with the same "
+                        "stage2/start_stage2 schedule")
+                if saved_use_swa != schedule_state["use_swa"]:
+                    raise ValueError(
+                        "a Stage-2 checkpoint must resume with the same "
+                        "use_swa setting")
+                if saved_use_swa and not info["has_swa_state"]:
+                    raise ValueError(
+                        "Stage-2 checkpoint declares SWA but has no swa_state")
+            elif stage2 and start_stage2 < start_epoch:
+                raise ValueError(
+                    "start_stage2 is earlier than the resumed epoch; resume "
+                    "from checkpoint_stage1.pt or choose a future boundary")
+            saved_curriculum_end = saved_schedule.get("curriculum_end")
+            saved_curriculum_enabled = bool(saved_schedule.get(
+                "curriculum_enabled", saved_curriculum_end is not None))
+            if not saved_curriculum_enabled:
+                curriculum_enabled = False
+                schedule_state["curriculum_enabled"] = False
+                schedule_state["curriculum_end"] = None
+            elif curriculum_enabled and saved_curriculum_end is not None:
+                if info["epoch"] >= saved_curriculum_end:
+                    # Once O3 has fully opened it must never be ramped down by
+                    # extending the total epoch count on resume.
+                    curriculum_enabled = False
+                    curriculum_end = saved_curriculum_end
+                    schedule_state["curriculum_end"] = saved_curriculum_end
+                elif curriculum_end != saved_curriculum_end:
+                    raise ValueError(
+                        "resume would change an unfinished O2-to-O3 "
+                        "curriculum boundary; keep the original schedule or "
+                        "start a new run")
+        elif raw_model.spin_descriptor is not None:
+            raise ValueError(
+                "spin checkpoint is missing schedule_state and cannot be "
+                "resumed with production curriculum semantics")
+        if info["best_model_text"] is not None:
+            with open(os.path.join(output_dir, "nep_best.txt"), "w") as stream:
+                stream.write(info["best_model_text"])
+        elif (raw_model.spin_descriptor is not None
+              and np.isfinite(best_loss)):
+            raise ValueError(
+                "spin checkpoint is missing its historical best model")
+        resume_early_stop_state = info.get("early_stop_state")
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
@@ -1596,7 +2388,11 @@ def train_nep(
              f"{optimizer.param_groups[0]['lr']:.2e} "
              f"(nep.in lr is not applied on resume)")
         saved_loss_weights = info["loss_weights"]
-        if saved_loss_weights is not None and saved_loss_weights != cur_loss_weights:
+        training_config_changed = (
+            saved_loss_weights is not None
+            and saved_loss_weights != cur_loss_weights
+        )
+        if training_config_changed:
             _log("Loss weights changed since checkpoint was saved — "
                  "resetting best losses so the new scale can establish "
                  "a new best.")
@@ -1605,6 +2401,23 @@ def train_nep(
             best_loss = float("inf")
             best_true_loss = float("inf")
             best_valid_loss = float("inf")
+            resume_early_stop_state = None
+            lr_scheduler = _make_lr_scheduler(
+                optimizer, lr_scheduler_mode, scheduler_factor,
+                scheduler_patience, stop_lr)
+            if stage2:
+                stage2_scheduler = _make_lr_scheduler(
+                    optimizer, lr_scheduler_mode, stage2_scheduler_factor,
+                    stage2_scheduler_patience, stop_lr)
+            if info["in_stage2"] and swa_model is not None:
+                swa_model = AveragedModel(raw_model)
+                _log("  SWA accumulator reset for the new objective/config")
+            _log("  scheduler state reset for the new objective/config")
+        else:
+            _restore_scheduler_state(
+                info, lr_scheduler, stage2_scheduler,
+                require_versioned=raw_model.spin_descriptor is not None,
+            )
 
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -1623,12 +2436,20 @@ def train_nep(
     if write_header:
         hdr = ("# epoch  loss  rmse_e(eV/atom)  rmse_f(eV/A)  "
                "rmse_v(eV/atom)  rmse_stress(GPa)")
+        if raw_model.spin_descriptor is not None:
+            hdr += "  rmse_m(eV/muB)  rmse_tau(eV)"
+        if response_enabled:
+            hdr += "  generator_curve"
         if valid_store is not None:
             # GPUMD loss.out convention: train RMSEs, then test RMSEs.
             # (The loss column is then the VALIDATION loss — it is what
             # drives the scheduler and the best-model choice.)
             hdr += ("  rmse_e_test(eV/atom)  rmse_f_test(eV/A)  "
                     "rmse_v_test(eV/atom)  rmse_stress_test(GPa)")
+            if raw_model.spin_descriptor is not None:
+                hdr += "  rmse_m_test(eV/muB)  rmse_tau_test(eV)"
+            if response_enabled:
+                hdr += "  generator_curve_test"
         loss_log.write(hdr + "\n")
 
     # All training hyperparameters (lr/scheduler/loss weights/stage2 ...)
@@ -1637,6 +2458,10 @@ def train_nep(
     # resuming from a checkpoint.
     stage2_tag = (f", Stage 2 from epoch {start_stage2} "
                   f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
+    curriculum_tag = (
+        f", O2->O3 curriculum fully open at epoch {curriculum_end}"
+        if curriculum_enabled else ""
+    )
     # In the last third of the run a candidate best is verified by a
     # frozen-weight evaluation over the full dataset before nep_best is
     # written (see the best-save block in the loop).
@@ -1650,7 +2475,10 @@ def train_nep(
                  f"run stops. Use early_stop > scheduler_patience.")
         _log(f"Early stopping: stop if {monitored} does not improve for "
              f"{early_stop} epochs")
-    _log(f"Training: epochs {start_epoch}..{num_epochs}{stage2_tag}")
+    _log(
+        f"Training: epochs {start_epoch}..{num_epochs}"
+        f"{stage2_tag}{curriculum_tag}"
+    )
     _log("=" * 72)
 
     def _save_best():
@@ -1661,9 +2489,18 @@ def train_nep(
     # Early-stopping tracker on the monitored metric (sched_loss: validation
     # loss when a valid set is present, else the epoch train loss). Reset when
     # stage 2 starts, since the loss scale changes with the stage-2 weights.
-    es_best = float("inf")
-    es_wait = 0
-    prev_in_stage2 = False
+    es_best = (
+        float(resume_early_stop_state["best"])
+        if resume_early_stop_state is not None else float("inf")
+    )
+    es_wait = (
+        int(resume_early_stop_state["wait"])
+        if resume_early_stop_state is not None else 0
+    )
+    prev_in_stage2 = (
+        bool(resume_early_stop_state["prev_in_stage2"])
+        if resume_early_stop_state is not None else False
+    )
 
     train_t0 = time.time()
 
@@ -1671,6 +2508,18 @@ def train_nep(
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
             model.train()
+            if raw_model.spin_curriculum:
+                scale = (
+                    spin_curriculum_scale(epoch, curriculum_end)
+                    if curriculum_enabled else 1.0
+                )
+                raw_model.set_spin_curriculum_scale(scale)
+                warmup_end = max(1, curriculum_end // 2)
+                if epoch in (start_epoch, warmup_end, curriculum_end):
+                    _log(
+                        f"  O3 curriculum epoch {epoch}: "
+                        f"gradient_scale={scale:.6f}"
+                    )
 
             # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
             # run_seed + epoch: distinct order every epoch, reproducible for a
@@ -1680,9 +2529,10 @@ def train_nep(
             g.manual_seed(run_seed + epoch)
             perm = torch.randperm(n_structs, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = 0.0
+            sum_le = sum_lf = sum_lv = sum_lm = sum_lt = 0.0
             sum_ls = 0.0                     # (eV/A**3)**2 accumulator for stress
             sum_e_structs = sum_f_atoms = sum_v_structs = 0
+            sum_m_atoms = sum_t_atoms = 0
             sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
             max_gn = 0.0
 
@@ -1699,8 +2549,10 @@ def train_nep(
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
-                cur_pref_e, cur_pref_f, cur_pref_v = (
-                    stage2_pref_e, stage2_pref_f, stage2_pref_v)
+                (cur_pref_e, cur_pref_f, cur_pref_v,
+                 cur_pref_m, cur_pref_tau) = (
+                    stage2_pref_e, stage2_pref_f, stage2_pref_v,
+                    stage2_pref_m, stage2_pref_tau)
                 # Apply stage 2 lr + reset the first time we hit stage 2 in
                 # THIS run — covers both the natural transition and resuming
                 # from a stage-1 checkpoint whose start_epoch has already
@@ -1728,7 +2580,12 @@ def train_nep(
                             in_stage2=False, swa_model=None,
                             best_true_loss=best_true_loss, run_seed=run_seed,
                             best_valid_loss=best_valid_loss,
-                            valid_info=cur_valid_info)
+                            valid_info=cur_valid_info,
+                            schedule_state=schedule_state,
+                            early_stop_state={
+                                "best": es_best, "wait": es_wait,
+                                "prev_in_stage2": prev_in_stage2,
+                            })
                         _log("Saved end-of-stage-1 checkpoint: "
                              "checkpoint_stage1.pt (redo stage 2 from it "
                              "via resume_from)")
@@ -1739,7 +2596,8 @@ def train_nep(
                         best_valid_loss = float("inf")
                         _log(f"Stage 2 started at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                             f"V_w={cur_pref_v}, lr={stage2_lr:.2e}")
+                             f"V_w={cur_pref_v}, M_w={cur_pref_m}, "
+                             f"Tau_w={cur_pref_tau}, lr={stage2_lr:.2e}")
                     else:
                         # Resumed mid-stage-2: keep the checkpoint's restored
                         # (possibly decayed) lr / optimizer / scheduler /
@@ -1750,11 +2608,13 @@ def train_nep(
                         cur_lr = optimizer.param_groups[0]['lr']
                         _log(f"Stage 2 resumed at epoch {epoch}: "
                              f"E_w={cur_pref_e}, F_w={cur_pref_f}, "
-                             f"V_w={cur_pref_v}, lr={cur_lr:.2e} "
+                             f"V_w={cur_pref_v}, M_w={cur_pref_m}, "
+                             f"Tau_w={cur_pref_tau}, lr={cur_lr:.2e} "
                              f"(kept from checkpoint)")
                     _log(f"{'='*72}")
             else:
                 cur_pref_e, cur_pref_f, cur_pref_v = pref_e, pref_f, pref_v
+                cur_pref_m, cur_pref_tau = pref_m, pref_tau
 
             # Per-epoch compute eligibility: a weight of 0 means "don't compute
             # this channel". This is recomputed every epoch so a stage-1 zero
@@ -1762,10 +2622,18 @@ def train_nep(
             # above) — and so pref_v=0 really skips virial compute/backward.
             has_forces = data_store.has_forces and cur_pref_f > 0
             has_virial = data_store.has_virial and cur_pref_v > 0
+            has_mforces = (
+                raw_model.spin_descriptor is not None
+                and data_store.has_mforces and cur_pref_m > 0)
+            has_tau = (
+                raw_model.spin_descriptor is not None
+                and data_store.has_tau and cur_pref_tau > 0)
 
             for start in range(0, n_structs, batch_size):
                 idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
+                batch["need_mforce"] = has_mforces
+                batch["need_tau"] = has_tau
 
                 if use_autograd_forces:
                     result = compute_props(
@@ -1775,7 +2643,12 @@ def train_nep(
                         batch["atom_types"], batch["N"],
                         batch["struct_idx"], batch["num_structures"],
                         need_forces=has_forces, need_virial=has_virial,
-                        backend=backend)
+                        backend=backend, spins=batch.get("spins"),
+                        need_mforce=has_mforces,
+                        need_tau=has_tau,
+                        rij_spin=batch.get("rij_spin"),
+                        pi_spin=batch.get("pair_i_spin"),
+                        pj_spin=batch.get("pair_j_spin"))
                 else:
                     result = compute_props_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
@@ -1784,7 +2657,7 @@ def train_nep(
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
                 e_mask = batch["energy_mask"]
-                loss = torch.tensor(0.0, dtype=dtype, device=dev)
+                loss = result["Etot"].sum() * 0.0
                 # sum_l* accumulates per-batch MSE so the rmse_* columns in
                 # the log are real RMSE. Optimizer sees _loss_fn (MSE) too.
                 if e_mask.any():
@@ -1830,6 +2703,34 @@ def train_nep(
                             s_diff = v_diff * scale
                             sum_ls += (s_diff ** 2).mean().item() * v_mask.sum().item()
 
+                if has_mforces:
+                    m_mask = (
+                        batch["mforce_mask"]
+                        & raw_model.spin_dof_type_active[
+                            batch["atom_types"]])
+                    if m_mask.any():
+                        m_pred = result["mforces"][m_mask]
+                        m_ref = batch["mforces"][m_mask]
+                        loss_m = _loss_fn(m_pred, m_ref)
+                        loss = loss + cur_pref_m * loss_m
+                        sum_lm += (
+                            (m_pred - m_ref) ** 2
+                        ).mean().item() * m_mask.sum().item()
+
+                if has_tau:
+                    t_mask = (
+                        batch["tau_mask"]
+                        & raw_model.spin_dof_type_active[
+                            batch["atom_types"]])
+                    if t_mask.any():
+                        t_pred = result["tau"][t_mask]
+                        t_ref = batch["tau"][t_mask]
+                        loss_t = _loss_fn(t_pred, t_ref)
+                        loss = loss + cur_pref_tau * loss_t
+                        sum_lt += (
+                            (t_pred - t_ref) ** 2
+                        ).mean().item() * t_mask.sum().item()
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
@@ -1846,14 +2747,24 @@ def train_nep(
                 # matches (MSE ≈ RMSE²).
                 if l1_coeff or l2_coeff:
                     with torch.no_grad():
-                        grads = [p.grad for p in trainable_params]
+                        # Foreach kernels reject ``None`` entries, so apply
+                        # regularization only to parameters that participated
+                        # in the backward pass.
+                        reg_params = [
+                            p for p in trainable_params if p.grad is not None
+                        ]
+                        grads = [p.grad for p in reg_params]
                         if l2_coeff:
-                            torch._foreach_add_(grads, trainable_params,
+                            torch._foreach_add_(grads, reg_params,
                                                 alpha=l2_coeff)
                         if l1_coeff:
                             torch._foreach_add_(
-                                grads, torch._foreach_sign(trainable_params),
+                                grads, torch._foreach_sign(reg_params),
                                 alpha=l1_coeff)
+
+                # Scale the complete O3 gradient, including regularization,
+                # before clipping and the optimizer step.
+                raw_model.apply_spin_curriculum_gradients()
 
                 if max_grad_norm > 0:
                     gn = torch.nn.utils.clip_grad_norm_(
@@ -1867,7 +2778,9 @@ def train_nep(
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
+                curriculum_rows = raw_model.capture_spin_curriculum_rows()
                 optimizer.step()
+                raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)
 
                 if in_stage2 and swa_model is not None:
                     swa_model.update_parameters(raw_model)
@@ -1875,7 +2788,53 @@ def train_nep(
                 sum_e_structs += batch["energy_mask"].sum().item()
                 sum_f_atoms += batch["force_mask"].sum().item()
                 sum_v_structs += batch["virial_mask"].sum().item()
+                if has_mforces:
+                    sum_m_atoms += int(m_mask.sum().item())
+                if has_tau:
+                    sum_t_atoms += int(t_mask.sum().item())
                 max_gn = max(max_gn, gn)
+
+            # Response-only Stage-2 steps.  They use complete rotation scans
+            # and derivatives of the same scalar ANN energy; no J/D output or
+            # auxiliary prediction head is introduced.
+            if in_stage2 and response_store is not None:
+                for idx in complete_group_batches(
+                        response_store.response_group_ids, batch_size,
+                        seed=run_seed + epoch):
+                    batch = response_store.collate(idx)
+                    batch["need_mforce"] = True
+                    batch["need_tau"] = False
+                    result = compute_props_cached(
+                        batch, need_forces=False, need_virial=False,
+                        backend=train_backend, create_graph=True)
+                    curve_loss = generator_curve_loss(
+                        result["mforces"], batch["mforces"],
+                        batch["spin_tangent"], batch["struct_idx"],
+                        batch["response_group_ids"],
+                        batch["response_coordinates"],
+                        batch["num_structures"])
+                    optimizer.zero_grad(set_to_none=True)
+                    (GENERATOR_CURVE_WEIGHT * curve_loss).backward()
+                    raw_model.apply_spin_curriculum_gradients()
+                    if max_grad_norm > 0:
+                        gn = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_grad_norm).item()
+                    else:
+                        gn = torch.sqrt(sum(
+                            p.grad.norm() ** 2
+                            for p in raw_model.parameters()
+                            if p.grad is not None)).item()
+                    if not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    curriculum_rows = \
+                        raw_model.capture_spin_curriculum_rows()
+                    optimizer.step()
+                    raw_model.apply_spin_curriculum_parameter_step(
+                        curriculum_rows)
+                    if swa_model is not None:
+                        swa_model.update_parameters(raw_model)
+                    max_gn = max(max_gn, gn)
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
             # absorbs this epoch's mean per-atom energy residual. Updated AFTER
@@ -1894,26 +2853,61 @@ def train_nep(
             mse_f = sum_lf / max(sum_f_atoms, 1) if sum_lf > 0 else 0.0
             mse_v = sum_lv / max(sum_v_structs, 1) if sum_lv > 0 else 0.0
             mse_s = sum_ls / max(sum_v_structs, 1) if sum_ls > 0 else 0.0
+            mse_m = sum_lm / max(sum_m_atoms, 1) if sum_lm > 0 else 0.0
+            mse_t = sum_lt / max(sum_t_atoms, 1) if sum_lt > 0 else 0.0
             avg_loss = (cur_pref_e * mse_e + cur_pref_f * mse_f
-                        + cur_pref_v * mse_v)
+                        + cur_pref_v * mse_v + cur_pref_m * mse_m
+                        + cur_pref_tau * mse_t)
             # Output units: eV/atom (E, V), eV/A (F), GPa (stress).
             rmse_e = np.sqrt(mse_e)
             rmse_f = np.sqrt(mse_f)
             rmse_v = np.sqrt(mse_v)
             rmse_s_gpa = np.sqrt(mse_s) * EV_PER_A3_TO_GPa
+            rmse_m = np.sqrt(mse_m)
+            rmse_t = np.sqrt(mse_t)
+
+            # Spin losses contain derivatives with respect to the magnetic
+            # coordinates. Evaluate the frozen end-of-epoch weights on the
+            # complete training set so logging, scheduling and nep_best all
+            # use the same model state rather than moving minibatch averages.
+            if raw_model.spin_descriptor is not None:
+                (avg_loss, rmse_e, rmse_f, rmse_v, rmse_s,
+                 rmse_m, rmse_t) = _evaluate_true_loss(
+                    data_store, eval_batch_size, raw_model,
+                    compute_props, compute_props_cached,
+                    use_autograd_forces, train_backend,
+                    cur_pref_e, cur_pref_f, cur_pref_v,
+                    cur_pref_m, cur_pref_tau, dtype, dev)
+                rmse_s_gpa = rmse_s * EV_PER_A3_TO_GPa
+
+            response_metric = None
+            if in_stage2 and response_store is not None:
+                response_metric = evaluate_generator_curves(
+                    response_store, eval_batch_size, raw_model,
+                    train_backend)
+                avg_loss += GENERATOR_CURVE_WEIGHT * response_metric
 
             # Validation: frozen-weight full pass every epoch (b1 already
             # train-fitted by the analytical update above; never re-fitted on
             # validation data). This loss drives the plateau scheduler and
             # the best-model choice below — the anti-overfitting signal.
             valid_loss = None
+            valid_response_metric = None
             if valid_store is not None:
-                valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s = \
+                (valid_loss, v_rmse_e, v_rmse_f, v_rmse_v, v_rmse_s,
+                 v_rmse_m, v_rmse_t) = \
                     _evaluate_valid_loss(
-                        valid_store, batch_size, raw_model,
+                        valid_store, eval_batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, train_backend,
-                        cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                        cur_pref_e, cur_pref_f, cur_pref_v,
+                        cur_pref_m, cur_pref_tau, dtype, dev)
+                if in_stage2 and valid_response_store is not None:
+                    valid_response_metric = evaluate_generator_curves(
+                        valid_response_store, eval_batch_size, raw_model,
+                        train_backend)
+                    valid_loss += (
+                        GENERATOR_CURVE_WEIGHT * valid_response_metric)
             dt = time.time() - t_epoch
 
             # With a validation set, the validation loss IS the run's loss:
@@ -1934,7 +2928,9 @@ def train_nep(
             # every rank sees the identical (all-reduced) sched_loss, so all
             # ranks reach the same decision and stop together.
             stop_now = False
-            if early_stop:
+            curriculum_ready = (
+                not curriculum_enabled or epoch >= curriculum_end)
+            if early_stop and curriculum_ready:
                 if in_stage2 and not prev_in_stage2:
                     es_best = float("inf")
                     es_wait = 0
@@ -1949,9 +2945,19 @@ def train_nep(
 
             row = (f"{epoch} {sched_loss:.6e} {rmse_e:.6f} "
                    f"{rmse_f:.6f} {rmse_v:.6f} {rmse_s_gpa:.4f}")
+            if raw_model.spin_descriptor is not None:
+                row += f" {rmse_m:.6f} {rmse_t:.6f}"
+            if response_enabled:
+                row += (f" {response_metric:.6e}"
+                        if response_metric is not None else " nan")
             if valid_loss is not None:
                 row += (f" {v_rmse_e:.6f} {v_rmse_f:.6f} {v_rmse_v:.6f} "
                         f"{v_rmse_s:.4f}")
+                if raw_model.spin_descriptor is not None:
+                    row += f" {v_rmse_m:.6f} {v_rmse_t:.6f}"
+                if response_enabled:
+                    row += (f" {valid_response_metric:.6e}"
+                            if valid_response_metric is not None else " nan")
             loss_log.write(row + "\n")
             loss_log.flush()
 
@@ -1959,14 +2965,28 @@ def train_nep(
             cur_lr = optimizer.param_groups[0]['lr']
             v_str = (f" | V {rmse_v:.5f} eV/atom | S {rmse_s_gpa:.3f} GPa"
                      if has_virial else "")
+            spin_str = ""
+            if has_mforces:
+                spin_str += f" | M {rmse_m:.5f} eV/muB"
+            if has_tau:
+                spin_str += f" | T {rmse_t:.5f} eV"
+            if response_metric is not None:
+                spin_str += f" | Gcurve {response_metric:.4f}"
             valid_str = ""
             if valid_loss is not None:
                 valid_str = (f" | test E {v_rmse_e:.5f} F {v_rmse_f:.5f}"
                              + (f" V {v_rmse_v:.5f} S {v_rmse_s:.3f}"
                                 if has_virial else ""))
+                if raw_model.spin_descriptor is not None:
+                    if valid_store.has_mforces and cur_pref_m > 0:
+                        valid_str += f" M {v_rmse_m:.5f}"
+                    if valid_store.has_tau and cur_pref_tau > 0:
+                        valid_str += f" T {v_rmse_t:.5f}"
+                if valid_response_metric is not None:
+                    valid_str += f" Gcurve {valid_response_metric:.4f}"
             line = (f"{stage_str}Epoch {epoch:4d} | loss {sched_loss:.4e} | "
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
-                    f"{v_str}{valid_str} | gnorm {max_gn:.1f} | "
+                    f"{v_str}{spin_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
@@ -1998,15 +3018,19 @@ def train_nep(
                 if valid_loss < best_valid_loss:
                     best_valid_loss = valid_loss
                     _save_best()
-            elif epoch < true_eval_start:
+            elif (epoch < true_eval_start
+                  or raw_model.spin_descriptor is not None):
                 if new_min:
+                    if raw_model.spin_descriptor is not None:
+                        best_true_loss = avg_loss
                     _save_best()
             elif new_min or epoch == num_epochs or stop_now:
-                t_loss, _te, _tf, _tv = _evaluate_true_loss(
-                    data_store, batch_size, raw_model,
+                t_loss, _te, _tf, _tv, _ts, _tm, _tt = _evaluate_true_loss(
+                    data_store, eval_batch_size, raw_model,
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
-                    cur_pref_e, cur_pref_f, cur_pref_v, dtype, dev)
+                    cur_pref_e, cur_pref_f, cur_pref_v,
+                    cur_pref_m, cur_pref_tau, dtype, dev)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()
@@ -2020,7 +3044,12 @@ def train_nep(
                     swa_model=swa_model if in_stage2 else None,
                     best_true_loss=best_true_loss, run_seed=run_seed,
                     best_valid_loss=best_valid_loss,
-                    valid_info=cur_valid_info)
+                    valid_info=cur_valid_info,
+                    schedule_state=schedule_state,
+                    early_stop_state={
+                        "best": es_best, "wait": es_wait,
+                        "prev_in_stage2": prev_in_stage2,
+                    })
 
             # Interim predict — overwrites the same output files, so users can
             # refresh the parity plot live. Runs on the CURRENT-epoch weights
@@ -2037,11 +3066,11 @@ def train_nep(
                 # Silent interim predict — reuses data_store's preprocessed
                 # neighbor lists + basis (no xyz re-read, no recompute).
                 predict_from_store(raw_model, data_store, output_dir,
-                                   batch_size=batch_size, backend=backend,
+                                   batch_size=eval_batch_size, backend=backend,
                                    verbose=False)
                 if valid_store is not None:
                     predict_from_store(raw_model, valid_store, output_dir,
-                                       batch_size=batch_size,
+                                       batch_size=eval_batch_size,
                                        backend=backend, verbose=False,
                                        suffix="test")
 
@@ -2063,13 +3092,17 @@ def train_nep(
     raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                            max_NN_rad, max_NN_ang)
     # SWA-averaged model (only when user opted in and stage 2 ran).
-    if swa_model is not None:
+    if (swa_model is not None
+            and int(swa_model.n_averaged.item()) > 0):
         swa_state = swa_model.module.state_dict()
         # Keep a copy of the final-epoch weights so we can restore them
         # after saving SWA — the end-of-training predict below must see
         # final weights, not SWA-averaged ones.
         final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
         raw_model.load_state_dict(swa_state)
+        recompute_b1_shift(
+            raw_model, data_store, eval_batch_size, backend
+        )
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                max_NN_rad, max_NN_ang)
         raw_model.load_state_dict(final_state)
@@ -2090,11 +3123,11 @@ def train_nep(
     _log("\nRunning prediction on training set (final-epoch model)...")
     pred_t0 = time.time()
     predict_from_store(raw_model, data_store, output_dir,
-                       batch_size=batch_size, backend=backend,
+                       batch_size=eval_batch_size, backend=backend,
                        verbose=False)
     if valid_store is not None:
         predict_from_store(raw_model, valid_store, output_dir,
-                           batch_size=batch_size, backend=backend,
+                           batch_size=eval_batch_size, backend=backend,
                            verbose=False, suffix="test")
     _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 
