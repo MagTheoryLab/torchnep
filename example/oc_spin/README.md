@@ -24,7 +24,8 @@ O/C 表示两个截断参数：
 
 ## 训练日程
 
-O3-C2 默认启用内部 O2 到 O3 curriculum：
+O3-C2 默认启用 O2 到 O3 curriculum；如需从第一个 epoch 直接训练
+完整 O3，可在 `nep.in` 设置 `spin_curriculum 0`：
 
 1. Stage 1 前半段只更新 O2 前缀；
 2. Stage 1 后半段线性释放 O3 的 14 个新增输入行；
@@ -33,8 +34,8 @@ O3-C2 默认启用内部 O2 到 O3 curriculum：
 
 600 epoch、Stage 2 从 400 epoch 开始时，对应 1--200 epoch 的
 O2 warm-up、201--399 epoch 的 O3 ramp，以及从 400 epoch 开始的
-完整 O3-C2 响应微调。curriculum 只改变训练路径，不写入模型格式，
-也不增加推理成本。
+完整 O3-C2 响应微调。curriculum 开关只改变训练路径，不写入模型
+格式，也不增加推理成本。
 
 O/C 使用由实际初始描述符统计得到的 self-consistent q-scaler。
 训练入口应保持 use_gpumd_qscaler=False；全一径向系数不适用于该

@@ -12,6 +12,9 @@ These rules apply to changes that touch the versioned `nep4_spin3` path.
 - Keep the public truncation surface narrow: `spin_compress`, `spin_l_max`,
   `spin_order`, `spin_soc`, and `spin_cutoff`. Research block switches do not
   belong in `nep.in` or the serialized model format.
+- `spin_curriculum` is the single public training-path switch: default it on
+  for fresh O3 training, allow users to disable it, and never serialize it as
+  an inference/model-format field.
 - `spin_mode 3` uses self-consistent descriptor scaling; do not enable the
   generation-0 GPUMD q-scaler for it.
 - O2-to-O3 curriculum, Stage 2, per-element LS conditioning, and grouped

@@ -354,6 +354,11 @@ def parse_nep_in(filename: str) -> Dict:
                 params["spin_order"] = int(parts[1])
             elif key == "spin_soc":
                 params["spin_soc"] = int(parts[1])
+            elif key == "spin_curriculum":
+                value = int(parts[1])
+                if value not in (0, 1):
+                    raise ValueError("spin_curriculum must be 0 or 1")
+                params["spin_curriculum"] = bool(value)
             elif key == "spin_cutoff":
                 if len(parts) != 2:
                     raise ValueError("spin_cutoff requires one value")
@@ -429,6 +434,7 @@ def parse_nep_in(filename: str) -> Dict:
         raise ValueError("spin_mode must be 0 or 3")
     spin_only_keys = {
         "spin_compress", "spin_l_max", "spin_order", "spin_soc",
+        "spin_curriculum",
         "spin_cutoff", "spin_dof_type", "spin_env_type",
     }
     ignored_spin_keys = sorted(explicit & spin_only_keys)

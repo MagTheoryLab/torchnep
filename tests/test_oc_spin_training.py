@@ -76,6 +76,30 @@ def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
     assert NEPModel(config).spin_dim == 51
 
 
+def test_oc_curriculum_can_be_disabled_in_nep_input(tmp_path):
+    path = tmp_path / "nep.in"
+    path.write_text(
+        "type 1 Fe\n"
+        "spin_mode 3\n"
+        "spin_order 3\n"
+        "spin_curriculum 0\n"
+    )
+    config = parse_nep_in(path)
+    assert config["spin_curriculum"] is False
+    assert NEPModel(config).spin_curriculum is False
+
+
+def test_oc_curriculum_parser_rejects_non_boolean_value(tmp_path):
+    path = tmp_path / "nep.in"
+    path.write_text(
+        "type 1 Fe\n"
+        "spin_mode 3\n"
+        "spin_curriculum 2\n"
+    )
+    with pytest.raises(ValueError, match="spin_curriculum must be 0 or 1"):
+        parse_nep_in(path)
+
+
 def test_curriculum_starts_at_exact_o2_prefix_and_ramps_gradients():
     model = NEPModel(_config()).double()
     start = model.struct_dim + model.spin_descriptor.order_dims[2]

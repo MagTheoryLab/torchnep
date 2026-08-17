@@ -100,13 +100,16 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
 | `spin_cutoff` | `6` | Magnetic neighbor cutoff (Å) |
 | `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
+| `spin_curriculum` | `1` for O3 | Use the O2-to-O3 training curriculum (`0` or `1`); it does not change the exported potential or inference cost |
 | `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
 | `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
 
 For O/C spin models set `spin_mode 3`. The production default is O3-C2:
 `spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
-`spin_soc 1`. O3 training automatically uses the internal O2-to-O3
-curriculum; it is not a model or user parameter. See
+`spin_soc 1`. Fresh O3 training enables the O2-to-O3 curriculum by default;
+set `spin_curriculum 0` to train the complete O3 model from the first epoch.
+The switch changes training only and is not written into the exported model.
+See
 [the production design and response-data contract](example/oc_spin/README.md) and
 [the complete example](example/oc_spin/nep.in).
 
