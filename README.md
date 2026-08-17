@@ -5,7 +5,7 @@ A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (
 ## Features
 
 - **GPUMD-compatible structural NEP4** — nonmagnetic output `nep.txt` files
-  load directly into GPUMD. Versioned `nep4_spin3` files use the O/C extension;
+  load directly into GPUMD. Versioned `nep4_spin2` files use the O/C extension;
   its downstream CUDA reader still requires a separate parity gate
 - **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
 - **Multi-GPU training** — distributed data parallel (DDP) across on one node or multiple nodes
@@ -94,7 +94,7 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `neuron` | `30` | Neurons in the (single) hidden layer |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
-| `spin_mode` | `0` | Set to `3` for the versioned O/C magnetic model |
+| `spin_mode` | `0` | Set to `2` for the versioned O/C magnetic model |
 | `spin_order` | `3` | Magnetic correlation order O (`1`–`3`) |
 | `spin_compress` | `2` | Shared magnetic radial rank C (`1`–`9` with the fixed B8 basis) |
 | `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
@@ -104,7 +104,7 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
 | `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
 
-For O/C spin models set `spin_mode 3`. The production default is O3-C2:
+For O/C spin models set `spin_mode 2`. The production default is O3-C2:
 `spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
 `spin_soc 1`. Fresh O3 training enables the O2-to-O3 curriculum by default;
 set `spin_curriculum 0` to train the complete O3 model from the first epoch.
@@ -312,7 +312,7 @@ train_nep(
 
 `finetune_from` accepts:
 - `nep.txt` — structural GPUMD text models or versioned TorchNEP
-  `nep4_spin3` models, with full semantic architecture validation
+  `nep4_spin2` models, with full semantic architecture validation
 - `checkpoint.pt` — full checkpoint (weights are extracted automatically)
 
 If the new dataset contains fewer element types than the original model, `slim_types=True` removes the unused types **before training begins**, shrinking the model and speeding up training.
@@ -390,7 +390,7 @@ parts = atoms.calc.get_components()
 print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 ```
 
-For `nep4_spin3`, attach an `(N,3)` `spins` array before evaluation;
+For `nep4_spin2`, attach an `(N,3)` `spins` array before evaluation;
 `atoms.calc.results["mforces"]` and `atoms.calc.results["tau"]` are then
 available. The NEP/ZBL component-split helper is currently nonmagnetic-only.
 

@@ -314,7 +314,7 @@ class GPUDataStore:
         self.has_spin = bool(config and config.get("spin_mode", 0))
         if self.has_spin and any("spins" not in s for s in structures):
             raise ValueError(
-                "spin_mode 3 requires a spin/moment vector for every atom")
+                "spin_mode 2 requires a spin/moment vector for every atom")
 
         n_rad = np.array([len(s["pair_i_rad"]) for s in structures], dtype=np.int64)
         n_ang = np.array([len(s["pair_i_ang"]) for s in structures], dtype=np.int64)
@@ -907,7 +907,7 @@ def validate_spin_frames(frames, source_name):
         preview = ", ".join(str(index) for index in missing[:5])
         suffix = "..." if len(missing) > 5 else ""
         raise ValueError(
-            f"spin_mode 3 requires spins in every {source_name} frame; "
+            f"spin_mode 2 requires spins in every {source_name} frame; "
             f"missing at indices {preview}{suffix}"
         )
 
@@ -963,7 +963,7 @@ def validate_resume_data_lineage(saved, current, require_versioned=False):
         return
     if "data" not in saved:
         # Backward compatibility for old nonmagnetic checkpoints, which only
-        # recorded the validation path/ratio. Spin3 has no legacy production
+        # recorded the validation path/ratio. Spin2 has no legacy production
         # checkpoint contract and therefore takes the fail-closed branch.
         if require_versioned:
             raise ValueError(
@@ -1233,7 +1233,7 @@ def _load_checkpoint(path, model, optimizer, swa_model, device):
         if m.spin_mode:
             raise ValueError(
                 "spin checkpoint is missing model_signature; export a "
-                "versioned nep4_spin3 model before fine-tuning")
+                "versioned nep4_spin2 model before fine-tuning")
         warnings.warn(
             "legacy checkpoint has no architecture signature; only tensor "
             "shapes can be checked",
@@ -1317,7 +1317,7 @@ def _load_finetune_weights(target, path, device):
         if target.spin_mode:
             raise ValueError(
                 "spin .pt weights are missing model_signature; use a "
-                "versioned checkpoint or nep4_spin3 text model")
+                "versioned checkpoint or nep4_spin2 text model")
         warnings.warn(
             "legacy .pt weights have no architecture signature; only tensor "
             "shapes can be checked",
@@ -1762,8 +1762,8 @@ def train_nep(
         (default ``"energy"``). Set to ``"atomization_energy"`` to train
         against atomization energies instead of totals.
     use_gpumd_qscaler : None (default) selects the safe mode by descriptor:
-        self-consistent scaling for spin_mode 3 and GPUMD-compatible scaling
-        otherwise. Explicit True is rejected for spin_mode 3 because its
+        self-consistent scaling for spin_mode 2 and GPUMD-compatible scaling
+        otherwise. Explicit True is rejected for spin_mode 2 because its
         all-one radial state collapses axial channels. For other modes, True
         reproduces GPUMD's initialization for
         GPUMD-compatible parameters: descriptor expansion coefficients and
@@ -1947,11 +1947,11 @@ def train_nep(
 
     response_frames = (
         select_generator_curve_frames(frames)
-        if config.get("spin_mode", 0) == 3 else []
+        if config.get("spin_mode", 0) == 2 else []
     )
     valid_response_frames = (
         select_generator_curve_frames(valid_frames)
-        if config.get("spin_mode", 0) == 3 and valid_frames is not None
+        if config.get("spin_mode", 0) == 2 and valid_frames is not None
         else []
     )
     response_enabled = bool(response_frames)
@@ -2082,9 +2082,9 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode == 3 and not use_autograd_forces:
+    if model.spin_mode == 2 and not use_autograd_forces:
         use_autograd_forces = True
-        _log("  spin_mode 3: using the full autograd E/F/V/MF/Tau path")
+        _log("  spin_mode 2: using the full autograd E/F/V/MF/Tau path")
     if energy_baseline_values is not None:
         model.set_energy_baseline(torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev))

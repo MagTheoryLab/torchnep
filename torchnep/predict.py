@@ -528,7 +528,7 @@ def predict_from_store(model, data_store, output_dir: str,
             batch = data_store.collate(idx)
             batch["need_mforce"] = model.spin_descriptor is not None
             batch["need_tau"] = model.spin_descriptor is not None
-            if model.spin_mode == 3:
+            if model.spin_mode == 2:
                 with torch.enable_grad():
                     r = model.compute_properties(
                         batch["rij_rad"],
@@ -695,7 +695,7 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
             batch = data_store.collate(list(range(start, end)))
             batch["need_mforce"] = model.spin_descriptor is not None
             batch["need_tau"] = model.spin_descriptor is not None
-            if model.spin_mode == 3:
+            if model.spin_mode == 2:
                 # The systematic magnetic-polynomial path currently obtains
                 # geometry and spin derivatives from autograd.  End-of-run
                 # prediction is normally under no_grad, so re-enable it only

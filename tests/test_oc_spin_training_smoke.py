@@ -31,7 +31,7 @@ def _write_case(tmp_path):
         "basis_size 1 1\n"
         "l_max 1 0 0\n"
         "neuron 4\n"
-        "spin_mode 3\n"
+        "spin_mode 2\n"
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_order 3\n"
@@ -129,7 +129,7 @@ def _assert_outputs(output):
     ):
         assert (output / name).stat().st_size > 0
     potential = (output / "nep_final.txt").read_text()
-    assert potential.startswith("nep4_spin3 1 Fe\n")
+    assert potential.startswith("nep4_spin2 1 Fe\n")
     baseline_line = next(
         line for line in potential.splitlines()
         if line.startswith("spin_baseline ")

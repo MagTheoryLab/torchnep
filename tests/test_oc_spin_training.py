@@ -24,6 +24,7 @@ from torchnep.response_training import (
     generator_curve_loss,
     select_generator_curve_frames,
 )
+from torchnep.spin_diagnostics import relative_vector_error, svd_health
 from torchnep.train import (
     _load_finetune_weights,
     build_data_lineage,
@@ -46,7 +47,7 @@ def _config(curriculum=True):
         "basis_size_angular": 8,
         "l_max": [4, 2, 0],
         "neuron": 8,
-        "spin_mode": 3,
+        "spin_mode": 2,
         "spin_compress": 2,
         "spin_basis_size": [8, 0],
         "spin_l_max": [2, 0, 0],
@@ -57,6 +58,37 @@ def _config(curriculum=True):
     }
 
 
+def test_svd_health_separates_constant_and_rank_deficient_columns():
+    x = np.linspace(-1.0, 1.0, 41)
+    full = np.column_stack((x, x * x, np.sin(2.3 * x), np.ones_like(x)))
+    healthy = svd_health(full)
+    assert healthy["active_features"] == 3
+    assert healthy["constant_features"] == 1
+    assert healthy["effective_rank"] == 3
+    assert healthy["full_column_rank"] is True
+    assert np.isfinite(healthy["condition_number"])
+
+    duplicate = np.column_stack((x, x * x, x))
+    deficient = svd_health(duplicate)
+    assert deficient["effective_rank"] == 2
+    assert deficient["full_column_rank"] is False
+    assert deficient["condition_number"] is None
+    assert np.isfinite(deficient["nonzero_condition_number"])
+
+
+def test_jacobian_health_does_not_center_linear_map_columns():
+    jacobian = np.column_stack((np.ones(7), np.arange(7, dtype=float)))
+    health = svd_health(jacobian, center=False)
+    assert health["active_features"] == 2
+    assert health["effective_rank"] == 2
+    assert health["full_column_rank"] is True
+
+    error = relative_vector_error(
+        np.array([1.0, 2.0]), np.array([1.0, 2.1]))
+    assert error["finite"] is True
+    assert error["relative_rms"] > 0.0
+
+
 def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
     path = tmp_path / "nep.in"
     path.write_text(
@@ -65,7 +97,7 @@ def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
         "n_max 4 4\n"
         "basis_size 8 8\n"
         "l_max 4 2 0\n"
-        "spin_mode 3\n"
+        "spin_mode 2\n"
     )
     config = parse_nep_in(path)
     assert config["spin_order"] == 3
@@ -73,14 +105,14 @@ def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
     assert config["spin_l_max"] == [2, 0, 0]
     assert config["spin_soc"] == 1
     assert config["spin_curriculum"] is True
-    assert NEPModel(config).spin_dim == 51
+    assert NEPModel(config).spin_dim == 49
 
 
 def test_oc_curriculum_can_be_disabled_in_nep_input(tmp_path):
     path = tmp_path / "nep.in"
     path.write_text(
         "type 1 Fe\n"
-        "spin_mode 3\n"
+        "spin_mode 2\n"
         "spin_order 3\n"
         "spin_curriculum 0\n"
     )
@@ -93,7 +125,7 @@ def test_oc_curriculum_parser_rejects_non_boolean_value(tmp_path):
     path = tmp_path / "nep.in"
     path.write_text(
         "type 1 Fe\n"
-        "spin_mode 3\n"
+        "spin_mode 2\n"
         "spin_curriculum 2\n"
     )
     with pytest.raises(ValueError, match="spin_curriculum must be 0 or 1"):
@@ -104,7 +136,7 @@ def test_curriculum_starts_at_exact_o2_prefix_and_ramps_gradients():
     model = NEPModel(_config()).double()
     start = model.struct_dim + model.spin_descriptor.order_dims[2]
     assert model.spin_order3_input_start == start
-    assert model.dim - start == 14
+    assert model.dim - start == 12
     for net in model.fitting_nets:
         torch.testing.assert_close(
             net.w0[start:], torch.zeros_like(net.w0[start:])

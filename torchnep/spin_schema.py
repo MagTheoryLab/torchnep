@@ -21,11 +21,11 @@ import torch
 def resolve_gpumd_qscaler(spin_mode: int, requested):
     """Use self-consistent scaling for the trainable O/C radial frame."""
     if requested is None:
-        return spin_mode != 3
+        return spin_mode != 2
     enabled = bool(requested)
-    if spin_mode == 3 and enabled:
+    if spin_mode == 2 and enabled:
         raise ValueError(
-            "spin_mode 3 does not support use_gpumd_qscaler=True: "
+            "spin_mode 2 does not support use_gpumd_qscaler=True: "
             "the all-one radial coefficients collapse axial descriptor "
             "channels and make q_scaler singular; use the self-consistent "
             "scaler (False)"
@@ -39,8 +39,8 @@ def spin_checkpoint_lines(model) -> List[str]:
         f"{value:.16e}"
         for value in model.energy_baseline.detach().cpu().numpy()
     )
-    if model.spin_mode != 3:
-        raise ValueError("spin checkpoint metadata requires spin_mode 3")
+    if model.spin_mode != 2:
+        raise ValueError("spin checkpoint metadata requires spin_mode 2")
     lines = [
         f"spin_baseline {baseline}",
         f"spin_basis_size {model.spin_basis_size[0]}",
@@ -74,7 +74,7 @@ def spin_checkpoint_lines(model) -> List[str]:
 
 def spin_projection_parameters(model):
     """Return O/C descriptor tensors in stable text-format order."""
-    if model.spin_mode != 3:
+    if model.spin_mode != 2:
         return ()
     return (model.spin_descriptor.radial_leg_mix,)
 

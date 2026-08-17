@@ -1,11 +1,11 @@
 # O/C spin production invariants
 
-These rules apply to changes that touch the versioned `nep4_spin3` path.
+These rules apply to changes that touch the versioned `nep4_spin2` path.
 
 - Keep `MagneticPolynomialDescriptor` independent. Do not make it inherit an
   older magnetic descriptor or reintroduce experimental descriptor registries.
 - Preserve order nesting: O2-C2 is the exact first 37 magnetic channels of
-  O3-C2; the O3-C2 production width is 51 magnetic channels.
+  O3-C2; the O3-C2 production width is 49 magnetic channels.
 - Keep one scalar, element-conditioned atomic-energy ANN. Forces, virial,
   magnetic forces, and torques must remain derivatives of that same energy.
 - A zero-spin input must make every magnetic descriptor channel exactly zero.
@@ -15,7 +15,7 @@ These rules apply to changes that touch the versioned `nep4_spin3` path.
 - `spin_curriculum` is the single public training-path switch: default it on
   for fresh O3 training, allow users to disable it, and never serialize it as
   an inference/model-format field.
-- `spin_mode 3` uses self-consistent descriptor scaling; do not enable the
+- `spin_mode 2` uses self-consistent descriptor scaling; do not enable the
   generation-0 GPUMD q-scaler for it.
 - O2-to-O3 curriculum, Stage 2, per-element LS conditioning, and grouped
   validation are training semantics, not inference/model-format switches.

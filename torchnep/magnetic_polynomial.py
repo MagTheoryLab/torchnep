@@ -408,15 +408,6 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     2,
                     "triple_density",
                 )
-                add(
-                    "coupling_l111_p_l_x",
-                    "order3_joint_soc",
-                    width,
-                    3,
-                    1,
-                    2,
-                    "triple_density",
-                )
             if self.spin_soc and self.spin_l_max >= 2:
                 add(
                     "coupling_l22_dot_response",
@@ -690,7 +681,6 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                         ("l1_long", r_dot_s),
                         ("l1_axial", torch.cross(rhat, sj, dim=-1)),
                         ("l1_stf", _stf5(rhat, sj)),
-                        ("l1_long_vector", r_dot_s * rhat),
                     )
                 )
             else:
@@ -862,10 +852,6 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 x2 = self._project(density["l1_axial"], 2)
                 blocks.append(
                     self._inner(p0, torch.cross(m1, x2, dim=-1))
-                )
-                l1 = self._project(density["l1_long_vector"], 1)
-                blocks.append(
-                    self._inner(p0, torch.cross(l1, x2, dim=-1))
                 )
             if self.spin_soc and self.spin_l_max >= 2:
                 q_left = self._project(density["geometry_l2"], 0)

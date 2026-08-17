@@ -91,10 +91,10 @@ class NEPModel(nn.Module):
         # Versioned O/C spin descriptor protocol.
         if "spin_descriptor" in config:
             raise ValueError(
-                "spin_descriptor is not supported; use spin_mode 3")
+                "spin_descriptor is not supported; use spin_mode 2")
         self.spin_mode = int(config.get("spin_mode", 0))
-        if self.spin_mode not in (0, 3):
-            raise ValueError("spin_mode must be 0 or 3")
+        if self.spin_mode not in (0, 2):
+            raise ValueError("spin_mode must be 0 or 2")
         spin_only_keys = {
             "spin_compress", "spin_basis_size", "spin_l_max",
             "spin_order", "spin_soc", "spin_cutoff", "spin_dof_type",
@@ -104,33 +104,33 @@ class NEPModel(nn.Module):
         supplied_spin_keys = (
             set(config) if explicit_keys is None else set(explicit_keys)
         ) & spin_only_keys
-        if self.spin_mode != 3 and supplied_spin_keys:
+        if self.spin_mode != 2 and supplied_spin_keys:
             raise ValueError(
-                "O/C spin parameters require spin_mode 3; otherwise they "
+                "O/C spin parameters require spin_mode 2; otherwise they "
                 "would be silently ignored: "
                 + ", ".join(sorted(supplied_spin_keys))
             )
         self.spin_order = int(config.get(
-            "spin_order", 3 if self.spin_mode == 3 else 1
+            "spin_order", 3 if self.spin_mode == 2 else 1
         ))
         self.spin_soc = int(config.get(
-            "spin_soc", 1 if self.spin_mode == 3 else 0
+            "spin_soc", 1 if self.spin_mode == 2 else 0
         ))
-        if self.spin_mode == 3 and self.spin_order not in (1, 2, 3):
+        if self.spin_mode == 2 and self.spin_order not in (1, 2, 3):
             raise ValueError("spin_order must be 1, 2, or 3")
-        if self.spin_mode == 3 and self.spin_soc not in (0, 1):
+        if self.spin_mode == 2 and self.spin_soc not in (0, 1):
             raise ValueError("spin_soc must be 0 or 1")
         self.spin_curriculum = bool(config.get(
             "spin_curriculum",
-            self.spin_mode == 3 and self.spin_order == 3,
+            self.spin_mode == 2 and self.spin_order == 3,
         ))
         if self.spin_curriculum and not (
-            self.spin_mode == 3 and self.spin_order == 3
+            self.spin_mode == 2 and self.spin_order == 3
         ):
-            raise ValueError("spin_curriculum requires spin_mode 3, spin_order 3")
+            raise ValueError("spin_curriculum requires spin_mode 2, spin_order 3")
         self.spin_descriptor_kind = (
             "magnetic_polynomial"
-            if self.spin_mode == 3
+            if self.spin_mode == 2
             else None
         )
         self.spin_compress = int(config.get("spin_compress", 2))
@@ -155,7 +155,7 @@ class NEPModel(nn.Module):
         self.spin_l_max = _spin_int_list("spin_l_max", [2, 0, 0], 3)
         spin_cutoff = list(config.get(
             "spin_cutoff",
-            ([6.0, 6.0] if self.spin_mode == 3
+            ([6.0, 6.0] if self.spin_mode == 2
              else [self.rc_radial, self.rc_angular]),
         ))
         if len(spin_cutoff) != 2:
@@ -340,7 +340,7 @@ class NEPModel(nn.Module):
                 }
             ),
         }
-        if self.spin_mode == 3:
+        if self.spin_mode == 2:
             signature["spin"] = {
                 "order": self.spin_order,
                 "compress": self.spin_compress,
@@ -437,7 +437,7 @@ class NEPModel(nn.Module):
     @torch.no_grad()
     def set_q_scaler(self, q_min: torch.Tensor, q_max: torch.Tensor):
         diff = q_max - q_min
-        if self.spin_mode == 3:
+        if self.spin_mode == 2:
             magnitude = torch.maximum(
                 torch.maximum(q_min.abs(), q_max.abs()),
                 torch.ones_like(diff),
@@ -453,7 +453,7 @@ class NEPModel(nn.Module):
     @torch.no_grad()
     def set_energy_baseline(self, baseline: torch.Tensor):
         if self.energy_baseline is None:
-            raise ValueError("energy baseline is only defined for spin_mode 3")
+            raise ValueError("energy baseline is only defined for spin_mode 2")
         self.energy_baseline.copy_(baseline.to(
             dtype=self.energy_baseline.dtype,
             device=self.energy_baseline.device,
@@ -638,8 +638,8 @@ class NEPModel(nn.Module):
 
         ``backend`` in {"loop", "bmm"} — see torchnep.ops.resolve_backend.
         """
-        if self.spin_mode == 3:
-            # Mode 3 obtains position/spin derivatives through autograd.  An
+        if self.spin_mode == 2:
+            # Mode 2 obtains position/spin derivatives through autograd.  An
             # evaluation caller may legitimately wrap this public method in
             # no_grad(); temporarily re-enable gradients for the derivative
             # calculation and return detached results in that case.  Training
@@ -847,7 +847,7 @@ class NEPModel(nn.Module):
         first_header = lines[0].split()
         model_tag = first_header[0]
         file_spin_mode = (
-            3 if "spin3" in model_tag
+            2 if "spin2" in model_tag
             else 0
         )
         if file_spin_mode != self.spin_mode:
@@ -885,7 +885,7 @@ class NEPModel(nn.Module):
         if self.spin_mode:
             if len(lines) < 2 or lines[1].split()[0] != "spin_mode":
                 raise ValueError(
-                    "nep4_spin3 requires spin_mode as the first metadata line")
+                    "nep4_spin2 requires spin_mode as the first metadata line")
             mode_parts = lines[1].split()
             if len(mode_parts) != 3:
                 raise ValueError(
@@ -1033,7 +1033,7 @@ class NEPModel(nn.Module):
                     "ZBL typewise factor does not match target config")
         if self.spin_mode:
             required = {
-                "spin_mode": 3,
+                "spin_mode": 2,
                 "spin_basis_size": self.spin_basis_size[0],
                 "spin_l_max": self.spin_l_max[0],
                 "spin_compress": self.spin_compress,
@@ -1151,7 +1151,7 @@ class NEPModel(nn.Module):
 
         projection_parameters = spin_projection_parameters(self)
         expected_projection_size = spin_projection_size(self)
-        if self.spin_mode == 3:
+        if self.spin_mode == 2:
             if declared_projection_size is None:
                 raise ValueError(
                     f"nep4_spin{self.spin_mode} model is missing "

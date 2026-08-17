@@ -341,7 +341,7 @@ def parse_nep_in(filename: str) -> Dict:
             elif key == "spin_descriptor":
                 raise ValueError(
                     "spin_descriptor is not part of the TorchNEP protocol; "
-                    "use spin_mode 3 for the O/C descriptor")
+                    "use spin_mode 2 for the O/C descriptor")
             elif key == "spin_mode":
                 params["spin_mode"] = int(parts[1])
             elif key == "spin_compress":
@@ -430,17 +430,17 @@ def parse_nep_in(filename: str) -> Dict:
     explicit = set(params.keys())
 
     declared_spin_mode = int(params.get("spin_mode", 0))
-    if declared_spin_mode not in (0, 3):
-        raise ValueError("spin_mode must be 0 or 3")
+    if declared_spin_mode not in (0, 2):
+        raise ValueError("spin_mode must be 0 or 2")
     spin_only_keys = {
         "spin_compress", "spin_l_max", "spin_order", "spin_soc",
         "spin_curriculum",
         "spin_cutoff", "spin_dof_type", "spin_env_type",
     }
     ignored_spin_keys = sorted(explicit & spin_only_keys)
-    if declared_spin_mode != 3 and ignored_spin_keys:
+    if declared_spin_mode != 2 and ignored_spin_keys:
         raise ValueError(
-            "O/C spin parameters require 'spin_mode 3'; otherwise they "
+            "O/C spin parameters require 'spin_mode 2'; otherwise they "
             "would be silently ignored: " + ", ".join(ignored_spin_keys)
         )
 
@@ -475,9 +475,9 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_2", 0.0)
     params.setdefault("stage2", False)
 
-    # spin_mode 3 is the order/compression (O/C) magnetic descriptor.
+    # spin_mode 2 is the order/compression (O/C) magnetic descriptor.
     params.setdefault("spin_mode", 0)
-    if params["spin_mode"] == 3:
+    if params["spin_mode"] == 2:
         params.setdefault("spin_compress", 2)
         params.setdefault("spin_basis_size", [8, 0])
         params.setdefault("spin_l_max", [2, 0, 0])
@@ -495,14 +495,14 @@ def parse_nep_in(filename: str) -> Dict:
         "spin_cutoff",
         (
             [6.0, 6.0]
-            if params["spin_mode"] == 3
+            if params["spin_mode"] == 2
             else [params["cutoff_radial"], params["cutoff_angular"]]
         ),
     )
     params.setdefault("spin_dof_type", None)
     params.setdefault("spin_env_type", None)
 
-    if params["spin_mode"] == 3:
+    if params["spin_mode"] == 2:
         max_spin_compress = params["spin_basis_size"][0] + 1
         if not 1 <= params["spin_compress"] <= max_spin_compress:
             raise ValueError(

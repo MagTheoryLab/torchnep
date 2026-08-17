@@ -45,6 +45,65 @@ def main():
                     runs["absolute"], runs[variant])
             ])) for metric in METRICS
         }
+    health_entries = [
+        entry["health"] for entries in runs.values() for entry in entries
+        if "health" in entry
+    ]
+    if health_entries:
+        derivative_names = ("force", "mforce", "isotropic_strain")
+        health_summary = {
+            "runs": len(health_entries),
+            "descriptor_scaled_full_rank_all": all(
+                health["descriptor"]["training"]["scaled"]
+                ["full_column_rank"]
+                for health in health_entries
+            ),
+            "descriptor_scaled_condition": [
+                health["descriptor"]["training"]["scaled"]
+                ["condition_number"]
+                for health in health_entries
+            ],
+            "blind_descriptor_scaled_full_rank_all": all(
+                health["descriptor"]["blind"]["scaled"]["full_column_rank"]
+                for health in health_entries
+            ),
+            "position_jacobian_full_rank_all": all(
+                health["derivatives"]["descriptor_jacobian"]["position"]
+                ["full_column_rank"] for health in health_entries
+            ),
+            "spin_jacobian_full_rank_all": all(
+                health["derivatives"]["descriptor_jacobian"]["spin"]
+                ["full_column_rank"] for health in health_entries
+            ),
+            "zero_spin_exact_all": all(
+                health["derivatives"]["spin_limits"]["zero"]["exact_zero"]
+                for health in health_entries
+            ),
+            "near_zero_spin_finite_all": all(
+                health["derivatives"]["spin_limits"]["near_zero"]["finite"]
+                for health in health_entries
+            ),
+            "training_log_finite_all": all(
+                health["training_log"]["all_observed_finite"]
+                for health in health_entries
+            ),
+        }
+        health_summary["worst_relative_derivative_error"] = {
+            name: max(
+                health["derivatives"]["energy_derivative_closure"][name]
+                ["relative_rms"] for health in health_entries
+            ) for name in derivative_names
+        }
+        health_summary["minimum_sector_derivative_rms"] = {
+            f"{order}_{variable}": min(
+                health["derivatives"]["descriptor_jacobian"]["sector_rms"]
+                [f"O{order}_increment"][f"{variable}_rms"]
+                for health in health_entries
+            )
+            for order in (1, 2, 3)
+            for variable in ("position", "spin", "isotropic_strain")
+        }
+        summary["health"] = health_summary
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".json").write_text(json.dumps(summary, indent=2))
 

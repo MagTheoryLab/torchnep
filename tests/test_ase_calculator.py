@@ -157,7 +157,7 @@ def test_non_periodic_vacuum_uses_largest_spin_cutoff():
     calc.nep = SimpleNamespace(
         rc_radial=3.0,
         rc_angular=4.0,
-        spin_mode=3,
+        spin_mode=2,
         spin_cutoff=[7.0, 7.0],
     )
     atoms = Atoms(

@@ -185,10 +185,29 @@ def test_order3_rank_two_keeps_supported_channels_and_omits_bulk_chirality():
     result3 = _evaluate(order3, environment)
     torch.testing.assert_close(result3[..., : order2.dim], result2)
     tokens = order3.split_by_token(result3)
-    assert order3.dim == 51
+    assert order3.dim == 49
     assert "coupling_l111_bulk" not in tokens
+    assert "coupling_l111_p_l_x" not in tokens
     assert tokens["coupling_l11_dot_response"].abs().max() > 1.0e-10
     assert tokens["coupling_l111_p_m_x"].abs().max() > 1.0e-10
+
+
+def test_removed_longitudinal_triple_channel_is_an_exact_linear_combination():
+    generator = torch.Generator().manual_seed(20260817)
+    rhat = torch.randn(19, 3, generator=generator, dtype=DTYPE)
+    rhat = rhat / torch.linalg.vector_norm(rhat, dim=-1, keepdim=True)
+    spin = torch.randn(19, 3, generator=generator, dtype=DTYPE)
+
+    longitudinal = (rhat * spin).sum(-1, keepdim=True) * rhat
+    quadrupole_on_spin = (
+        rhat * (rhat * spin).sum(-1, keepdim=True) - spin / 3.0
+    )
+    torch.testing.assert_close(
+        longitudinal,
+        quadrupole_on_spin + spin / 3.0,
+        rtol=2.0e-15,
+        atol=2.0e-15,
+    )
 
 
 def test_element_conditioned_radial_mixing_changes_only_active_types():

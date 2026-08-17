@@ -37,7 +37,7 @@ def _config(order=3, compress=3):
         "basis_size_angular": 8,
         "l_max": [4, 2, 0],
         "neuron": 8,
-        "spin_mode": 3,
+        "spin_mode": 2,
         "spin_compress": compress,
         "spin_basis_size": [8, 0],
         "spin_l_max": [2, 0, 0],
@@ -57,7 +57,7 @@ def _write_input(path: Path, order=3, compress=3):
         "basis_size 8 8\n"
         "l_max 4 2 0\n"
         "neuron 8\n"
-        "spin_mode 3\n"
+        "spin_mode 2\n"
         "spin_cutoff 6\n"
         f"spin_compress {compress}\n"
         "spin_l_max 2\n"
@@ -66,11 +66,11 @@ def _write_input(path: Path, order=3, compress=3):
     )
 
 
-def test_spin3_parser_exposes_only_nested_truncations(tmp_path):
+def test_spin2_parser_exposes_only_nested_truncations(tmp_path):
     path = tmp_path / "nep.in"
     _write_input(path)
     config = parse_nep_in(path)
-    assert config["spin_mode"] == 3
+    assert config["spin_mode"] == 2
     assert config["spin_compress"] == 3
     assert config["spin_order"] == 3
     assert config["spin_l_max"] == [2, 0, 0]
@@ -78,7 +78,7 @@ def test_spin3_parser_exposes_only_nested_truncations(tmp_path):
     assert config["spin_cutoff"] == [6.0, 6.0]
 
 
-def test_direct_spin3_defaults_match_nep_input_defaults():
+def test_direct_spin2_defaults_match_nep_input_defaults():
     config = _config(order=3, compress=2)
     for key in (
         "spin_compress", "spin_basis_size", "spin_l_max", "spin_cutoff",
@@ -94,7 +94,7 @@ def test_direct_spin3_defaults_match_nep_input_defaults():
     assert model.spin_soc == 1
 
 
-def test_spin3_parser_rejects_unversioned_spin_options(tmp_path):
+def test_spin2_parser_rejects_unversioned_spin_options(tmp_path):
     path = tmp_path / "nep.in"
     _write_input(path)
     with path.open("a") as stream:
@@ -103,33 +103,45 @@ def test_spin3_parser_rejects_unversioned_spin_options(tmp_path):
         parse_nep_in(path)
 
 
-def test_spin_options_require_explicit_spin_mode_three(tmp_path):
+def test_spin_options_require_explicit_spin_mode_two(tmp_path):
     path = tmp_path / "nep.in"
     path.write_text(
         "type 1 Fe\n"
         "spin_order 3\n"
     )
-    with pytest.raises(ValueError, match="require 'spin_mode 3'"):
+    with pytest.raises(ValueError, match="require 'spin_mode 2'"):
         parse_nep_in(path)
 
     config = _config(order=3, compress=2)
     config["spin_mode"] = 0
-    with pytest.raises(ValueError, match="require spin_mode 3"):
+    with pytest.raises(ValueError, match="require spin_mode 2"):
         NEPModel(config)
 
 
-def test_spin3_dimensions_and_qscaler_policy():
+def test_retired_unpublished_spin_mode_three_is_rejected(tmp_path):
+    path = tmp_path / "nep.in"
+    path.write_text("type 1 Fe\nspin_mode 3\n")
+    with pytest.raises(ValueError, match="spin_mode must be 0 or 2"):
+        parse_nep_in(path)
+
+    config = _config(order=3, compress=2)
+    config["spin_mode"] = 3
+    with pytest.raises(ValueError, match="spin_mode must be 0 or 2"):
+        NEPModel(config)
+
+
+def test_spin2_dimensions_and_qscaler_policy():
     assert NEPModel(_config(order=2, compress=2)).spin_dim == 37
     assert NEPModel(_config(order=2, compress=3)).spin_dim == 58
-    assert NEPModel(_config(order=3, compress=2)).spin_dim == 51
-    assert NEPModel(_config(order=3, compress=3)).spin_dim == 82
-    assert resolve_gpumd_qscaler(3, None) is False
-    assert resolve_gpumd_qscaler(3, False) is False
-    with pytest.raises(ValueError, match="spin_mode 3"):
-        resolve_gpumd_qscaler(3, True)
+    assert NEPModel(_config(order=3, compress=2)).spin_dim == 49
+    assert NEPModel(_config(order=3, compress=3)).spin_dim == 79
+    assert resolve_gpumd_qscaler(2, None) is False
+    assert resolve_gpumd_qscaler(2, False) is False
+    with pytest.raises(ValueError, match="spin_mode 2"):
+        resolve_gpumd_qscaler(2, True)
 
 
-def test_spin3_qscaler_does_not_amplify_constant_channels():
+def test_spin2_qscaler_does_not_amplify_constant_channels():
     model = NEPModel(_config(order=3, compress=2)).double()
     q_min = torch.zeros(model.dim, dtype=DTYPE)
     q_max = torch.ones(model.dim, dtype=DTYPE)
@@ -139,7 +151,7 @@ def test_spin3_qscaler_does_not_amplify_constant_channels():
     assert torch.isfinite(model.q_scaler).all()
 
 
-def test_spin3_accepts_rank_two_order_three(tmp_path):
+def test_spin2_accepts_rank_two_order_three(tmp_path):
     path = tmp_path / "nep.in"
     _write_input(path, order=3, compress=2)
     config = parse_nep_in(path)
@@ -147,7 +159,7 @@ def test_spin3_accepts_rank_two_order_three(tmp_path):
     assert config["spin_compress"] == 2
 
 
-def test_spin3_rejects_compression_above_fixed_radial_basis(tmp_path):
+def test_spin2_rejects_compression_above_fixed_radial_basis(tmp_path):
     path = tmp_path / "nep.in"
     _write_input(path, order=3, compress=10)
     with pytest.raises(ValueError, match=r"spin_compress must be in \[1, 9\].*B=8"):
@@ -162,9 +174,12 @@ def test_o3c2_has_o2c2_prefix_and_omits_rank3_bulk():
     order2 = NEPModel(_config(order=2, compress=2)).spin_descriptor
     order3 = NEPModel(_config(order=3, compress=2)).spin_descriptor
     assert order2.dim == 37
-    assert order3.dim == 51
+    assert order3.dim == 49
     assert tuple(order3.schema[: len(order2.schema)]) == tuple(order2.schema)
     assert "coupling_l111_bulk" not in {
+        token.name for token in order3.schema
+    }
+    assert "coupling_l111_p_l_x" not in {
         token.name for token in order3.schema
     }
 
@@ -198,7 +213,7 @@ def test_slim_model_preserves_oc_descriptor_for_kept_elements():
     torch.testing.assert_close(actual, expected)
 
 
-def test_spin3_force_and_mforce_loss_backpropagates_to_descriptor_parameters():
+def test_spin2_force_and_mforce_loss_backpropagates_to_descriptor_parameters():
     model = NEPModel(_config(order=3, compress=3)).double()
     descriptor = model.spin_descriptor
     pair_i = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
@@ -246,9 +261,9 @@ def test_spin3_force_and_mforce_loss_backpropagates_to_descriptor_parameters():
 
 @pytest.mark.parametrize(
     "order,compress,dimension",
-    ((2, 2, 37), (3, 2, 51), (3, 3, 82)),
+    ((2, 2, 37), (3, 2, 49), (3, 3, 79)),
 )
-def test_nep4_spin3_round_trip(order, compress, dimension, tmp_path):
+def test_nep4_spin2_round_trip(order, compress, dimension, tmp_path):
     torch.manual_seed(20260810 + order)
     source = NEPModel(_config(order=order, compress=compress)).double()
     with torch.no_grad():
@@ -261,10 +276,10 @@ def test_nep4_spin3_round_trip(order, compress, dimension, tmp_path):
             torch.tensor([-0.2, 0.3], dtype=DTYPE)
         )
 
-    first = tmp_path / f"nep_spin3_o{order}.txt"
+    first = tmp_path / f"nep_spin2_o{order}.txt"
     source.save_nep_txt(first, max_NN_radial=32, max_NN_angular=32)
     text = first.read_text()
-    assert text.startswith("nep4_spin3 2 Fe Ge\n")
+    assert text.startswith("nep4_spin2 2 Fe Ge\n")
     assert f"spin_order {order}\n" in text
     assert f"spin_compress {compress}\n" in text
     assert f"spin_projection_size {4 * compress * compress}\n" in text
@@ -275,12 +290,12 @@ def test_nep4_spin3_round_trip(order, compress, dimension, tmp_path):
         torch.testing.assert_close(restored.state_dict()[name], expected)
 
     calculator = NEPCalculator(first, dtype=DTYPE)
-    assert calculator.spin_mode == 3
+    assert calculator.spin_mode == 2
     assert calculator.spin_descriptor.dim == dimension
     assert calculator.spin_descriptor_kind == "magnetic_polynomial"
 
 
-def test_spin3_load_rejects_active_type_mismatch(tmp_path):
+def test_spin2_load_rejects_active_type_mismatch(tmp_path):
     source_config = _config(order=3, compress=2)
     source_config["spin_dof_type"] = ["Fe"]
     source = NEPModel(source_config).double()
@@ -310,7 +325,7 @@ def test_spin_env_defaults_to_spin_dof_across_all_readers(tmp_path):
     torch.testing.assert_close(calculator.spin_env_type_active, expected)
 
 
-def test_spin3_text_load_rejects_structural_cutoff_mismatch(tmp_path):
+def test_spin2_text_load_rejects_structural_cutoff_mismatch(tmp_path):
     source = NEPModel(_config(order=3, compress=2)).double()
     path = tmp_path / "wrong_cutoff.txt"
     source.save_nep_txt(path, max_NN_radial=16, max_NN_angular=16)
@@ -321,7 +336,7 @@ def test_spin3_text_load_rejects_structural_cutoff_mismatch(tmp_path):
         target.load_weights_from_nep_txt(path)
 
 
-def test_spin3_calculator_rejects_unknown_counted_metadata(tmp_path):
+def test_spin2_calculator_rejects_unknown_counted_metadata(tmp_path):
     model = NEPModel(_config(order=3, compress=2)).double()
     path = tmp_path / "bad_metadata.txt"
     model.save_nep_txt(path, max_NN_radial=16, max_NN_angular=16)
@@ -331,7 +346,7 @@ def test_spin3_calculator_rejects_unknown_counted_metadata(tmp_path):
         NEPCalculator(path, dtype=DTYPE)
 
 
-def test_spin3_text_load_rejects_wrong_metadata_count(tmp_path):
+def test_spin2_text_load_rejects_wrong_metadata_count(tmp_path):
     source = NEPModel(_config(order=3, compress=2)).double()
     path = tmp_path / "wrong_count.txt"
     source.save_nep_txt(path, max_NN_radial=16, max_NN_angular=16)

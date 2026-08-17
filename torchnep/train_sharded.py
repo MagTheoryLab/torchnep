@@ -492,11 +492,11 @@ def train_nep_sharded(
         validate_response_group_disjoint(frames, valid_frames)
     response_frames = (
         select_generator_curve_frames(frames)
-        if config.get("spin_mode", 0) == 3 else []
+        if config.get("spin_mode", 0) == 2 else []
     )
     valid_response_frames = (
         select_generator_curve_frames(valid_frames)
-        if config.get("spin_mode", 0) == 3 and valid_frames is not None
+        if config.get("spin_mode", 0) == 2 and valid_frames is not None
         else []
     )
     response_enabled = bool(response_frames)
@@ -713,9 +713,9 @@ def train_nep_sharded(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode == 3 and not use_autograd_forces:
+    if model.spin_mode == 2 and not use_autograd_forces:
         use_autograd_forces = True
-        _log("  spin_mode 3: using the full autograd E/F/V/MF/Tau path")
+        _log("  spin_mode 2: using the full autograd E/F/V/MF/Tau path")
     if energy_baseline_values is not None:
         baseline = torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev

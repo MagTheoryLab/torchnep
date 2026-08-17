@@ -22,6 +22,7 @@ import torch
 
 from torchnep import train_nep
 from torchnep.nep import NEPCalculator
+from torchnep.spin_diagnostics import relative_vector_error, svd_health
 
 
 SPECIES = ["Fe"] * 4
@@ -188,7 +189,7 @@ def _write_config(path, epochs):
         "basis_size 8 8\n"
         "l_max 4 2 0\n"
         "neuron 16\n"
-        "spin_mode 3\n"
+        "spin_mode 2\n"
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_order 3\n"
@@ -269,6 +270,213 @@ def _evaluate(model_file, blind, device):
     }
 
 
+def _descriptor_health(calculator, frames):
+    scaled = []
+    for frame in frames:
+        scaled.append(calculator.get_descriptor(
+            SPECIES, frame["positions"], CELL, spins=frame["spins"]
+        ))
+    scaled = np.concatenate(scaled, axis=0)[:, calculator.struct_dim:]
+    scaler = calculator.q_scaler.detach().cpu().numpy()[
+        calculator.struct_dim:
+    ]
+    raw = scaled / scaler[None, :]
+    descriptor = calculator.spin_descriptor
+    labels = []
+    for token in descriptor.schema:
+        labels.extend(
+            f"{token.name}[{offset}]"
+            for offset in range(token.stop - token.start)
+        )
+    sectors = {}
+    previous = 0
+    for order in range(1, descriptor.spin_order + 1):
+        stop = descriptor.order_dims[order]
+        sectors[f"O{order}_increment"] = {
+            "raw": svd_health(
+                raw[:, previous:stop], labels=labels[previous:stop]
+            ),
+            "scaled": svd_health(
+                scaled[:, previous:stop], labels=labels[previous:stop]
+            ),
+            "correlation": svd_health(
+                raw[:, previous:stop], standardize=True,
+                labels=labels[previous:stop],
+            ),
+        }
+        previous = stop
+    return {
+        "raw": svd_health(raw, labels=labels),
+        "scaled": svd_health(scaled, labels=labels),
+        "correlation": svd_health(
+            raw, standardize=True, labels=labels
+        ),
+        "sectors": sectors,
+    }
+
+
+def _finite_difference_health(calculator, frame, step=1.0e-5):
+    positions = np.asarray(frame["positions"], dtype=np.float64)
+    spins = np.asarray(frame["spins"], dtype=np.float64)
+    cell = np.asarray(CELL, dtype=np.float64)
+    n_atoms = positions.shape[0]
+    spin_dim = calculator.spin_descriptor.dim
+
+    def compute(pos, box, spin, descriptor=False):
+        result = calculator.compute(
+            SPECIES, pos, box, spins=spin,
+            compute_descriptor=descriptor,
+        )
+        if descriptor:
+            return result["descriptor"].detach().cpu().numpy()[
+                :, calculator.struct_dim:
+            ]
+        return result
+
+    def total_energy(pos, box, spin):
+        return float(compute(pos, box, spin)["energy"].sum().item())
+
+    analytic = compute(positions, cell, spins)
+    force_fd = np.empty_like(positions)
+    mforce_fd = np.empty_like(spins)
+    position_jacobian = np.empty((n_atoms * spin_dim, n_atoms * 3))
+    spin_jacobian = np.empty_like(position_jacobian)
+    for atom in range(n_atoms):
+        for axis in range(3):
+            column = 3 * atom + axis
+            plus = positions.copy()
+            minus = positions.copy()
+            plus[atom, axis] += step
+            minus[atom, axis] -= step
+            force_fd[atom, axis] = -(
+                total_energy(plus, cell, spins)
+                - total_energy(minus, cell, spins)
+            ) / (2.0 * step)
+            position_jacobian[:, column] = (
+                compute(plus, cell, spins, descriptor=True)
+                - compute(minus, cell, spins, descriptor=True)
+            ).reshape(-1) / (2.0 * step)
+
+            plus_spin = spins.copy()
+            minus_spin = spins.copy()
+            plus_spin[atom, axis] += step
+            minus_spin[atom, axis] -= step
+            mforce_fd[atom, axis] = -(
+                total_energy(positions, cell, plus_spin)
+                - total_energy(positions, cell, minus_spin)
+            ) / (2.0 * step)
+            spin_jacobian[:, column] = (
+                compute(positions, cell, plus_spin, descriptor=True)
+                - compute(positions, cell, minus_spin, descriptor=True)
+            ).reshape(-1) / (2.0 * step)
+
+    plus_positions = positions * (1.0 + step)
+    minus_positions = positions * (1.0 - step)
+    plus_cell = cell * (1.0 + step)
+    minus_cell = cell * (1.0 - step)
+    strain_energy_fd = (
+        total_energy(plus_positions, plus_cell, spins)
+        - total_energy(minus_positions, minus_cell, spins)
+    ) / (2.0 * step)
+    strain_descriptor = (
+        compute(plus_positions, plus_cell, spins, descriptor=True)
+        - compute(minus_positions, minus_cell, spins, descriptor=True)
+    ) / (2.0 * step)
+    analytic_virial = analytic["virial"].sum(dim=0).reshape(3, 3)
+    strain_energy_analytic = -float(torch.trace(analytic_virial).item())
+
+    sector_norms = {}
+    previous = 0
+    for order in range(1, calculator.spin_descriptor.spin_order + 1):
+        stop = calculator.spin_descriptor.order_dims[order]
+        position_sector = position_jacobian.reshape(
+            n_atoms, spin_dim, -1
+        )[:, previous:stop]
+        spin_sector = spin_jacobian.reshape(
+            n_atoms, spin_dim, -1
+        )[:, previous:stop]
+        strain_sector = strain_descriptor[:, previous:stop]
+        sector_norms[f"O{order}_increment"] = {
+            "position_rms": float(np.sqrt(np.mean(position_sector ** 2))),
+            "spin_rms": float(np.sqrt(np.mean(spin_sector ** 2))),
+            "isotropic_strain_rms": float(
+                np.sqrt(np.mean(strain_sector ** 2))
+            ),
+        }
+        previous = stop
+
+    spin_limits = {}
+    for label, scale in (("normal", 1.0), ("near_zero", 1.0e-8), ("zero", 0.0)):
+        values = compute(
+            positions, cell, spins * scale, descriptor=True
+        )
+        spin_limits[label] = {
+            "finite": bool(np.isfinite(values).all()),
+            "max_abs": float(np.max(np.abs(values))),
+            "exact_zero": bool(np.count_nonzero(values) == 0),
+        }
+
+    force = analytic["forces"].detach().cpu().numpy()
+    mforce = analytic["mforces"].detach().cpu().numpy()
+    translation = np.zeros((n_atoms * 3, 3))
+    for axis in range(3):
+        translation[axis::3, axis] = 1.0 / np.sqrt(n_atoms)
+    complete_basis, _ = np.linalg.qr(translation, mode="complete")
+    translation_free = complete_basis[:, 3:]
+    quotient_position_jacobian = position_jacobian @ translation_free
+    return {
+        "energy_derivative_closure": {
+            "force": relative_vector_error(force, force_fd),
+            "mforce": relative_vector_error(mforce, mforce_fd),
+            "isotropic_strain": relative_vector_error(
+                np.array([strain_energy_analytic]),
+                np.array([strain_energy_fd]),
+            ),
+        },
+        "descriptor_jacobian": {
+            "position_with_translation_modes": svd_health(
+                position_jacobian, center=False
+            ),
+            "position": svd_health(
+                quotient_position_jacobian, center=False
+            ),
+            "spin": svd_health(spin_jacobian, center=False),
+            "sector_rms": sector_norms,
+        },
+        "spin_limits": spin_limits,
+    }
+
+
+def _training_log_health(path):
+    values = np.loadtxt(path, comments="#", ndmin=2)
+    finite = np.isfinite(values)
+    active_columns = finite.any(axis=0)
+    invalid_columns = 0
+    leading_nan_columns = 0
+    for column in range(values.shape[1]):
+        indices = np.flatnonzero(finite[:, column])
+        if indices.size == 0:
+            continue
+        first = int(indices[0])
+        leading_nan_columns += int(first > 0)
+        if not finite[first:, column].all():
+            invalid_columns += 1
+    observed_finite = bool(
+        invalid_columns == 0 and not np.isinf(values).any()
+    )
+    finite_values = values[finite]
+    return {
+        "epochs": int(values.shape[0]),
+        "columns": int(values.shape[1]),
+        "active_columns": int(active_columns.sum()),
+        "inactive_nan_columns": int((~active_columns).sum()),
+        "leading_nan_columns": leading_nan_columns,
+        "invalid_nonfinite_columns": invalid_columns,
+        "all_observed_finite": observed_finite,
+        "max_abs_observed": float(np.max(np.abs(finite_values))),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -297,6 +505,22 @@ def main():
     result = {
         "variant": args.variant, "seed": args.seed, "epochs": args.epochs,
         "metrics": _evaluate(model_dir / "nep_best.txt", blind, args.device),
+    }
+    health_calculator = NEPCalculator(
+        model_dir / "nep_best.txt", dtype=torch.float64, device=args.device
+    )
+    result["health"] = {
+        "descriptor": {
+            "training": _descriptor_health(health_calculator, train),
+            "blind": _descriptor_health(
+                health_calculator,
+                [frame for group in blind for frame in group],
+            ),
+        },
+        "derivatives": _finite_difference_health(
+            health_calculator, blind[0][len(blind[0]) // 2]
+        ),
+        "training_log": _training_log_health(model_dir / "loss.out"),
     }
     (args.output / "result.json").write_text(json.dumps(result, indent=2))
     print(json.dumps({"variant": args.variant, "seed": args.seed,

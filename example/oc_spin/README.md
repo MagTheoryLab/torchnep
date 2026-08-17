@@ -7,7 +7,7 @@ O/C 表示两个截断参数：
 - O（order）：局域磁集团的相关阶数；
 - C（compression）：所有收缩路径共享的径向秩。
 
-磁性侧的生产默认是 O3-C2（51D）；本示例通过 `n_max 4 4` 和
+磁性侧的生产默认是 O3-C2（49D）；本示例通过 `n_max 4 4` 和
 `l_max 4 2 0` 配置了 30D 结构描述符。O2-C2 是 O3-C2 的严格
 37D 磁通道前缀；提高 C 会统一增加径向分辨率，而不是追加某个指定
 哈密顿量通道。
@@ -18,7 +18,7 @@ O/C 表示两个截断参数：
 通道在零磁矩时严格为零；每元素最小二乘能量 baseline 只负责移除
 总能量中的成分偏置。
 
-当前模型格式为 nep4_spin3。O/C 的 Python reference/training 路径
+当前模型格式为 nep4_spin2。O/C 的 Python reference/training 路径
 使用 autograd 导数；下游 CUDA reader 在发布前仍需通过相同模型、
 输入和精度下的能量及全部导数 parity gate。
 
@@ -28,7 +28,7 @@ O3-C2 默认启用 O2 到 O3 curriculum；如需从第一个 epoch 直接训练
 完整 O3，可在 `nep.in` 设置 `spin_curriculum 0`：
 
 1. Stage 1 前半段只更新 O2 前缀；
-2. Stage 1 后半段线性释放 O3 的 14 个新增输入行；
+2. Stage 1 后半段线性释放 O3 的 12 个新增输入行；
 3. 进入 Stage 2 的首个 epoch 时 O3 完全打开；
 4. Stage 2 保留 E/F/V/MF/Tau 监督，不把磁响应权重清零。
 
@@ -84,6 +84,26 @@ sum_i MF_i dot dS_i/dtheta，同时拟合组均值和中心化形状。这既保
 隔离。chirality、strain、volume 仍作为普通绝对量监督和独立验收；
 尚未把它们硬编码成模型输出或专门 loss，因此不能据此宣称所有
 J/D/磁弹切片都已自动学准。
+
+## 数值健康证书
+
+`benchmark_production_response_toy.py` 的每个 sealed run 都在
+`result.json` 写入 `health`：
+
+- 完整训练分布和 sealed blind 扫描子集各自在 q-scaler 前后的 SVD、
+  有效秩、恒定列和条件数；
+- O1/O2/O3 增量 sector 各自的 SVD；
+- 描述符对位置、自旋和各向同性应变的有限差分 Jacobian SVD；位置
+  Jacobian 同时报告原始谱和商去三维整体平移零模后的谱；
+- 各 sector 对位置、自旋和应变的导数 RMS，暴露失活通道；
+- E 对位置、自旋和应变导数与 F/MF/virial 的独立 FD 闭合；
+- 正常、近零和严格零磁矩下的有限性与严格零退化；
+- `loss.out` 的非有限数检查。
+
+`analyze_production_response_toy.py` 跨 variant 和 seed 汇总最坏导数
+误差、满秩状态、条件数、最小 sector 响应及训练有限性。该证书只
+对实际采样的数据分布成立；不能把一次 toy 满秩外推成任意 DFT
+数据集都满秩。
 
 ## 当前不纳入生产面的策略
 

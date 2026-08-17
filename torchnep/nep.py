@@ -110,7 +110,7 @@ class NEPCalculator:
         version_str = header[0]  # "nep4", "nep4_zbl", etc.
         self.has_zbl = "zbl" in version_str
         header_spin_mode = (
-            3 if "spin3" in version_str
+            2 if "spin2" in version_str
             else 0
         )
         self.spin_mode = header_spin_mode
@@ -157,7 +157,7 @@ class NEPCalculator:
                 if key == "spin_descriptor":
                     raise ValueError(
                         "spin_descriptor is not supported; the standalone "
-                        "O/C protocol uses spin_mode 3")
+                        "O/C protocol uses spin_mode 2")
                 if key not in allowed_spin_metadata:
                     raise ValueError(f"unknown O/C model metadata: {key}")
                 if key in seen_spin_metadata:
@@ -239,14 +239,14 @@ class NEPCalculator:
                 f"header declares spin_mode {header_spin_mode}, but the "
                 f"metadata block declares {self.spin_mode}"
             )
-        if self.spin_mode not in (0, 3):
-            raise ValueError("spin_mode must be 0 or 3")
+        if self.spin_mode not in (0, 2):
+            raise ValueError("spin_mode must be 0 or 2")
         self.spin_descriptor_kind = (
             "magnetic_polynomial"
-            if self.spin_mode == 3
+            if self.spin_mode == 2
             else None
         )
-        if self.spin_mode == 3:
+        if self.spin_mode == 2:
             required = {
                 "spin_baseline", "spin_basis_size", "spin_l_max",
                 "spin_compress", "spin_cutoff", "spin_order", "spin_soc",
@@ -263,7 +263,7 @@ class NEPCalculator:
                 raise ValueError("spin_soc must be 0 or 1")
             if self.spin_projection_size is None:
                 raise ValueError(
-                    "nep4_spin3 model is missing spin_projection_size"
+                    "nep4_spin2 model is missing spin_projection_size"
                 )
         if bool((self.spin_dof_type_active
                  & ~self.spin_env_type_active).any().item()):
@@ -414,7 +414,7 @@ class NEPCalculator:
             di += c_spin_size
 
         expected_projection_size = spin_projection_size(self)
-        if self.spin_mode == 3:
+        if self.spin_mode == 2:
             if self.spin_projection_size != expected_projection_size:
                 raise ValueError(
                     "spin_projection_size does not match the descriptor: "

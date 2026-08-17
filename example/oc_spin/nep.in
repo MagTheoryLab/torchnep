@@ -5,7 +5,7 @@ basis_size 8 8
 l_max 4 2 0
 neuron 30
 
-spin_mode 3
+spin_mode 2
 spin_cutoff 6
 spin_l_max 2
 spin_compress 2
