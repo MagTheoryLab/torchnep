@@ -38,6 +38,7 @@ from ase import Atoms                                   # noqa: E402
 from torchnep.ase_calculator import NEP                 # noqa: E402
 from torchnep.nep import NEPCalculator                  # noqa: E402
 from torchnep.data import read_xyz                      # noqa: E402
+from torchnep.model import NEPModel                     # noqa: E402
 from _common import FIXTURES, load_reference            # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -137,6 +138,51 @@ def test_component_split_sums_to_total():
     # get_energy_components is the energy-only view of the same split
     ec = atoms.calc.get_energy_components(atoms)
     assert ec == {k: comp[k]["energy"] for k in comp}
+
+
+def test_spin_zbl_component_split_sums_to_total(tmp_path):
+    config = {
+        "num_types": 2,
+        "type_names": ["Fe", "Ge"],
+        "cutoff_radial": 4.0,
+        "cutoff_angular": 4.0,
+        "n_max_radial": 2,
+        "n_max_angular": 2,
+        "basis_size_radial": 3,
+        "basis_size_angular": 3,
+        "l_max": [2, 0, 0],
+        "neuron": 4,
+        "spin_mode": 2,
+        "spin_compress": 2,
+        "spin_basis_size": [8, 0],
+        "spin_l_max": [2, 0, 0],
+        "spin_cutoff": [4.0, 4.0],
+        "spin_order": 3,
+        "spin_soc": 1,
+        "zbl": 2.5,
+    }
+    model = NEPModel(config).double().eval()
+    path = tmp_path / "spin2_zbl.txt"
+    model.save_nep_txt(path, max_NN_radial=16, max_NN_angular=16)
+
+    atoms = Atoms(
+        symbols=["Fe", "Ge", "Fe"],
+        positions=[[0.0, 0.0, 0.0], [1.2, 0.1, 0.0], [2.5, 0.3, 0.2]],
+        cell=np.eye(3) * 12.0,
+        pbc=True,
+    )
+    atoms.set_array("spins", np.array(
+        [[0.0, 0.0, 2.0], [0.2, 0.1, 1.0], [-0.1, 0.3, 1.5]]))
+    atoms.calc = NEP(path, dtype="float64")
+    comp = atoms.calc.get_components(atoms)
+
+    assert abs(comp["nep"]["energy"] + comp["zbl"]["energy"]
+               - comp["total"]["energy"]) < 1e-12
+    assert np.abs(comp["nep"]["forces"] + comp["zbl"]["forces"]
+                  - comp["total"]["forces"]).max() < 1e-12
+    assert np.abs(comp["nep"]["stress"] + comp["zbl"]["stress"]
+                  - comp["total"]["stress"]).max() < 1e-12
+    assert abs(comp["zbl"]["energy"]) > 1e-6
 
 
 def test_non_periodic_has_no_stress():

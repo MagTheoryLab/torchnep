@@ -295,6 +295,97 @@ def test_nep4_spin2_round_trip(order, compress, dimension, tmp_path):
     assert calculator.spin_descriptor_kind == "magnetic_polynomial"
 
 
+def test_spin2_zbl_round_trip_components_and_derivatives(tmp_path):
+    torch.manual_seed(31)
+    input_path = tmp_path / "nep.in"
+    _write_input(input_path, order=3, compress=2)
+    with input_path.open("a") as stream:
+        stream.write("zbl 2.5\n")
+    config = parse_nep_in(input_path)
+    assert config["spin_mode"] == 2
+    assert config["zbl"] == 2.5
+    model = NEPModel(config).double().eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.05)
+
+    path = tmp_path / "spin2_zbl.txt"
+    model.save_nep_txt(path, max_NN_radial=32, max_NN_angular=32)
+    lines = path.read_text().splitlines()
+    assert lines[0] == "nep4_spin2_zbl 2 Fe Ge"
+    assert "zbl 1.25 2.5" in lines
+
+    calculator = NEPCalculator(path, dtype=DTYPE)
+    species = ["Fe", "Ge", "Fe"]
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.2, 0.1, 0.0], [2.5, 0.3, 0.2]],
+        dtype=DTYPE,
+    )
+    cell = torch.eye(3, dtype=DTYPE) * 12.0
+    spins = torch.tensor(
+        [[0.0, 0.0, 2.0], [0.2, 0.1, 1.0], [-0.1, 0.3, 1.5]],
+        dtype=DTYPE,
+    )
+    pair_i_np, pair_j_np, rij_np = build_neighbor_list_np(
+        positions.numpy(), cell.numpy(), 6.0)
+    pair_i = torch.from_numpy(pair_i_np)
+    pair_j = torch.from_numpy(pair_j_np)
+    rij = torch.from_numpy(rij_np)
+    distance = torch.linalg.norm(rij, dim=-1)
+    radial = distance < 6.0
+    angular = distance < 5.0
+    atom_types = torch.tensor([0, 1, 0], dtype=torch.long)
+    reference = model.compute_properties(
+        rij[radial], rij[angular],
+        pair_i[radial], pair_j[radial],
+        pair_i[angular], pair_j[angular],
+        atom_types, 3, torch.zeros(3, dtype=torch.long), 1,
+        need_forces=True, need_virial=True, spins=spins,
+        need_mforce=True, need_tau=True,
+        rij_spin=rij[radial], pi_spin=pair_i[radial],
+        pj_spin=pair_j[radial], create_graph=False,
+    )
+    result = calculator.compute(
+        species, positions.numpy(), cell.numpy(), spins=spins.numpy(),
+        return_components=True,
+    )
+
+    for model_key, calculator_key in (
+        ("Ei", "energy"), ("forces", "forces"),
+        ("virial", "virial"), ("mforces", "mforces"),
+        ("tau", "tau"),
+    ):
+        torch.testing.assert_close(
+            reference[model_key].detach(), result[calculator_key],
+            rtol=2.0e-9, atol=2.0e-9,
+        )
+
+    for quantity in ("energy", "forces", "virial"):
+        torch.testing.assert_close(
+            result[quantity],
+            result[f"{quantity}_nep"] + result[f"{quantity}_zbl"],
+            rtol=0.0,
+            atol=0.0,
+        )
+    assert result["energy_zbl"].abs().sum() > 0
+    assert result["forces_zbl"].abs().max() > 0
+    assert torch.isfinite(result["mforces"]).all()
+    assert torch.isfinite(result["tau"]).all()
+
+    spin_step = 1.0e-5
+    plus = spins.clone()
+    minus = spins.clone()
+    plus[1, 0] += spin_step
+    minus[1, 0] -= spin_step
+    e_plus = calculator.compute(
+        species, positions.numpy(), cell.numpy(), spins=plus.numpy())["energy"].sum()
+    e_minus = calculator.compute(
+        species, positions.numpy(), cell.numpy(), spins=minus.numpy())["energy"].sum()
+    mforce_fd = -(e_plus - e_minus) / (2.0 * spin_step)
+    torch.testing.assert_close(
+        result["mforces"][1, 0], mforce_fd, rtol=2.0e-7, atol=2.0e-7)
+
+
 def test_spin2_load_rejects_active_type_mismatch(tmp_path):
     source_config = _config(order=3, compress=2)
     source_config["spin_dof_type"] = ["Fe"]

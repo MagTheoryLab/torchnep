@@ -392,7 +392,11 @@ print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 
 For `nep4_spin2`, attach an `(N,3)` `spins` array before evaluation;
 `atoms.calc.results["mforces"]` and `atoms.calc.results["tau"]` are then
-available. The NEP/ZBL component-split helper is currently nonmagnetic-only.
+available. Spin models can also use `zbl` and the same NEP/ZBL component-split
+helper; because ZBL is spin-independent, it contributes no magnetic force or
+torque. TorchNEP exports this combination as `nep4_spin2_zbl`; the current
+GPUMD and NEPAdapters spin readers still accept only `nep4_spin2`, so that text
+model needs a downstream reader/parity update before deployment there.
 
 ### Full-dataset prediction
 

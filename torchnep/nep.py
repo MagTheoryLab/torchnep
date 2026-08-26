@@ -483,7 +483,9 @@ class NEPCalculator:
         dict with 'energy', 'forces', 'virial', optionally 'descriptor';
         spin models also return 'mforces' and ``tau = spin x mforce``.
         If ``return_components`` is set, the per-contribution breakdown above
-        is included for non-spin models.
+        is included.  ZBL has no spin derivative, so a spin model's magnetic
+        forces and torques are the NEP contribution and remain reported only
+        through the unsuffixed ``mforces`` and ``tau`` keys.
         """
         atom_types = torch.tensor(
             [self.type_names.index(s) for s in species],
@@ -493,9 +495,6 @@ class NEPCalculator:
         N = pos_np.shape[0]
         if self.spin_mode and spins is None:
             raise ValueError("spin model requires per-atom spins")
-        if self.spin_mode and return_components:
-            raise NotImplementedError(
-                "return_components is not implemented for O/C spin models")
         spin_tensor = None
         if self.spin_mode:
             spin_tensor = torch.as_tensor(

@@ -259,16 +259,14 @@ class NEP(Calculator):
             atoms = self.atoms
         if atoms is None:
             raise ValueError("No atoms supplied and none attached to the calculator.")
-        if self.nep.spin_mode:
-            raise NotImplementedError(
-                "NEP/ZBL component splitting is not implemented for "
-                "O/C spin models")
 
         cell, periodic = self._cell_for_neighbors(atoms)
+        spins = self._spin_vectors(atoms) if self.nep.spin_mode else None
         res = self.nep.compute(
             species=atoms.get_chemical_symbols(),
             positions=atoms.get_positions(),
             cell=cell,
+            spins=spins,
             return_components=True,
         )
         vol = atoms.get_volume() if periodic else None
