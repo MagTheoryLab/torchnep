@@ -100,8 +100,10 @@ def _mark_rotation_scan(path, group, repeat_single=False):
         stop = start + natoms + 2
         blocks.append(lines[start:stop])
         start = stop
-    if repeat_single and len(blocks) == 1:
-        blocks = [list(blocks[0]) for _ in range(3)]
+    # A response group is one parent geometry under a controlled spin
+    # rotation.  Clone the first structure even when the original smoke file
+    # contains unrelated ordinary configurations.
+    blocks = [list(blocks[0]) for _ in range(3)]
     coordinates = (-0.1, 0.0, 0.1)
     assert len(blocks) == len(coordinates)
     rendered = []
@@ -114,7 +116,21 @@ def _mark_rotation_scan(path, group, repeat_single=False):
         header = header.replace(
             "mforce:R:3", "mforce:R:3:spin_tangent:R:3")
         rendered.extend([block[0], header])
-        rendered.extend(line + " 0 1 0" for line in block[2:])
+        for atom, line in enumerate(block[2:]):
+            fields = line.split()
+            tangent = [0.0, 0.0, 0.0]
+            if atom == 1:
+                fields[7:10] = [
+                    f"{np.cos(coordinate):.16e}",
+                    f"{np.sin(coordinate):.16e}",
+                    "0.0",
+                ]
+                tangent = [
+                    -np.sin(coordinate), np.cos(coordinate), 0.0,
+                ]
+            rendered.append(
+                " ".join(fields + [f"{value:.16e}" for value in tangent])
+            )
     path.write_text("\n".join(rendered) + "\n")
 
 
@@ -173,6 +189,7 @@ def test_single_device_oc_training_smoke(tmp_path):
     assert "O3 curriculum epoch 2: gradient_scale=1.000000" in log
     assert "forces: autograd" in log
     assert "generator curves: 3 training frames, 3 validation frames" in log
+    assert "neutral-group-balanced-mean-plus-centered" in log
     assert "use_gpumd_qscaler: descriptor coeffs" not in log
 
 
@@ -225,3 +242,6 @@ def test_two_rank_oc_training_smoke(tmp_path):
     )
     assert completed.returncode == 0, completed.stdout
     _assert_outputs(output)
+    log = (output / "output.log").read_text()
+    assert "neutral-group-balanced-mean-plus-centered" in log
+    assert "one replicated complete group per ordinary optimizer step" in log

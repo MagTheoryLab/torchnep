@@ -20,8 +20,11 @@ import torch
 from torchnep.data import parse_nep_in, read_xyz
 from torchnep.model import NEPModel
 from torchnep.response_training import (
+    GENERATOR_CURVE_SCHEMA,
     complete_group_batches,
     generator_curve_loss,
+    group_balanced_generator_rms,
+    normalized_group_batches,
     select_generator_curve_frames,
 )
 from torchnep.spin_diagnostics import relative_vector_error, svd_health
@@ -354,3 +357,153 @@ def test_spin_pt_finetune_requires_matching_architecture_signature(tmp_path):
     target = NEPModel(changed)
     with pytest.raises(ValueError, match="architecture"):
         _load_finetune_weights(target, str(checkpoint), torch.device("cpu"))
+
+
+def test_generator_curve_is_neutral_to_sin_cos_and_sin2_targets():
+    """Target phase or harmonic content must not manufacture group weights."""
+    dtype = torch.float64
+    n_points = 16
+    theta = (
+        2.0 * torch.pi * torch.arange(n_points, dtype=dtype) / n_points
+        - torch.pi
+    )
+    waves = (torch.sin(theta), torch.cos(theta), torch.sin(2.0 * theta))
+    target_values = torch.cat(waves)
+    common_error = 0.1 * torch.cos(3.0 * theta)
+    predicted_values = target_values + common_error.repeat(len(waves))
+    predicted = torch.stack((
+        predicted_values,
+        torch.zeros_like(predicted_values),
+        torch.zeros_like(predicted_values),
+    ), dim=1).requires_grad_()
+    target = torch.stack((
+        target_values,
+        torch.zeros_like(target_values),
+        torch.zeros_like(target_values),
+    ), dim=1)
+    tangent = torch.zeros_like(target)
+    tangent[:, 0] = 1.0
+    struct_idx = torch.arange(target_values.numel())
+    groups = torch.arange(len(waves)).repeat_interleave(n_points)
+    coordinates = theta.repeat(len(waves))
+
+    loss = generator_curve_loss(
+        predicted, target, tangent, struct_idx, groups, coordinates,
+        target_values.numel(), mean_weight=0.0)
+    loss.backward()
+    gradient_norms = predicted.grad[:, 0].reshape(len(waves), n_points).norm(
+        dim=1)
+    torch.testing.assert_close(
+        gradient_norms,
+        gradient_norms[0].expand_as(gradient_norms),
+        rtol=1.0e-12, atol=1.0e-12)
+    assert "neutral" in GENERATOR_CURVE_SCHEMA
+
+
+def test_generator_curve_zero_mean_and_zero_target_scales_stay_finite():
+    dtype = torch.float64
+    n_points = 16
+    theta = 2.0 * torch.pi * torch.arange(n_points, dtype=dtype) / n_points
+    cosine = torch.cos(theta)
+    tangent = torch.tensor([[1.0, 0.0, 0.0]], dtype=dtype).repeat(
+        n_points, 1)
+    struct_idx = torch.arange(n_points)
+    groups = torch.zeros(n_points, dtype=torch.long)
+
+    target = torch.zeros(n_points, 3, dtype=dtype)
+    target[:, 0] = cosine
+    shifted = target.clone()
+    shifted[:, 0] += 0.1
+    zero_mean_loss = generator_curve_loss(
+        shifted, target, tangent, struct_idx, groups, theta, n_points)
+    torch.testing.assert_close(
+        zero_mean_loss,
+        torch.tensor(0.0025, dtype=dtype),
+        rtol=1.0e-12, atol=1.0e-12)
+
+    zero_target = torch.zeros_like(target)
+    small_prediction = torch.zeros_like(target)
+    small_prediction[:, 0] = 1.0e-7 * cosine
+    zero_target_loss = generator_curve_loss(
+        small_prediction, zero_target, tangent, struct_idx, groups, theta,
+        n_points)
+    assert torch.isfinite(zero_target_loss)
+    assert 0.0 < zero_target_loss.item() < 1.0
+
+
+def test_generator_curve_group_replication_and_batch_packing_are_invariant():
+    dtype = torch.float64
+    n_points = 8
+    theta = 2.0 * torch.pi * torch.arange(n_points, dtype=dtype) / n_points
+
+    def make_case(repeats):
+        waves = (torch.sin(theta), torch.cos(theta), torch.sin(2.0 * theta))
+        values = []
+        errors = []
+        group_ids = []
+        for repeat in range(repeats):
+            for index, wave in enumerate(waves):
+                values.append(wave)
+                errors.append(0.05 * torch.cos((index + 3.0) * theta))
+                group_ids.extend([repeat * len(waves) + index] * n_points)
+        values = torch.cat(values)
+        errors = torch.cat(errors)
+        target = torch.zeros(values.numel(), 3, dtype=dtype)
+        target[:, 0] = values
+        tangent = torch.zeros_like(target)
+        tangent[:, 0] = 1.0
+        return target, tangent, errors, torch.tensor(group_ids), \
+            theta.repeat(repeats * len(waves))
+
+    def full_loss_and_gradient(repeats):
+        target, tangent, errors, groups, coordinates = make_case(repeats)
+        amplitude = torch.tensor(0.4, dtype=dtype, requires_grad=True)
+        predicted = target.clone()
+        predicted[:, 0] += amplitude * errors
+        loss = generator_curve_loss(
+            predicted, target, tangent, torch.arange(target.shape[0]),
+            groups, coordinates, target.shape[0], mean_weight=0.0)
+        loss.backward()
+        return loss.detach(), amplitude.grad.detach()
+
+    once = full_loss_and_gradient(1)
+    twice = full_loss_and_gradient(2)
+    torch.testing.assert_close(once[0], twice[0], rtol=1.0e-12, atol=1.0e-12)
+    torch.testing.assert_close(once[1], twice[1], rtol=1.0e-12, atol=1.0e-12)
+
+    target, tangent, errors, groups, coordinates = make_case(1)
+    predicted = target.clone()
+    predicted[:, 0] += 0.4 * errors
+    full = generator_curve_loss(
+        predicted, target, tangent, torch.arange(target.shape[0]), groups,
+        coordinates, target.shape[0], mean_weight=0.0)
+    for packed_size in (n_points, 2 * n_points + 1):
+        packed = full.new_zeros(())
+        for indices, weight in normalized_group_batches(
+                groups.tolist(), packed_size, seed=9):
+            index = torch.tensor(indices, dtype=torch.long)
+            packed = packed + weight * generator_curve_loss(
+                predicted[index], target[index], tangent[index],
+                torch.arange(index.numel()), groups[index],
+                coordinates[index], index.numel(), mean_weight=0.0,
+                normalization_scale=target[:, 0].square().mean().sqrt())
+        torch.testing.assert_close(
+            packed, full, rtol=1.0e-12, atol=1.0e-12)
+
+
+def test_generator_scale_is_group_balanced_for_unequal_scan_lengths():
+    short = torch.tensor([1.0, -1.0], dtype=torch.float64)
+    long = torch.tensor([4.0, -4.0], dtype=torch.float64)
+    expected = torch.tensor(8.5, dtype=torch.float64).sqrt()
+
+    values = torch.cat((short, long))
+    groups = torch.tensor([0, 0, 1, 1])
+    torch.testing.assert_close(
+        group_balanced_generator_rms(values, groups), expected)
+
+    repeated_values = torch.cat((short, long.repeat(7)))
+    repeated_groups = torch.tensor([0, 0] + [1] * 14)
+    torch.testing.assert_close(
+        group_balanced_generator_rms(repeated_values, repeated_groups),
+        expected,
+    )

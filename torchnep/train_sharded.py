@@ -53,6 +53,7 @@ from .spin_schema import resolve_gpumd_qscaler
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
+    GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
     GENERATOR_CURVE_WEIGHT,
     complete_group_batches,
@@ -518,6 +519,8 @@ def train_nep_sharded(
         _log(f"  generator curves: {len(response_frames)} training frames"
              + (f", {len(valid_response_frames)} validation frames"
                 if valid_frames is not None else ""))
+        _log(f"  generator objective: {GENERATOR_CURVE_SCHEMA}; "
+             "one replicated complete group per ordinary optimizer step")
     n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
@@ -992,6 +995,11 @@ def train_nep_sharded(
             GENERATOR_CURVE_HUBER_DELTA if response_enabled else 0.0),
         "generator_curve_mean_weight": (
             GENERATOR_CURVE_MEAN_WEIGHT if response_enabled else 0.0),
+        "generator_curve_scale_floor": (
+            GENERATOR_CURVE_SCALE_FLOOR if response_enabled else 0.0),
+        "generator_curve_normalization_scale": (
+            float(response_store.generator_curve_scale.item())
+            if response_enabled else 0.0),
     }
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
@@ -1325,6 +1333,20 @@ def train_nep_sharded(
                 raw_model.spin_descriptor is not None
                 and global_has_tau and cur_pref_tau > 0)
 
+            # The response subset is deliberately replicated.  Every rank
+            # selects the same complete group and DDP therefore averages an
+            # identical response gradient while reducing the sharded ordinary
+            # gradient.  At a matched optimizer step this forms
+            # L_ordinary + lambda_R L_response.  Cross-world-size trajectory
+            # comparisons additionally require a fixed global batch and the
+            # same number/order of optimizer steps.
+            response_batches = (
+                complete_group_batches(
+                    response_store.response_group_ids, 1,
+                    seed=run_seed + epoch)
+                if in_stage2 and response_store is not None else []
+            )
+
             for start in range(0, n_local, batch_size):
                 idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
@@ -1430,6 +1452,32 @@ def train_nep_sharded(
                     loss = loss + cur_pref_tau * sum_sq_t * ws / (3.0 * n_t_g)
                     sum_lt += sum_sq_t.item() / 3.0
 
+                if response_batches:
+                    response_idx = response_batches[
+                        (start // batch_size) % len(response_batches)]
+                    response_batch = response_store.collate(response_idx)
+                    response_batch["need_mforce"] = True
+                    response_batch["need_tau"] = False
+                    # Use the raw model for the replicated branch.  The
+                    # ordinary DDP forward has already armed the reducer; its
+                    # parameter hooks therefore all-reduce the summed
+                    # ordinary+response gradient in the single backward.
+                    response_result = raw_model.compute_properties_cached(
+                        response_batch, need_forces=False,
+                        need_virial=False, backend=train_backend,
+                        create_graph=True)
+                    curve_loss = generator_curve_loss(
+                        response_result["mforces"],
+                        response_batch["mforces"],
+                        response_batch["spin_tangent"],
+                        response_batch["struct_idx"],
+                        response_batch["response_group_ids"],
+                        response_batch["response_coordinates"],
+                        response_batch["num_structures"],
+                        normalization_scale=(
+                            response_store.generator_curve_scale))
+                    loss = loss + GENERATOR_CURVE_WEIGHT * curve_loss
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
@@ -1484,47 +1532,6 @@ def train_nep_sharded(
                 if t_mask is not None:
                     sum_t_atoms += int(t_mask.sum().item())
                 max_gn = max(max_gn, gn)
-
-            # Replicate the deliberately small response subset on every
-            # rank. Each rank executes the same complete-group batches, so
-            # DDP reductions remain lock-step and no curve is split across
-            # data shards.
-            if in_stage2 and response_store is not None:
-                for idx in complete_group_batches(
-                        response_store.response_group_ids, batch_size,
-                        seed=run_seed + epoch):
-                    batch = response_store.collate(idx)
-                    result = model(
-                        batch, True, False, False, True, False,
-                        train_backend)
-                    curve_loss = generator_curve_loss(
-                        result["mforces"], batch["mforces"],
-                        batch["spin_tangent"], batch["struct_idx"],
-                        batch["response_group_ids"],
-                        batch["response_coordinates"],
-                        batch["num_structures"])
-                    optimizer.zero_grad(set_to_none=True)
-                    (GENERATOR_CURVE_WEIGHT * curve_loss).backward()
-                    raw_model.apply_spin_curriculum_gradients()
-                    if max_grad_norm > 0:
-                        gn = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_grad_norm).item()
-                    else:
-                        gn = torch.sqrt(sum(
-                            p.grad.norm() ** 2
-                            for p in raw_model.parameters()
-                            if p.grad is not None)).item()
-                    if not np.isfinite(gn):
-                        optimizer.zero_grad(set_to_none=True)
-                        continue
-                    curriculum_rows = \
-                        raw_model.capture_spin_curriculum_rows()
-                    optimizer.step()
-                    raw_model.apply_spin_curriculum_parameter_step(
-                        curriculum_rows)
-                    if swa_model is not None and is_main:
-                        swa_model.update_parameters(raw_model)
-                    max_gn = max(max_gn, gn)
 
             metrics = torch.tensor(
                 [sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
@@ -1615,7 +1622,9 @@ def train_nep_sharded(
                 if in_stage2 and valid_response_store is not None:
                     valid_response_metric = evaluate_generator_curves(
                         valid_response_store, eval_batch_size, raw_model,
-                        train_backend)
+                        train_backend,
+                        normalization_scale=(
+                            response_store.generator_curve_scale))
                     valid_loss += (
                         GENERATOR_CURVE_WEIGHT * valid_response_metric)
             dt = time.time() - t_epoch

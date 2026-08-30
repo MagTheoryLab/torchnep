@@ -25,7 +25,9 @@ import torch
 GENERATOR_CURVE_WEIGHT = 0.3
 GENERATOR_CURVE_HUBER_DELTA = 1.0
 GENERATOR_CURVE_MEAN_WEIGHT = 0.25
-GENERATOR_CURVE_SCHEMA = "mean-plus-centered-mforce-generator-v2"
+GENERATOR_CURVE_SCALE_FLOOR = 1.0e-6
+GENERATOR_CURVE_SCHEMA = \
+    "neutral-group-balanced-mean-plus-centered-mforce-generator-v3"
 
 
 def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
@@ -127,6 +129,28 @@ def complete_group_batches(
     return batches
 
 
+def normalized_group_batches(
+    group_ids: Sequence[int], batch_size: int, seed: int = 0
+):
+    """Return complete-group batches and their share of one response update.
+
+    Each response group has weight ``1 / num_groups`` irrespective of the
+    number of scan points it contains.  The returned batch weights sum to one,
+    so accumulating all weighted batch gradients before one optimizer step is
+    invariant to batch packing and to replication of the full group set.
+    """
+    batches = complete_group_batches(group_ids, batch_size, seed)
+    groups = {int(group) for group in group_ids}
+    if not groups:
+        return []
+    normalizer = float(len(groups))
+    weighted = []
+    for indices in batches:
+        batch_groups = {int(group_ids[index]) for index in indices}
+        weighted.append((indices, len(batch_groups) / normalizer))
+    return weighted
+
+
 def _frame_generator(
     mforces: torch.Tensor,
     tangent: torch.Tensor,
@@ -139,6 +163,24 @@ def _frame_generator(
     return value
 
 
+def group_balanced_generator_rms(
+    values: torch.Tensor, group_ids
+) -> torch.Tensor:
+    """RMS with one equal contribution from every complete response group."""
+    groups = torch.as_tensor(
+        group_ids, dtype=torch.long, device=values.device
+    ).reshape(-1)
+    if groups.numel() != values.numel():
+        raise ValueError("group_ids must contain one value per generator value")
+    powers = [
+        values[groups == group].square().mean()
+        for group in torch.unique(groups, sorted=True)
+    ]
+    if not powers:
+        return values.new_zeros(())
+    return torch.stack(powers).mean().sqrt()
+
+
 def generator_curve_loss(
     predicted_mforces: torch.Tensor,
     target_mforces: torch.Tensor,
@@ -149,15 +191,20 @@ def generator_curve_loss(
     num_structures: int,
     huber_delta: float = GENERATOR_CURVE_HUBER_DELTA,
     mean_weight: float = GENERATOR_CURVE_MEAN_WEIGHT,
+    normalization_scale=None,
 ) -> torch.Tensor:
-    """Robust loss on mean plus centered magnetic-force generator curves.
+    """Robust, group-balanced loss on magnetic-force generator curves.
 
     The target and prediction are centered independently within each group,
     isolating the angular shape. A separate group-mean term preserves the
     constant response component without naming or exposing a D-like output.
-    A detached linear-signal/noise estimate downweights inconsistent groups.
-    Normalisation is global across the batch, so a nearly-zero group cannot
-    acquire an arbitrarily large weight.
+    Every group contributes equally, regardless of scan length or whether its
+    physical shape is sine-like, cosine-like, or contains higher harmonics. A
+    single RMS target-generator scale is shared by the centered and mean terms;
+    production training passes the scale of the complete response subset so it
+    is independent of batch packing.
+    ``coordinates`` remains part of the stable call seam, but target values are
+    never regressed against it to manufacture training weights.
     """
     prediction = _frame_generator(
         predicted_mforces, spin_tangent, struct_idx, num_structures
@@ -165,59 +212,58 @@ def generator_curve_loss(
     target = _frame_generator(
         target_mforces, spin_tangent, struct_idx, num_structures
     )
-    centered_prediction = torch.empty_like(prediction)
-    centered_target = torch.empty_like(target)
-    reliability = torch.empty_like(target)
-    mean_prediction = []
-    mean_target = []
+    if group_ids.numel() != prediction.numel():
+        raise ValueError(
+            "response_group_ids must contain one value per structure")
+    if coordinates.numel() != prediction.numel():
+        raise ValueError(
+            "response_coordinates must contain one value per structure")
+
+    shape_losses = []
+    mean_losses = []
+    delta = target.new_tensor(float(huber_delta))
+    absolute_floor = target.new_tensor(GENERATOR_CURVE_SCALE_FLOOR)
+    if normalization_scale is None:
+        global_scale = group_balanced_generator_rms(
+            target.detach(), group_ids
+        )
+    else:
+        global_scale = torch.as_tensor(
+            normalization_scale, dtype=target.dtype, device=target.device
+        ).detach()
+    global_scale = global_scale.clamp_min(absolute_floor)
     for group in torch.unique(group_ids, sorted=True):
         mask = group_ids == group
-        x = coordinates[mask]
-        x = x - x.mean()
         y = target[mask]
         yp = prediction[mask]
-        yc = y - y.mean()
-        mean_target.append(y.mean())
-        mean_prediction.append(yp.mean())
-        centered_target[mask] = yc
-        centered_prediction[mask] = yp - yp.mean()
-        denominator = x.square().sum().clamp_min(torch.finfo(x.dtype).eps)
-        slope = (x * yc).sum() / denominator
-        signal = slope * x
-        noise = yc - signal
-        signal_power = signal.square().mean()
-        noise_power = noise.square().mean()
-        score = signal_power / (
-            signal_power + noise_power + torch.finfo(x.dtype).eps
-        )
-        reliability[mask] = score.detach()
+        y_mean = y.mean()
+        yp_mean = yp.mean()
+        yc = y - y_mean
+        ypc = yp - yp_mean
 
-    scale = centered_target.detach().square().mean().sqrt().clamp_min(
-        64.0 * torch.finfo(target.dtype).eps
-    )
-    residual = (centered_prediction - centered_target) / scale
-    absolute = residual.abs()
-    delta = residual.new_tensor(float(huber_delta))
-    huber = torch.where(
-        absolute <= delta,
-        0.5 * residual.square(),
-        delta * (absolute - 0.5 * delta),
-    )
-    weight = reliability.clamp_min(0.05)
-    shape_loss = (weight * huber).sum() / weight.sum().clamp_min(1.0)
+        # The shared total-generator RMS is neutral to phase/harmonic content
+        # and, unlike a group-mean scale, stays finite for physically important
+        # zero-mean scans.  The absolute floor defines the all-zero-label case.
+        shape_residual = (ypc - yc) / global_scale
+        shape_absolute = shape_residual.abs()
+        shape_losses.append(torch.where(
+            shape_absolute <= delta,
+            0.5 * shape_residual.square(),
+            delta * (shape_absolute - 0.5 * delta),
+        ).mean())
+
+        if mean_weight > 0:
+            mean_residual = (yp_mean - y_mean) / global_scale
+            mean_absolute = mean_residual.abs()
+            mean_losses.append(torch.where(
+                mean_absolute <= delta,
+                0.5 * mean_residual.square(),
+                delta * (mean_absolute - 0.5 * delta),
+            ))
+
+    if not shape_losses:
+        return prediction.sum() * 0.0
+    shape_loss = torch.stack(shape_losses).mean()
     if mean_weight <= 0:
         return shape_loss
-
-    mean_prediction = torch.stack(mean_prediction)
-    mean_target = torch.stack(mean_target)
-    mean_scale = mean_target.detach().square().mean().sqrt().clamp_min(
-        64.0 * torch.finfo(target.dtype).eps
-    )
-    mean_residual = (mean_prediction - mean_target) / mean_scale
-    mean_absolute = mean_residual.abs()
-    mean_huber = torch.where(
-        mean_absolute <= delta,
-        0.5 * mean_residual.square(),
-        delta * (mean_absolute - 0.5 * delta),
-    ).mean()
-    return shape_loss + float(mean_weight) * mean_huber
+    return shape_loss + float(mean_weight) * torch.stack(mean_losses).mean()

@@ -51,10 +51,13 @@ from .spin_schema import resolve_gpumd_qscaler
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
+    GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
     GENERATOR_CURVE_WEIGHT,
     complete_group_batches,
     generator_curve_loss,
+    group_balanced_generator_rms,
+    normalized_group_batches,
     select_generator_curve_frames,
 )
 
@@ -566,6 +569,22 @@ class GPUDataStore:
             and all(self.has_spin_tangent_flag)
             and all(self.has_mforces_flag)
         )
+        self.generator_curve_scale = None
+        if self.has_generator_curves:
+            target_generators = torch.stack([
+                (mforce * tangent).sum()
+                for mforce, tangent in zip(
+                    self.mforces, self.spin_tangent)
+            ])
+            response_group_ids = torch.as_tensor(
+                self.response_group_ids, dtype=torch.long, device=device)
+            self.generator_curve_scale = (
+                group_balanced_generator_rms(
+                    target_generators.detach().to(torch.float64),
+                    response_group_ids,
+                ).clamp_min(GENERATOR_CURVE_SCALE_FLOOR)
+                .to(dtype=dtype)
+            ).detach()
 
     def collate(self, indices: List[int]) -> Dict:
         """Fast GPU-side batch collation. No CPU->GPU transfer."""
@@ -1572,19 +1591,20 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
 
 
 def evaluate_generator_curves(response_store, batch_size, raw_model,
-                              backend):
+                              backend, normalization_scale=None):
     """Evaluate the frozen centered generator-curve objective."""
     if response_store is None:
         return None
     was_training = raw_model.training
     raw_model.eval()
     weighted_sum = 0.0
-    n_frames = 0
+    if normalization_scale is None:
+        normalization_scale = response_store.generator_curve_scale
     try:
         with torch.enable_grad():
-            batches = complete_group_batches(
+            batches = normalized_group_batches(
                 response_store.response_group_ids, batch_size, seed=0)
-            for indices in batches:
+            for indices, batch_weight in batches:
                 batch = response_store.collate(indices)
                 batch["need_mforce"] = True
                 batch["need_tau"] = False
@@ -1596,13 +1616,13 @@ def evaluate_generator_curves(response_store, batch_size, raw_model,
                     batch["spin_tangent"], batch["struct_idx"],
                     batch["response_group_ids"],
                     batch["response_coordinates"],
-                    batch["num_structures"])
-                weighted_sum += value.item() * len(indices)
-                n_frames += len(indices)
+                    batch["num_structures"],
+                    normalization_scale=normalization_scale)
+                weighted_sum += value.item() * batch_weight
     finally:
         if was_training:
             raw_model.train()
-    return weighted_sum / max(n_frames, 1)
+    return weighted_sum
 
 
 def _quiet_compile_logs():
@@ -1973,6 +1993,8 @@ def train_nep(
         _log(f"  generator curves: {len(response_frames)} training frames"
              + (f", {len(valid_response_frames)} validation frames"
                 if valid_frames is not None else ""))
+        _log(f"  generator objective: {GENERATOR_CURVE_SCHEMA}; "
+             "one complete group per ordinary optimizer step")
 
     # Single-GPU: per-epoch shuffle is done at iteration time via
     # torch.randperm(n_structs). We deliberately do NOT pre-sort by natoms
@@ -2304,6 +2326,11 @@ def train_nep(
             GENERATOR_CURVE_HUBER_DELTA if response_enabled else 0.0),
         "generator_curve_mean_weight": (
             GENERATOR_CURVE_MEAN_WEIGHT if response_enabled else 0.0),
+        "generator_curve_scale_floor": (
+            GENERATOR_CURVE_SCALE_FLOOR if response_enabled else 0.0),
+        "generator_curve_normalization_scale": (
+            float(response_store.generator_curve_scale.item())
+            if response_enabled else 0.0),
     }
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
@@ -2629,6 +2656,17 @@ def train_nep(
                 raw_model.spin_descriptor is not None
                 and data_store.has_tau and cur_pref_tau > 0)
 
+            # Pair one complete response group with each ordinary optimizer
+            # step.  This optimizes L_ordinary + lambda_R L_response in one
+            # backward pass instead of changing the effective number of
+            # optimizer steps according to the number of response groups.
+            response_batches = (
+                complete_group_batches(
+                    response_store.response_group_ids, 1,
+                    seed=run_seed + epoch)
+                if in_stage2 and response_store is not None else []
+            )
+
             for start in range(0, n_structs, batch_size):
                 idx = perm[start:start + batch_size]
                 batch = data_store.collate(idx)
@@ -2731,6 +2769,28 @@ def train_nep(
                             (t_pred - t_ref) ** 2
                         ).mean().item() * t_mask.sum().item()
 
+                if response_batches:
+                    response_idx = response_batches[
+                        (start // batch_size) % len(response_batches)]
+                    response_batch = response_store.collate(response_idx)
+                    response_batch["need_mforce"] = True
+                    response_batch["need_tau"] = False
+                    response_result = compute_props_cached(
+                        response_batch, need_forces=False,
+                        need_virial=False, backend=train_backend,
+                        create_graph=True)
+                    curve_loss = generator_curve_loss(
+                        response_result["mforces"],
+                        response_batch["mforces"],
+                        response_batch["spin_tangent"],
+                        response_batch["struct_idx"],
+                        response_batch["response_group_ids"],
+                        response_batch["response_coordinates"],
+                        response_batch["num_structures"],
+                        normalization_scale=(
+                            response_store.generator_curve_scale))
+                    loss = loss + GENERATOR_CURVE_WEIGHT * curve_loss
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
@@ -2794,47 +2854,6 @@ def train_nep(
                     sum_t_atoms += int(t_mask.sum().item())
                 max_gn = max(max_gn, gn)
 
-            # Response-only Stage-2 steps.  They use complete rotation scans
-            # and derivatives of the same scalar ANN energy; no J/D output or
-            # auxiliary prediction head is introduced.
-            if in_stage2 and response_store is not None:
-                for idx in complete_group_batches(
-                        response_store.response_group_ids, batch_size,
-                        seed=run_seed + epoch):
-                    batch = response_store.collate(idx)
-                    batch["need_mforce"] = True
-                    batch["need_tau"] = False
-                    result = compute_props_cached(
-                        batch, need_forces=False, need_virial=False,
-                        backend=train_backend, create_graph=True)
-                    curve_loss = generator_curve_loss(
-                        result["mforces"], batch["mforces"],
-                        batch["spin_tangent"], batch["struct_idx"],
-                        batch["response_group_ids"],
-                        batch["response_coordinates"],
-                        batch["num_structures"])
-                    optimizer.zero_grad(set_to_none=True)
-                    (GENERATOR_CURVE_WEIGHT * curve_loss).backward()
-                    raw_model.apply_spin_curriculum_gradients()
-                    if max_grad_norm > 0:
-                        gn = torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_grad_norm).item()
-                    else:
-                        gn = torch.sqrt(sum(
-                            p.grad.norm() ** 2
-                            for p in raw_model.parameters()
-                            if p.grad is not None)).item()
-                    if not np.isfinite(gn):
-                        optimizer.zero_grad(set_to_none=True)
-                        continue
-                    curriculum_rows = \
-                        raw_model.capture_spin_curriculum_rows()
-                    optimizer.step()
-                    raw_model.apply_spin_curriculum_parameter_step(
-                        curriculum_rows)
-                    if swa_model is not None:
-                        swa_model.update_parameters(raw_model)
-                    max_gn = max(max_gn, gn)
 
             # Analytical b1 (GPUMD-style), folded into the training pass: b1
             # absorbs this epoch's mean per-atom energy residual. Updated AFTER
@@ -2905,7 +2924,9 @@ def train_nep(
                 if in_stage2 and valid_response_store is not None:
                     valid_response_metric = evaluate_generator_curves(
                         valid_response_store, eval_batch_size, raw_model,
-                        train_backend)
+                        train_backend,
+                        normalization_scale=(
+                            response_store.generator_curve_scale))
                     valid_loss += (
                         GENERATOR_CURVE_WEIGHT * valid_response_metric)
             dt = time.time() - t_epoch
