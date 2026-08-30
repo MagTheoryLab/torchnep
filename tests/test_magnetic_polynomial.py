@@ -73,11 +73,12 @@ def test_descriptor_has_only_the_ops_internal_dependency():
     assert relative == [(None, ("ops",))]
 
 
-def test_orders_are_literal_prefixes():
+@pytest.mark.parametrize("compress", (1, 2, 3))
+def test_orders_are_literal_prefixes(compress):
     environment = _environment()
     descriptors = [
         MagneticPolynomialDescriptor(
-            spin_compress=3,
+            spin_compress=compress,
             spin_l_max=2,
             spin_order=order,
             spin_soc=True,
@@ -91,6 +92,88 @@ def test_orders_are_literal_prefixes():
     assert all(
         token.order <= descriptors[-1].spin_order
         for token in descriptors[-1].channel_grammar
+    )
+
+
+def test_rank_one_prunes_contractions_that_require_independent_radial_legs():
+    minimum_rank = {
+        "coupling_l11_axial": 2,
+        "coupling_l22_axial": 2,
+        "coupling_l11_dot_response": 2,
+        "coupling_l22_dot_response": 2,
+        "coupling_l112_edge_response": 2,
+        "coupling_l111_bulk": 3,
+    }
+    rank_three = MagneticPolynomialDescriptor(
+        spin_compress=3,
+        spin_l_max=2,
+        spin_order=3,
+        spin_soc=True,
+    )
+    metadata = {
+        token.name: token.minimum_radial_rank
+        for token in rank_three.channel_grammar
+    }
+    assert {
+        name: metadata[name] for name in minimum_rank
+    } == minimum_rank
+
+    rank_one = MagneticPolynomialDescriptor(
+        spin_compress=1,
+        spin_l_max=2,
+        spin_order=3,
+        spin_soc=True,
+    ).to(dtype=DTYPE)
+    names = {token.name for token in rank_one.channel_grammar}
+    assert names.isdisjoint(minimum_rank)
+    assert all(
+        token.minimum_radial_rank <= rank_one.spin_compress
+        for token in rank_one.channel_grammar
+    )
+    assert rank_one.order_dims == {1: 5, 2: 16, 3: 19}
+
+    result = _evaluate(rank_one, _environment(n_atoms=8, seed=29))
+    for name, block in rank_one.split_by_token(result).items():
+        assert block.abs().max() > 1.0e-10, name
+
+
+def test_rank_two_retains_exact_production_dimensions():
+    order2 = MagneticPolynomialDescriptor(
+        spin_compress=2,
+        spin_l_max=2,
+        spin_order=2,
+        spin_soc=True,
+    )
+    order3 = MagneticPolynomialDescriptor(
+        spin_compress=2,
+        spin_l_max=2,
+        spin_order=3,
+        spin_soc=True,
+    )
+    assert order2.dim == 37
+    assert order3.dim == 49
+    assert order3.channel_grammar[: len(order2.channel_grammar)] == (
+        order2.channel_grammar
+    )
+
+
+def test_rank_three_retains_exact_production_dimensions():
+    order2 = MagneticPolynomialDescriptor(
+        spin_compress=3,
+        spin_l_max=2,
+        spin_order=2,
+        spin_soc=True,
+    )
+    order3 = MagneticPolynomialDescriptor(
+        spin_compress=3,
+        spin_l_max=2,
+        spin_order=3,
+        spin_soc=True,
+    )
+    assert order2.dim == 58
+    assert order3.dim == 79
+    assert order3.channel_grammar[: len(order2.channel_grammar)] == (
+        order2.channel_grammar
     )
 
 

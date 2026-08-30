@@ -14,14 +14,16 @@
 """Order/compression (O/C) descriptor for local magnetic states.
 
 The implementation builds a shared bank of irreducible edge densities and
-contracts that bank through an order-nested grammar.  spin_order controls the
-correlation order O and spin_compress controls the shared radial rank C.  The
-same interface is used by training, inference, serialization and future
-generated CUDA implementations.
+contracts that bank through an order-nested grammar.  ``spin_order`` controls
+the maximum nested primitive-contraction level O and ``spin_compress`` controls
+the shared radial rank C.  O is a hierarchy of explicitly supplied primitive
+invariants, not the body order of the final energy: a nonlinear ANN may combine
+descriptor coordinates across levels.  The same interface is used by training,
+inference, serialization and future generated CUDA implementations.
 
 The descriptor is a symmetry-respecting local approximation to a DFT energy
 surface.  It is not a fixed spin Hamiltonian and it does not claim exact DFT
-equivalence at finite cutoff, radial rank, angular rank or correlation order.
+equivalence at finite cutoff, radial rank, angular rank or contraction level.
 """
 
 from __future__ import annotations
@@ -36,7 +38,13 @@ from . import ops
 
 @dataclass(frozen=True)
 class MagneticPolynomialChannel:
-    """Metadata for one generated scalar contraction family."""
+    """Metadata for one generated scalar contraction family.
+
+    ``minimum_radial_rank`` is the algebraic lower bound needed to keep the
+    contraction from vanishing solely because nominally independent legs
+    collapse onto the same rank-one projection.  Tokens above the configured
+    C are removed from both the schema and the forward computation.
+    """
 
     name: str
     group: str
@@ -46,6 +54,7 @@ class MagneticPolynomialChannel:
     geometry_rank: int
     spin_degree: int
     topology: str
+    minimum_radial_rank: int = 1
     inversion_parity: int = 1
     time_reversal_parity: int = 1
 
@@ -120,10 +129,11 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
     ``spin_l_max``
         Maximum geometry-spin irreducible rank (currently 0, 1 or 2).
     ``spin_order``
-        Maximum local correlation level.  Order 1 contains local/direct-edge
-        response, order 2 adds two-density and environment response, and order
-        3 adds triple-density and dot-gated response.  Lower orders are literal
-        output prefixes of higher orders.
+        Maximum nested primitive-contraction level.  Order 1 contains
+        local/direct-edge response, order 2 adds two-density and environment
+        response, and order 3 adds triple-density and dot-gated response.
+        Lower orders are literal output prefixes of higher orders at fixed C.
+        This is not a body-order label for the final nonlinear ANN energy.
     ``spin_soc``
         If false, space and spin may rotate independently.  If true, joint
         O(3) contractions with even inversion and time-reversal parity are
@@ -196,6 +206,9 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
 
         self.channel_grammar = self._build_channel_grammar()
         self.schema = self.channel_grammar
+        self._channel_names = frozenset(
+            channel.name for channel in self.channel_grammar
+        )
         self.dim = self.channel_grammar[-1].stop
         self.order_dims = {
             order: max(
@@ -218,8 +231,13 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             geometry_rank,
             spin_degree,
             topology,
+            minimum_radial_rank=1,
         ):
             nonlocal position
+            if minimum_radial_rank < 1:
+                raise ValueError("minimum_radial_rank must be >= 1")
+            if self.spin_compress < minimum_radial_rank:
+                return
             channels.append(
                 MagneticPolynomialChannel(
                     name=name,
@@ -230,6 +248,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     geometry_rank=geometry_rank,
                     spin_degree=spin_degree,
                     topology=topology,
+                    minimum_radial_rank=minimum_radial_rank,
                 )
             )
             position += width
@@ -349,6 +368,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     1,
                     2,
                     "density_response",
+                    minimum_radial_rank=2,
                 )
                 add(
                     "edge_l11_axial",
@@ -368,6 +388,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     2,
                     2,
                     "density_response",
+                    minimum_radial_rank=2,
                 )
                 add(
                     "edge_l22_axial",
@@ -398,6 +419,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     1,
                     4,
                     "density_response",
+                    minimum_radial_rank=2,
                 )
                 add(
                     "coupling_l111_p_m_x",
@@ -417,6 +439,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     2,
                     4,
                     "density_response",
+                    minimum_radial_rank=2,
                 )
                 add(
                     "coupling_l111_p_qs_x",
@@ -435,12 +458,9 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     2,
                     2,
                     "edge_anchored_triple_density",
+                    minimum_radial_rank=2,
                 )
-            if (
-                self.spin_soc
-                and self.spin_l_max >= 1
-                and self.spin_compress >= 3
-            ):
+            if self.spin_soc and self.spin_l_max >= 1:
                 add(
                     "coupling_l111_bulk",
                     "order3_joint_soc",
@@ -449,6 +469,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     1,
                     2,
                     "edge_anchored_triple_density",
+                    minimum_radial_rank=3,
                 )
         return tuple(channels)
 
@@ -783,12 +804,13 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 polar_left = self._project(density["polar"], 0)
                 polar_right = self._project(density["polar"], 1)
                 omega_response = self._project(density["omega"], 0)
-                blocks.append(
-                    self._inner(
-                        torch.cross(polar_left, polar_right, dim=-1),
-                        omega_response,
+                if "coupling_l11_axial" in self._channel_names:
+                    blocks.append(
+                        self._inner(
+                            torch.cross(polar_left, polar_right, dim=-1),
+                            omega_response,
+                        )
                     )
-                )
                 polar_i = polar_left.index_select(0, pair_i)
                 edge_axis = torch.cross(
                     polar_i, rhat.unsqueeze(1), dim=-1
@@ -806,9 +828,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             if self.spin_soc and self.spin_l_max >= 2:
                 q_left = self._project(density["geometry_l2"], 0)
                 q_right = self._project(density["geometry_l2"], 1)
-                q_axis = self._commutator_axial(q_left, q_right)
                 omega_response = self._project(density["omega"], 0)
-                blocks.append(self._inner(q_axis, omega_response))
+                if "coupling_l22_axial" in self._channel_names:
+                    q_axis = self._commutator_axial(q_left, q_right)
+                    blocks.append(self._inner(q_axis, omega_response))
                 q_i = _stf5_to_matrix(q_left).index_select(0, pair_i)
                 q_on_r = torch.matmul(
                     q_i, rhat[:, None, :, None]
@@ -841,12 +864,13 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 polar_left = self._project(density["polar"], 0)
                 polar_right = self._project(density["polar"], 1)
                 dot_response = self._project(density["dot_omega"], 0)
-                blocks.append(
-                    self._inner(
-                        torch.cross(polar_left, polar_right, dim=-1),
-                        dot_response,
+                if "coupling_l11_dot_response" in self._channel_names:
+                    blocks.append(
+                        self._inner(
+                            torch.cross(polar_left, polar_right, dim=-1),
+                            dot_response,
+                        )
                     )
-                )
                 p0 = polar_left
                 m1 = self._project(density["spin"], 1)
                 x2 = self._project(density["l1_axial"], 2)
@@ -856,9 +880,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             if self.spin_soc and self.spin_l_max >= 2:
                 q_left = self._project(density["geometry_l2"], 0)
                 q_right = self._project(density["geometry_l2"], 1)
-                q_axis = self._commutator_axial(q_left, q_right)
                 dot_response = self._project(density["dot_omega"], 0)
-                blocks.append(self._inner(q_axis, dot_response))
+                if "coupling_l22_dot_response" in self._channel_names:
+                    q_axis = self._commutator_axial(q_left, q_right)
+                    blocks.append(self._inner(q_axis, dot_response))
                 p0 = self._project(density["polar"], 0)
                 qs1 = self._project(density["l2_on_spin"], 1)
                 x2 = self._project(density["l1_axial"], 2)
@@ -873,23 +898,20 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 mixed_chirality = self._inner(
                     p0, torch.cross(p1, q_on_p1, dim=-1)
                 )
-                edge_weight = self._project_weights(weights, 0)
-                edge_response = (rhat * omega).sum(-1, keepdim=True)
-                blocks.append(
-                    _index_sum(
-                        spins,
-                        pair_i,
-                        edge_weight
-                        * mixed_chirality.index_select(0, pair_i)
-                        * edge_response,
-                        N,
+                if "coupling_l112_edge_response" in self._channel_names:
+                    edge_weight = self._project_weights(weights, 0)
+                    edge_response = (rhat * omega).sum(-1, keepdim=True)
+                    blocks.append(
+                        _index_sum(
+                            spins,
+                            pair_i,
+                            edge_weight
+                            * mixed_chirality.index_select(0, pair_i)
+                            * edge_response,
+                            N,
+                        )
                     )
-                )
-            if (
-                self.spin_soc
-                and self.spin_l_max >= 1
-                and self.spin_compress >= 3
-            ):
+            if "coupling_l111_bulk" in self._channel_names:
                 p0 = self._project(density["polar"], 0)
                 p1 = self._project(density["polar"], 1)
                 p2 = self._project(density["polar"], 2)
