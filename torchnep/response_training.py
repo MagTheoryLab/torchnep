@@ -64,8 +64,10 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
         groups[group] = []
         for index, frame in indexed_members:
             missing = [
-                key for key in ("response_coordinate", "mforces")
-                if key not in frame
+                key for key in (
+                    "response_coordinate", "mforces", "spins", "species",
+                    "positions", "cell",
+                ) if key not in frame
             ]
             if missing:
                 raise ValueError(
@@ -79,11 +81,62 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
                 raise ValueError(
                     "rotation response_coordinate must be numeric, got "
                     f"{coordinate!r} at frame {index}")
+            if not np.isfinite(float(coordinate)):
+                raise ValueError(
+                    "rotation response_coordinate must be finite, got "
+                    f"{coordinate!r} at frame {index}")
             tangent = np.asarray(frame["spin_tangent"])
             if tangent.shape != (frame["natoms"], 3):
                 raise ValueError(
                     f"spin_tangent at frame {index} must have shape "
                     f"({frame['natoms']}, 3), got {tangent.shape}")
+            mforces = np.asarray(frame["mforces"])
+            if mforces.shape != (frame["natoms"], 3):
+                raise ValueError(
+                    f"mforces at frame {index} must have shape "
+                    f"({frame['natoms']}, 3), got {mforces.shape}")
+            if not np.isfinite(tangent).all():
+                raise ValueError(
+                    f"spin_tangent at frame {index} contains NaN or Inf")
+            if not np.isfinite(mforces).all():
+                raise ValueError(
+                    f"mforces at frame {index} contains NaN or Inf")
+            spins = np.asarray(frame["spins"])
+            positions = np.asarray(frame["positions"])
+            cell = np.asarray(frame["cell"])
+            if spins.shape != (frame["natoms"], 3):
+                raise ValueError(
+                    f"spins at frame {index} must have shape "
+                    f"({frame['natoms']}, 3), got {spins.shape}")
+            if positions.shape != (frame["natoms"], 3):
+                raise ValueError(
+                    f"positions at frame {index} must have shape "
+                    f"({frame['natoms']}, 3), got {positions.shape}")
+            if cell.shape != (3, 3):
+                raise ValueError(
+                    f"cell at frame {index} must have shape (3, 3), "
+                    f"got {cell.shape}")
+            if len(frame["species"]) != frame["natoms"]:
+                raise ValueError(
+                    f"species at frame {index} must contain natoms entries")
+            if not np.isfinite(spins).all() or \
+                    not np.isfinite(positions).all() or \
+                    not np.isfinite(cell).all():
+                raise ValueError(
+                    f"rotation response frame {index} has nonfinite "
+                    "spin or geometry values")
+            spin_norm = np.linalg.norm(spins, axis=1)
+            tangent_norm = np.linalg.norm(tangent, axis=1)
+            dot = np.einsum("ij,ij->i", spins, tangent)
+            tolerance = 1.0e-7 * np.maximum(
+                spin_norm * tangent_norm, 1.0)
+            if np.any(np.abs(dot) > tolerance):
+                raise ValueError(
+                    f"spin_tangent at frame {index} is not orthogonal to "
+                    "the fixed-magnitude rotation spin")
+            if np.any((spin_norm < 1.0e-12) & (tangent_norm > 1.0e-12)):
+                raise ValueError(
+                    f"spin_tangent at frame {index} rotates a zero spin")
             groups[group].append(frame)
 
     selected = []
@@ -99,6 +152,45 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
                 f"rotation response_group {group!r} needs at least three "
                 "distinct response_coordinate values"
             )
+        reference = members[0]
+        reference_positions = np.asarray(reference["positions"])
+        reference_cell = np.asarray(reference["cell"])
+        reference_magnitudes = np.linalg.norm(
+            np.asarray(reference["spins"]), axis=1)
+        for frame in members[1:]:
+            if frame["natoms"] != reference["natoms"] or \
+                    tuple(frame["species"]) != tuple(reference["species"]):
+                raise ValueError(
+                    f"rotation response_group {group!r} changes atom count, "
+                    "species, or atom order")
+            if not np.allclose(
+                    frame["positions"], reference_positions,
+                    rtol=0.0, atol=1.0e-10) or not np.allclose(
+                    frame["cell"], reference_cell,
+                    rtol=0.0, atol=1.0e-10):
+                raise ValueError(
+                    f"rotation response_group {group!r} changes geometry; "
+                    "put each strained geometry in a separate group")
+            if not np.allclose(
+                    np.linalg.norm(frame["spins"], axis=1),
+                    reference_magnitudes, rtol=1.0e-8, atol=1.0e-10):
+                raise ValueError(
+                    f"rotation response_group {group!r} changes spin "
+                    "magnitudes")
+        if all(np.allclose(
+                frame["spins"], reference["spins"],
+                rtol=0.0, atol=1.0e-12) for frame in members[1:]):
+            raise ValueError(
+                f"rotation response_group {group!r} contains no spin "
+                "rotation across coordinates")
+        tangent_power = sum(
+            float(np.square(np.asarray(frame["spin_tangent"])).sum())
+            for frame in members
+        )
+        if tangent_power == 0.0:
+            raise ValueError(
+                f"rotation response_group {group!r} has an all-zero "
+                "spin_tangent generator")
         selected.extend(members)
     return selected
 

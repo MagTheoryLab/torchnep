@@ -258,16 +258,22 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
     # strain points.  The descriptor never consumes them; trainers use the
     # group id only to prevent validation leakage, while response evaluators
     # may use the remaining labels.
-    for key in ("response_group", "response_probe", "response_branch"):
+    for key in (
+        "response_group", "response_probe", "response_branch",
+        "response_family", "response_stat_family",
+    ):
         value = _find_scalar(comment, key)
         if value is not None:
             frame[key] = value
-    coordinate = _find_scalar(comment, "response_coordinate")
-    if coordinate is not None:
-        try:
-            frame["response_coordinate"] = float(coordinate)
-        except ValueError:
-            frame["response_coordinate"] = coordinate
+    if "response_family" in frame and "response_stat_family" not in frame:
+        frame["response_stat_family"] = frame["response_family"]
+    for key in ("response_coordinate", "response_path_coordinate"):
+        coordinate = _find_scalar(comment, key)
+        if coordinate is not None:
+            try:
+                frame[key] = float(coordinate)
+            except ValueError:
+                frame[key] = coordinate
 
     return frame
 

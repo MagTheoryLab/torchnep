@@ -61,6 +61,23 @@ def _config(curriculum=True):
     }
 
 
+def _rotation_frame(coordinate, group="g"):
+    spin = np.array([[np.cos(coordinate), np.sin(coordinate), 0.0]])
+    tangent = np.array([[-np.sin(coordinate), np.cos(coordinate), 0.0]])
+    return {
+        "natoms": 1,
+        "species": ["Fe"],
+        "positions": np.array([[1.0, 1.0, 1.0]]),
+        "cell": np.diag([6.0, 6.0, 6.0]),
+        "spins": spin,
+        "response_group": group,
+        "response_probe": "rotation",
+        "response_coordinate": coordinate,
+        "mforces": np.zeros((1, 3)),
+        "spin_tangent": tangent,
+    }
+
+
 def test_svd_health_separates_constant_and_rank_deficient_columns():
     x = np.linspace(-1.0, 1.0, 41)
     full = np.column_stack((x, x * x, np.sin(2.3 * x), np.ones_like(x)))
@@ -222,7 +239,8 @@ def test_response_metadata_and_spin_targets_round_trip_from_extxyz(tmp_path):
         "1\n"
         'Lattice="6 0 0 0 6 0 0 0 6" energy=-2 '
         "response_group=cell0 response_probe=rotation "
-        "response_coordinate=0.01 response_branch=plus "
+        "response_coordinate=0.01 response_branch=strain "
+        "response_family=parent0 response_path_coordinate=-0.02 "
         "Properties=species:S:1:pos:R:3:spin:R:3:mforce:R:3:"
         "spin_tangent:R:3\n"
         "Fe 0 0 0 0 0 2 0.1 0.2 0.3 0 1 0\n"
@@ -231,7 +249,10 @@ def test_response_metadata_and_spin_targets_round_trip_from_extxyz(tmp_path):
     assert frame["response_group"] == "cell0"
     assert frame["response_probe"] == "rotation"
     assert frame["response_coordinate"] == 0.01
-    assert frame["response_branch"] == "plus"
+    assert frame["response_branch"] == "strain"
+    assert frame["response_family"] == "parent0"
+    assert frame["response_stat_family"] == "parent0"
+    assert frame["response_path_coordinate"] == -0.02
     np.testing.assert_allclose(frame["spins"], [[0.0, 0.0, 2.0]])
     np.testing.assert_allclose(frame["mforces"], [[0.1, 0.2, 0.3]])
     np.testing.assert_allclose(frame["spin_tangent"], [[0.0, 1.0, 0.0]])
@@ -242,14 +263,7 @@ def test_generator_curve_selection_and_complete_group_batches():
     frames = []
     for group in ("b", "a"):
         for coordinate in (0.1, -0.1, 0.0):
-            frames.append({
-                "natoms": 1,
-                "response_group": group,
-                "response_probe": "rotation",
-                "response_coordinate": coordinate,
-                "mforces": np.zeros((1, 3)),
-                "spin_tangent": np.ones((1, 3)),
-            })
+            frames.append(_rotation_frame(coordinate, group))
     selected = select_generator_curve_frames(frames)
     assert [frame["response_group"] for frame in selected] == \
         ["a", "a", "a", "b", "b", "b"]
@@ -299,14 +313,8 @@ def test_generator_curve_mean_term_preserves_constant_response():
 
 
 def test_rotation_curve_requires_three_distinct_coordinates():
-    frames = [{
-        "natoms": 1,
-        "response_group": "g",
-        "response_probe": "rotation",
-        "response_coordinate": coordinate,
-        "mforces": np.zeros((1, 3)),
-        "spin_tangent": np.zeros((1, 3)),
-    } for coordinate in (0.0, 0.0, 0.1)]
+    frames = [_rotation_frame(coordinate)
+              for coordinate in (0.0, 0.0, 0.1)]
     with pytest.raises(ValueError, match="three distinct"):
         select_generator_curve_frames(frames)
 
@@ -322,15 +330,47 @@ def test_rotation_metadata_without_tangent_remains_evaluation_only():
 
 
 def test_rotation_curve_rejects_partially_declared_tangents():
-    frames = [{
-        "natoms": 1,
-        "response_group": "g",
-        "response_probe": "rotation",
-        "response_coordinate": coordinate,
-        "mforces": np.zeros((1, 3)),
-        **({"spin_tangent": np.zeros((1, 3))} if index else {}),
-    } for index, coordinate in enumerate((-0.1, 0.0, 0.1))]
+    frames = [_rotation_frame(coordinate)
+              for coordinate in (-0.1, 0.0, 0.1)]
+    frames[0].pop("spin_tangent")
     with pytest.raises(ValueError, match="only part"):
+        select_generator_curve_frames(frames)
+
+
+@pytest.mark.parametrize("field", ("response_coordinate", "spin_tangent", "mforces"))
+def test_rotation_curve_rejects_nonfinite_generator_inputs(field):
+    frames = [_rotation_frame(coordinate)
+              for coordinate in (-0.1, 0.0, 0.1)]
+    if field == "response_coordinate":
+        frames[1][field] = np.nan
+    else:
+        frames[1][field][0, 0] = np.inf
+    with pytest.raises(ValueError, match="finite|NaN or Inf"):
+        select_generator_curve_frames(frames)
+
+
+def test_rotation_curve_rejects_an_all_zero_generator():
+    frames = [_rotation_frame(coordinate)
+              for coordinate in (-0.1, 0.0, 0.1)]
+    for frame in frames:
+        frame["spin_tangent"].fill(0.0)
+    with pytest.raises(ValueError, match="all-zero"):
+        select_generator_curve_frames(frames)
+
+
+def test_rotation_curve_rejects_mixed_parent_geometry():
+    frames = [_rotation_frame(coordinate)
+              for coordinate in (-0.1, 0.0, 0.1)]
+    frames[1]["positions"][0, 0] += 0.01
+    with pytest.raises(ValueError, match="changes geometry"):
+        select_generator_curve_frames(frames)
+
+
+def test_rotation_curve_rejects_longitudinal_tangent():
+    frames = [_rotation_frame(coordinate)
+              for coordinate in (-0.1, 0.0, 0.1)]
+    frames[1]["spin_tangent"] = frames[1]["spins"].copy()
+    with pytest.raises(ValueError, match="not orthogonal"):
         select_generator_curve_frames(frames)
 
 
