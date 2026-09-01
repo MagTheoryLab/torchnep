@@ -2272,7 +2272,7 @@ def train_nep(
         os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
         os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
         os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
-        _log("  O3-C2 CUDA train graph: enabled "
+        _log("  O/C CUDA train graph: enabled "
              "(Torch reference, bounded exact-ragged-shape LRU)")
     else:
         oc_graph_enabled = False
@@ -2281,7 +2281,7 @@ def train_nep(
                 oc_graph_reason or
                 "the graph cache requires autograd response training"
             )
-            _log(f"  O3-C2 CUDA train graph: disabled — {reason}")
+            _log(f"  O/C CUDA train graph: disabled — {reason}")
 
     # weight_decay stays 0: L2 is applied explicitly in the loss as GPUMD's
     # λ₂·RMS(w) (see the reg block below), NOT as Adam's decoupled decay —

@@ -1,4 +1,4 @@
-"""Matched V100 A/B for the bounded O3-C2 CUDA training graph cache."""
+"""Matched V100 A/B for the bounded generic O/C CUDA training graph cache."""
 
 from __future__ import annotations
 
@@ -113,6 +113,11 @@ def main():
     parser.add_argument("--center", action="store_true")
     parser.add_argument("--struct-center", action="store_true")
     parser.add_argument("--compile-tail", action="store_true")
+    parser.add_argument("--order", type=int, default=3)
+    parser.add_argument("--compress", type=int, default=2)
+    parser.add_argument("--spin-l", type=int, default=2)
+    parser.add_argument("--soc", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--spin-basis", type=int, default=8)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
@@ -129,7 +134,16 @@ def main():
     )
     os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
     torch.manual_seed(19)
-    base = NEPModel(config()).cuda().train()
+    model_config = config()
+    model_config.update({
+        "spin_order": args.order,
+        "spin_compress": args.compress,
+        "spin_l_max": [args.spin_l, 0, 0],
+        "spin_soc": args.soc,
+        "spin_basis_size": [args.spin_basis, 0],
+        "spin_curriculum": False,
+    })
+    base = NEPModel(model_config).cuda().train()
     batches = {
         n_atoms: training_batch(n_atoms, 16, 1000 + n_atoms)
         for n_atoms in (32, 108, 256)
@@ -209,6 +223,12 @@ def main():
         "analytic_center": args.center,
         "analytic_struct_center": args.struct_center,
         "compiled_loss_tail": args.compile_tail,
+        "spin_config": {
+            "order": args.order, "compress": args.compress,
+            "l_max": args.spin_l, "soc": args.soc,
+            "basis_size": args.spin_basis,
+            "descriptor_dim": base.spin_dim,
+        },
         "results": results,
         "trace": {
             "eager_ms": eager_trace, "graph_cold_amortized_ms": graph_trace,

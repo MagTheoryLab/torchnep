@@ -1,4 +1,5 @@
 import copy
+import itertools
 import os
 
 import pytest
@@ -9,28 +10,37 @@ from torchnep.model import NEPModel
 from torchnep.oc_cuda_graph import OCCudaGraphTrainCache, _joint_loss_metrics
 
 
-def _config():
+def _config(*, order=3, compress=2, spin_l=2, soc=1, spin_basis=8,
+            l_max=None, n_max=(4, 4), basis_size=(8, 8), neuron=30,
+            cutoffs=(6.0, 5.0), spin_cutoff=6.0,
+            dof_types=None, env_types=None):
+    if l_max is None:
+        l_max = [4, 2, 0]
     return {
         "num_types": 3,
         "type_names": ["Fe", "Ge", "Ni"],
-        "cutoff_radial": 6.0,
-        "cutoff_angular": 5.0,
-        "n_max_radial": 4,
-        "n_max_angular": 4,
-        "basis_size_radial": 8,
-        "basis_size_angular": 8,
-        "l_max": [4, 2, 0],
-        "neuron": 30,
+        "cutoff_radial": cutoffs[0],
+        "cutoff_angular": cutoffs[1],
+        "n_max_radial": n_max[0],
+        "n_max_angular": n_max[1],
+        "basis_size_radial": basis_size[0],
+        "basis_size_angular": basis_size[1],
+        "l_max": l_max,
+        "neuron": neuron,
         "spin_mode": 2,
-        "spin_cutoff": [6.0, 6.0],
-        "spin_l_max": [2, 0, 0],
-        "spin_compress": 2,
-        "spin_basis_size": [8, 0],
-        "spin_order": 3,
-        "spin_soc": 1,
+        "spin_cutoff": [spin_cutoff, spin_cutoff],
+        "spin_l_max": [spin_l, 0, 0],
+        "spin_compress": compress,
+        "spin_basis_size": [spin_basis, 0],
+        "spin_order": order,
+        "spin_soc": soc,
         "spin_curriculum": False,
-        "spin_dof_type": ["Fe", "Ge", "Ni"],
-        "spin_env_type": ["Fe", "Ge", "Ni"],
+        "spin_dof_type": (
+            ["Fe", "Ge", "Ni"] if dof_types is None else dof_types
+        ),
+        "spin_env_type": (
+            ["Fe", "Ge", "Ni"] if env_types is None else env_types
+        ),
     }
 
 
@@ -150,6 +160,135 @@ def test_o3c2_graph_step_matches_fused_eager_adam(monkeypatch, compile_tail):
     assert actual.found_inf.item() == 0.0
 
 
+_OC_MATRIX = list(itertools.product((1, 2, 3), (1, 2, 3, 5, 9), (0, 1, 2),
+                                    (0, 1)))
+
+
+def _assert_general_graph_joint_step(
+    monkeypatch, config, seed, *, struct_center=False
+):
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_TRAIN_GRAPH_CACHE", "1")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_FULL", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_TRAIN", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_BANK", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_CENTER", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_STRUCT_CENTER", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_COMPILE_TAIL", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_GRAPH", "1")
+    torch.manual_seed(seed)
+    reference = NEPModel(config).cuda().train()
+    captured = copy.deepcopy(reference)
+    reference_optimizer = _optimizer(reference)
+    graph_optimizer = _optimizer(captured)
+    batch = _batch(6, neighbors=2, seed=3100)
+    weights = (1.0, 0.7, 0.2, 0.5, 0.3)
+
+    reference_optimizer.zero_grad(set_to_none=False)
+    reference_loss, _ = _joint_loss_metrics(
+        reference, batch, torch.tensor(weights, device="cuda"),
+        True, True, True, True, "bmm",
+    )
+    reference_loss.backward()
+    reference_optimizer.step()
+
+    monkeypatch.setenv(
+        "TORCHNEP_OC_CUDA_STRUCT_CENTER", "1" if struct_center else "0"
+    )
+    cache = OCCudaGraphTrainCache(
+        captured, graph_optimizer, backend="bmm", warmup=1
+    )
+    actual = cache.step(
+        batch, weights=weights, l1_coeff=0.0, l2_coeff=0.0,
+        max_grad_norm=0.0, curriculum_scale=1.0,
+        need_forces=True, need_virial=True, need_mforce=True, need_tau=True,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual.loss, reference_loss, rtol=3e-5, atol=3e-6)
+    worst_abs = (0.0, "")
+    worst_rel = (0.0, "")
+    for (name, left), right in zip(
+        captured.named_parameters(), reference.parameters()
+    ):
+        delta = (left - right).abs()
+        max_abs = delta.max().item()
+        max_rel = (delta / right.abs().clamp_min(1.0e-12)).max().item()
+        if max_abs > worst_abs[0]:
+            worst_abs = (max_abs, name)
+        if max_rel > worst_rel[0]:
+            worst_rel = (max_rel, name)
+        torch.testing.assert_close(left, right, rtol=2.0e-3, atol=1.0e-5)
+    return worst_abs, worst_rel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "order,compress,spin_l,soc", _OC_MATRIX,
+    ids=lambda value: str(value),
+)
+def test_graph_joint_step_all_discrete_o_l_soc_and_runtime_c_samples(
+    monkeypatch, order, compress, spin_l, soc
+):
+    """Every discrete O/L/SOC combination and C from scalar to B=9 bound."""
+    config = _config(
+        order=order, compress=compress, spin_l=spin_l, soc=soc,
+        spin_basis=max(4, compress - 1), neuron=8,
+        n_max=(1, 1), basis_size=(2, 2), l_max=[2, 1, 0],
+    )
+    _assert_general_graph_joint_step(
+        monkeypatch, config,
+        1000 + 100 * order + 10 * compress + 2 * spin_l + soc,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("case", (
+    dict(order=1, compress=1, spin_l=0, soc=0, spin_basis=0,
+         n_max=(0, 0), basis_size=(0, 0), neuron=1,
+         l_max=[0, 0, 0], cutoffs=(3.7, 2.8), spin_cutoff=3.2),
+    dict(order=2, compress=4, spin_l=1, soc=0, spin_basis=11,
+         n_max=(1, 3), basis_size=(2, 5), neuron=7,
+         l_max=[1, 0, 0], cutoffs=(5.1, 4.2), spin_cutoff=4.8),
+    dict(order=3, compress=3, spin_l=2, soc=1, spin_basis=4,
+         n_max=(3, 2), basis_size=(6, 7), neuron=16,
+         l_max=[3, 1, 1, 1, 1, 1, 0],
+         dof_types=["Fe"], env_types=["Fe", "Ge"], spin_cutoff=5.4),
+    dict(order=3, compress=9, spin_l=2, soc=1, spin_basis=8,
+         n_max=(7, 6), basis_size=(12, 10), neuron=64,
+         l_max=[4, 1, 1, 1, 1, 1, 1], cutoffs=(6.7, 5.8),
+         spin_cutoff=6.3),
+))
+def test_graph_joint_step_parameter_boundaries(monkeypatch, case):
+    """Non-default radial widths, cutoffs, ANN widths and active-type masks."""
+    _assert_general_graph_joint_step(
+        monkeypatch, _config(**case), 7000 + case["compress"],
+        struct_center=case["l_max"][0] > 0,
+    )
+
+
+_STRUCT_SECTOR_MATRIX = [
+    [4, *flags] for flags in itertools.product((0, 1), repeat=6)
+] + [[l_max, 0, 0, 0, 0, 0, 0] for l_max in range(4)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("l_max", _STRUCT_SECTOR_MATRIX)
+def test_graph_joint_step_all_structural_sector_combinations(
+    monkeypatch, l_max
+):
+    """All optional structural sectors plus every lower angular prefix."""
+    flags = l_max[1:]
+    config = _config(
+        order=1, compress=1, spin_l=0, soc=0, spin_basis=4,
+        neuron=8, n_max=(2, 2), basis_size=(3, 3), l_max=l_max,
+    )
+    _assert_general_graph_joint_step(
+        monkeypatch, config, 5000 + l_max[0] * 100 + sum(
+            bit << index for index, bit in enumerate(flags)
+        ), struct_center=l_max[0] > 0,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_graph_cache_is_exact_shape_keyed_and_bounded(monkeypatch):
     monkeypatch.setenv("TORCHNEP_OC_CUDA_FULL", "0")
@@ -232,6 +371,6 @@ def test_train_nep_uses_bounded_graph_cache_for_changing_shapes(
         run_seed=3,
     )
     log = (output / "output.log").read_text()
-    assert "O3-C2 CUDA train graph: enabled" in log
+    assert "O/C CUDA train graph: enabled" in log
     assert "graph 50.0% hit (2/2" in log
     assert (output / "nep_final.txt").stat().st_size > 0

@@ -5,7 +5,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Bounded CUDA-Graph cache for the narrow O3-C2 training surface.
+"""Bounded CUDA-Graph cache for spin-mode-2 O/C training.
 
 Each entry owns exact-shape ragged buffers and a complete
 descriptor -> E/F/V/MF/Tau -> loss -> backward -> Adam replay.  The
@@ -56,23 +56,13 @@ def graph_cache_size() -> int:
 
 
 def graph_support_reason(model, device: torch.device) -> str:
-    """Return empty only for the validated O3-C2 CUDA trainer surface."""
+    """Return empty for a reference-supported spin-mode-2 CUDA trainer."""
     if not graph_cache_requested():
         return f"{_GRAPH_ENV}=1 was not requested"
     if device.type != "cuda" or not torch.cuda.is_available():
-        return "the O3-C2 graph cache requires CUDA"
+        return "the O/C graph cache requires CUDA"
     if model.spin_mode != 2:
         return "the graph cache is restricted to spin_mode 2"
-    if not (
-        model.spin_order == 3
-        and model.spin_compress == 2
-        and model.spin_l_max[0] == 2
-        and model.spin_soc == 1
-        and model.struct_dim == 30
-        and model.spin_dim == 49
-        and model.dim == 79
-    ):
-        return "the model is outside the validated O3-C2 30+49D surface"
     if model.zbl is not None:
         return "ZBL has not passed CUDA-Graph joint-training validation"
     return ""
@@ -81,9 +71,9 @@ def graph_support_reason(model, device: torch.device) -> str:
 def configure_graph_optimizer(optimizer: torch.optim.Optimizer) -> None:
     """Make one Adam parameter group capture-safe without replacing state."""
     if not isinstance(optimizer, torch.optim.Adam):
-        raise TypeError("the O3-C2 CUDA graph cache currently requires Adam")
+        raise TypeError("the O/C CUDA graph cache currently requires Adam")
     if len(optimizer.param_groups) != 1:
-        raise ValueError("the O3-C2 CUDA graph cache requires one parameter group")
+        raise ValueError("the O/C CUDA graph cache requires one parameter group")
     group = optimizer.param_groups[0]
     group["capturable"] = True
     group["fused"] = True
