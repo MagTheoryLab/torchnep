@@ -190,6 +190,7 @@ def moment_gate(
     """Return the O3 moment-gate sector, selecting CUDA only when enabled."""
     compatible = (
         _enabled()
+        and os.environ.get("TORCHNEP_OC_CUDA_FULL", "0") != "1"
         and weights.is_cuda
         and spins.is_cuda
         and weights.ndim == 2

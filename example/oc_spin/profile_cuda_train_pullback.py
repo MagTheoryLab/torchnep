@@ -12,13 +12,17 @@ from benchmark_cuda_train_pullback import (
     ragged_case,
     response,
 )
+import benchmark_cuda_train_pullback as benchmark
 from torchnep.model import NEPModel
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cuda-slice", action="store_true")
+    parser.add_argument("--full", action="store_true")
     args = parser.parse_args()
+    if args.full:
+        benchmark.CANDIDATE_KIND = "full"
     torch.manual_seed(20260901)
     model = NEPModel(config()).cuda().float().train()
     batch = ragged_case(256, 23, 113, "noncollinear", torch.float32)

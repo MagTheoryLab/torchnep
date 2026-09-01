@@ -34,6 +34,7 @@ import math
 import torch
 
 from . import ops
+from .oc_cuda_full import full_descriptor as _oc_cuda_full_descriptor
 from .oc_cuda_train import moment_gate as _oc_cuda_moment_gate
 
 
@@ -608,6 +609,51 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         )
 
     def forward(
+        self,
+        rij: torch.Tensor,
+        pair_i: torch.Tensor,
+        pair_j: torch.Tensor,
+        spins: torch.Tensor,
+        N: int,
+        atom_types: torch.Tensor | None = None,
+        c_spin_2body: torch.Tensor | None = None,
+        c_spin_3body: torch.Tensor | None = None,
+        spin_dof_type_active: torch.Tensor | None = None,
+        spin_env_type_active: torch.Tensor | None = None,
+        rij_coupled: torch.Tensor | None = None,
+        pair_i_coupled: torch.Tensor | None = None,
+        pair_j_coupled: torch.Tensor | None = None,
+    ):
+        candidate = _oc_cuda_full_descriptor(
+            self,
+            rij,
+            pair_i,
+            pair_j,
+            spins,
+            atom_types,
+            c_spin_2body,
+            spin_dof_type_active,
+            spin_env_type_active,
+        )
+        if candidate is not None:
+            return candidate
+        return self._forward_reference(
+            rij,
+            pair_i,
+            pair_j,
+            spins,
+            N,
+            atom_types,
+            c_spin_2body,
+            c_spin_3body,
+            spin_dof_type_active,
+            spin_env_type_active,
+            rij_coupled,
+            pair_i_coupled,
+            pair_j_coupled,
+        )
+
+    def _forward_reference(
         self,
         rij: torch.Tensor,
         pair_i: torch.Tensor,

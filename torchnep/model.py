@@ -18,6 +18,7 @@ Supports per-type NN architecture with ZBL (including typewise cutoffs).
 Uses ops module for core computations (pure PyTorch or CUDA).
 """
 
+import os
 import warnings
 
 import torch
@@ -509,13 +510,28 @@ class NEPModel(nn.Module):
         dummy_accum = torch.zeros((), dtype=q.dtype, device=q.device)
         dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(
             1, self.dim, dtype=q.dtype, device=q.device)
-        for t in range(self.num_types):
-            mask = atom_types == t
-            net = self.fitting_nets[t]
-            if mask.any():
-                Ei[mask] = net(q_scaled[mask])
-            else:
-                dummy_accum = dummy_accum + net(dummy_q).sum()
+        if os.environ.get("TORCHNEP_OC_CUDA_GRAPH", "0") == "1":
+            # Branch-free, capture-safe multi-element ANN. Boolean indexing
+            # lowers to a dynamic nonzero allocation, which CUDA Graphs reject.
+            # Gathering the per-type weights keeps the ragged atom dimension
+            # explicit and also handles types absent from this batch.
+            w0 = torch.stack([net.w0 for net in self.fitting_nets])
+            b0 = torch.stack([net.b0 for net in self.fitting_nets])
+            w1 = torch.stack([net.w1 for net in self.fitting_nets])
+            atom_w0 = w0[atom_types]
+            hidden = torch.tanh(
+                torch.bmm(q_scaled.unsqueeze(1), atom_w0).squeeze(1)
+                - b0[atom_types]
+            )
+            Ei = (hidden * w1[atom_types]).sum(dim=1)
+        else:
+            for t in range(self.num_types):
+                mask = atom_types == t
+                net = self.fitting_nets[t]
+                if mask.any():
+                    Ei[mask] = net(q_scaled[mask])
+                else:
+                    dummy_accum = dummy_accum + net(dummy_q).sum()
         Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1
         if include_baseline and self.energy_baseline is not None:

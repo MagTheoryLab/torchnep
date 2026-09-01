@@ -20,6 +20,10 @@ import torch
 from torchnep.model import NEPModel
 
 
+CANDIDATE_KIND = "narrow"
+GRAPH_CORRECTNESS = False
+
+
 def config():
     return {
         "num_types": 3,
@@ -100,7 +104,12 @@ def ragged_case(n_atoms, neighbors, seed, spin_kind, dtype):
 
 
 def set_cuda_slice(enabled):
-    os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "1" if enabled else "0"
+    os.environ["TORCHNEP_OC_CUDA_TRAIN"] = (
+        "1" if enabled and CANDIDATE_KIND == "narrow" else "0"
+    )
+    os.environ["TORCHNEP_OC_CUDA_FULL"] = (
+        "1" if enabled and CANDIDATE_KIND == "full" else "0"
+    )
 
 
 def descriptors(model, batch, enabled):
@@ -115,13 +124,17 @@ def descriptors(model, batch, enabled):
 
 def response(model, batch, enabled, create_graph=True):
     set_cuda_slice(enabled)
+    backend = (
+        "bmm" if os.environ.get("TORCHNEP_OC_CUDA_GRAPH", "0") == "1"
+        else "loop"
+    )
     return model.compute_properties(
         batch["rij_rad"], batch["rij_ang"], batch["pi_rad"], batch["pj_rad"],
         batch["pi_ang"], batch["pj_ang"], batch["atom_types"], batch["N"],
         batch["struct_idx"], batch["num_structures"], need_forces=True,
         need_virial=True, spins=batch["spins"], need_mforce=True,
         need_tau=True, rij_spin=batch["rij_spin"], pi_spin=batch["pi_spin"],
-        pj_spin=batch["pj_spin"], create_graph=create_graph,
+        pj_spin=batch["pj_spin"], create_graph=create_graph, backend=backend,
     )
 
 
@@ -175,12 +188,14 @@ def compare_gradients(candidate, reference):
 
 
 def correctness_case(base, batch):
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
     reference = copy.deepcopy(base)
     candidate = copy.deepcopy(base)
     q_ref = descriptors(reference, batch, False)
     q_cuda = descriptors(candidate, batch, True)
 
     out_ref = response(reference, batch, False, create_graph=True)
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1" if GRAPH_CORRECTNESS else "0"
     out_cuda = response(candidate, batch, True, create_graph=True)
     outputs = {"descriptor": error_stats(q_cuda, q_ref)}
     for name in ("Etot", "forces", "virial", "mforces", "tau"):
@@ -191,16 +206,20 @@ def correctness_case(base, batch):
 
     reference = copy.deepcopy(base)
     candidate = copy.deepcopy(base)
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
     loss_ref = joint_loss(response(reference, batch, False, True), batch)
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1" if GRAPH_CORRECTNESS else "0"
     loss_cuda = joint_loss(response(candidate, batch, True, True), batch)
     joint_ref = named_gradients(reference, loss_ref)
     joint_cuda = named_gradients(candidate, loss_cuda)
-    return {
+    result = {
         "atoms": batch["N"], "edges": batch["edges"], "outputs": outputs,
         "energy_gradient": compare_gradients(energy_cuda, energy_ref),
         "joint_gradient": compare_gradients(joint_cuda, joint_ref),
         "loss_abs": abs(float(loss_cuda.item() - loss_ref.item())),
     }
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
+    return result
 
 
 def directional_fd(base, batch, step=1.0e-5):
@@ -306,12 +325,169 @@ def performance_case(base, batch, enabled, warmup, repeats):
     }
 
 
+def cuda_graph_train_case(base, batch, warmup, repeats):
+    """Capture one complete candidate train step for this ragged shape."""
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
+    model = copy.deepcopy(base).float().train()
+    source_batch = {
+        key: (value.float() if torch.is_tensor(value) and value.is_floating_point()
+              else value)
+        for key, value in batch.items()
+    }
+    static_batch = {
+        key: (value.detach().clone() if torch.is_tensor(value) else value)
+        for key, value in source_batch.items()
+    }
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=0.0, capturable=True
+    )
+
+    def train_step():
+        optimizer.zero_grad(set_to_none=False)
+        loss = joint_loss(response(model, static_batch, True, True), static_batch)
+        loss.backward()
+        optimizer.step()
+
+    # Materialize Inductor graphs, autograd metadata, gradients and Adam state
+    # before CUDA stream capture. Addresses are then stable across replays.
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        for _ in range(max(warmup, 3)):
+            train_step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    optimizer.zero_grad(set_to_none=False)
+    with torch.cuda.graph(graph):
+        optimizer.zero_grad(set_to_none=False)
+        loss = joint_loss(response(model, static_batch, True, True), static_batch)
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    copy_keys = [
+        key for key, value in static_batch.items() if torch.is_tensor(value)
+    ]
+
+    def replay_with_input_copy():
+        for key in copy_keys:
+            static_batch[key].copy_(source_batch[key])
+        graph.replay()
+
+    replay = timed(replay_with_input_copy, warmup, repeats)
+    result = {
+        "train_step": replay,
+        "peak_memory_mib": torch.cuda.max_memory_allocated() / (1024 ** 2),
+        "shape_cache_key": [batch["N"], batch["edges"]],
+    }
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
+    return result
+
+
+def cuda_graph_optimizer_parity(base, batch, replay_steps=3):
+    """Compare nonzero-lr Adam updates between eager and captured steps."""
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
+    captured = copy.deepcopy(base).float().train()
+    captured_opt = torch.optim.Adam(
+        captured.parameters(), lr=2.0e-4, capturable=True
+    )
+    values = {
+        key: (value.float() if torch.is_tensor(value) and value.is_floating_point()
+              else value)
+        for key, value in batch.items()
+    }
+    static_values = {
+        key: (value.detach().clone() if torch.is_tensor(value) else value)
+        for key, value in values.items()
+    }
+
+    def step(model, optimizer, step_batch):
+        optimizer.zero_grad(set_to_none=False)
+        loss = joint_loss(response(model, step_batch, True, True), step_batch)
+        loss.backward()
+        optimizer.step()
+        return loss
+
+    # Materialize all state once, then fork model and optimizer from the exact
+    # same checkpoint. Independent float32 scatter warmups are not bitwise
+    # deterministic and would contaminate the graph-vs-eager comparison.
+    for _ in range(3):
+        step(captured, captured_opt, static_values)
+    torch.cuda.synchronize()
+    eager = copy.deepcopy(captured)
+    eager_opt = torch.optim.Adam(
+        eager.parameters(), lr=2.0e-4, capturable=True
+    )
+    eager_opt.load_state_dict(copy.deepcopy(captured_opt.state_dict()))
+
+    graph = torch.cuda.CUDAGraph()
+    before_capture = {
+        name: parameter.detach().clone()
+        for name, parameter in captured.named_parameters()
+    }
+    captured_opt.zero_grad(set_to_none=False)
+    with torch.cuda.graph(graph):
+        captured_opt.zero_grad(set_to_none=False)
+        captured_loss = joint_loss(
+            response(captured, static_values, True, True), static_values
+        )
+        captured_loss.backward()
+        captured_opt.step()
+    torch.cuda.synchronize()
+    capture_delta = max(
+        (parameter - before_capture[name]).abs().max().item()
+        for name, parameter in captured.named_parameters()
+    )
+    capture_executed_update = capture_delta > 0.0
+    eager_loss = None
+    if capture_executed_update:
+        eager_loss = step(eager, eager_opt, values)
+    for _ in range(replay_steps):
+        for key, value in static_values.items():
+            if torch.is_tensor(value):
+                value.copy_(values[key])
+        graph.replay()
+        eager_loss = step(eager, eager_opt, values)
+    torch.cuda.synchronize()
+
+    rows = {}
+    for (name, expected), (_, actual) in zip(
+        eager.named_parameters(), captured.named_parameters()
+    ):
+        rows[name] = error_stats(actual, expected)
+    worst_abs = max(rows, key=lambda name: rows[name]["max_abs"])
+    worst_rel = max(rows, key=lambda name: rows[name]["max_rel"])
+    result = {
+        "steps_after_warmup": replay_steps + int(capture_executed_update),
+        "capture_parameter_delta": capture_delta,
+        "capture_executed_update": capture_executed_update,
+        "parameter_max_abs": rows[worst_abs]["max_abs"],
+        "parameter_max_rel": rows[worst_rel]["max_rel"],
+        "worst_abs_parameter": worst_abs,
+        "worst_rel_parameter": worst_rel,
+        "loss": error_stats(captured_loss, eager_loss),
+    }
+    os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
+    return result
+
+
 def main():
+    global CANDIDATE_KIND, GRAPH_CORRECTNESS
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=9)
+    parser.add_argument("--candidate", choices=("narrow", "full"), default="narrow")
+    parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--performance-only", action="store_true")
+    parser.add_argument("--graph-parity-only", action="store_true")
+    parser.add_argument("--graph-correctness", action="store_true")
+    parser.add_argument("--correctness-only", action="store_true")
     args = parser.parse_args()
+    CANDIDATE_KIND = args.candidate
+    GRAPH_CORRECTNESS = args.graph_correctness
     torch.manual_seed(20260901)
     torch.cuda.manual_seed_all(20260901)
     base64 = NEPModel(config()).cuda().double().train()
@@ -336,35 +512,63 @@ def main():
         if geometry_scale != 1.0:
             for key in ("rij_rad", "rij_ang", "rij_spin"):
                 batch[key] = batch[key] * geometry_scale
-        correctness.append({
-            "seed": seed, "spin_kind": spin_kind,
-            "geometry_scale": geometry_scale,
-            **correctness_case(base64, batch),
-        })
+        if not args.performance_only:
+            correctness.append({
+                "seed": seed, "spin_kind": spin_kind,
+                "geometry_scale": geometry_scale,
+                **correctness_case(base64, batch),
+            })
         if spin_kind == "noncollinear" and geometry_scale == 1.0:
             batches64[atoms] = batch
 
-    fd = directional_fd(base64, batches64[32])
+    if args.performance_only:
+        fd = None
+    else:
+        os.environ["TORCHNEP_OC_CUDA_GRAPH"] = (
+            "1" if GRAPH_CORRECTNESS else "0"
+        )
+        fd = directional_fd(base64, batches64[32])
+        os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
     base32 = copy.deepcopy(base64).float()
     performance = []
-    for atoms in (32, 108, 256):
+    performance_atoms = (
+        () if args.graph_parity_only or args.correctness_only
+        else (32, 108, 256)
+    )
+    for atoms in performance_atoms:
         batch = {key: (value.float() if torch.is_tensor(value)
                        and value.is_floating_point() else value)
                  for key, value in batches64[atoms].items()}
         ref = performance_case(base32, batch, False, args.warmup, args.repeats)
         cuda = performance_case(base32, batch, True, args.warmup, args.repeats)
-        performance.append({
+        row = {
             "atoms": atoms, "edges": batch["edges"], "reference": ref,
             "cuda_slice": cuda,
             "train_speedup": ref["train_step"]["median_ms"]
                              / cuda["train_step"]["median_ms"],
-        })
+        }
+        if args.cuda_graph:
+            graph = cuda_graph_train_case(
+                base32, batch, args.warmup, args.repeats
+            )
+            row["cuda_graph"] = graph
+            row["cuda_graph_speedup"] = (
+                ref["train_step"]["median_ms"]
+                / graph["train_step"]["median_ms"]
+            )
+        performance.append(row)
 
+    graph_optimizer = (
+        cuda_graph_optimizer_parity(base32, batches64[32])
+        if args.cuda_graph else None
+    )
     result = {
         "device": torch.cuda.get_device_name(0), "torch": torch.__version__,
         "cuda": torch.version.cuda, "dtype_correctness": "float64",
+        "candidate": CANDIDATE_KIND,
         "dtype_performance": "float32", "dimensions": [30, 49, 79],
         "correctness": correctness, "directional_fd": fd,
+        "cuda_graph_optimizer_parity": graph_optimizer,
         "performance": performance,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
