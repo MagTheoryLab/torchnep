@@ -12,6 +12,7 @@ def _descriptor(model, values, enabled):
     os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
     os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
     os.environ["TORCHNEP_OC_CUDA_BANK"] = "1" if enabled else "0"
+    os.environ["TORCHNEP_OC_CUDA_CENTER"] = "0"
     rij, pair_i, pair_j, spins, atom_types = values
     return model.spin_descriptor(
         rij, pair_i, pair_j, spins, spins.shape[0], atom_types,

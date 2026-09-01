@@ -21,6 +21,7 @@ _EXTENSION = None
 _EXTENSION_LOCK = threading.Lock()
 BANK_WIDTH = 85
 AUX_WIDTH = 8
+EDGE_ANCHOR_WIDTH = 6
 
 
 def _enabled() -> bool:
@@ -172,6 +173,80 @@ class _DensityBank(torch.autograd.Function):
         )
 
 
+class _EdgeAnchoredVjp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, grad_output, bank, auxiliary, pair_i, radial_leg_mix):
+        ctx.save_for_backward(
+            grad_output, bank, auxiliary, pair_i, radial_leg_mix
+        )
+        return tuple(_load_extension().edge_anchor_backward(
+            grad_output.contiguous(), bank.contiguous(),
+            auxiliary.contiguous(), pair_i.contiguous(),
+            radial_leg_mix.contiguous(),
+        ))
+
+    @staticmethod
+    def backward(ctx, grad_grad_bank, grad_grad_auxiliary, grad_grad_mix):
+        grad_output, bank, auxiliary, pair_i, radial_leg_mix = ctx.saved_tensors
+        if grad_grad_bank is None:
+            grad_grad_bank = torch.zeros_like(bank)
+        if grad_grad_auxiliary is None:
+            grad_grad_auxiliary = torch.zeros_like(auxiliary)
+        if grad_grad_mix is None:
+            grad_grad_mix = torch.zeros_like(radial_leg_mix)
+        pulled = _load_extension().edge_anchor_double_backward(
+            grad_output.contiguous(), bank.contiguous(),
+            auxiliary.contiguous(), pair_i.contiguous(),
+            radial_leg_mix.contiguous(), grad_grad_bank.contiguous(),
+            grad_grad_auxiliary.contiguous(), grad_grad_mix.contiguous(),
+        )
+        need = ctx.needs_input_grad
+        return (
+            pulled[0] if need[0] else None,
+            pulled[1] if need[1] else None,
+            pulled[2] if need[2] else None,
+            None,
+            pulled[3] if need[4] else None,
+        )
+
+
+class _EdgeAnchoredSector(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, bank, auxiliary, pair_i, radial_leg_mix):
+        ctx.save_for_backward(bank, auxiliary, pair_i, radial_leg_mix)
+        return _load_extension().edge_anchor_forward(
+            bank.contiguous(), auxiliary.contiguous(), pair_i.contiguous(),
+            radial_leg_mix.contiguous(),
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        bank, auxiliary, pair_i, radial_leg_mix = ctx.saved_tensors
+        if grad_output is None:
+            grad_output = bank.new_zeros((bank.shape[0], EDGE_ANCHOR_WIDTH))
+        pulled = _EdgeAnchoredVjp.apply(
+            grad_output, bank, auxiliary, pair_i, radial_leg_mix
+        )
+        need = ctx.needs_input_grad
+        return (
+            pulled[0] if need[0] else None,
+            pulled[1] if need[1] else None,
+            None,
+            pulled[2] if need[3] else None,
+        )
+
+
+def edge_anchored_sector(descriptor, bank, auxiliary, pair_i):
+    """Fuse the remaining l11/l22/l112 edge-anchored O3-C2 families."""
+    if os.environ.get("TORCHNEP_OC_CUDA_CENTER", "0") != "1":
+        return None
+    if not bank.is_cuda:
+        return None
+    return _EdgeAnchoredSector.apply(
+        bank, auxiliary, pair_i, descriptor.radial_leg_mix
+    )
+
+
 def density_bank(
     descriptor,
     rij,
@@ -198,7 +273,13 @@ def density_bank(
         and env_active is not None
     ):
         return None
-    return _DensityBank.apply(
+    bank, auxiliary = _DensityBank.apply(
         rij, pair_i, pair_j, spins, atom_types, coefficient,
         dof_active, env_active, descriptor.cutoff_radial, descriptor.eps,
     )
+    edge_anchor = edge_anchored_sector(
+        descriptor, bank, auxiliary, pair_i
+    )
+    if edge_anchor is None:
+        return bank, auxiliary
+    return bank, auxiliary, edge_anchor

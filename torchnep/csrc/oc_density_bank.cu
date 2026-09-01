@@ -13,6 +13,7 @@ constexpr int C = 2;
 constexpr int B = 9;
 constexpr int BankWidth = 85;
 constexpr int AuxWidth = 8;
+constexpr int EdgeAnchorWidth = 6;
 constexpr int ChannelStride = 38;
 constexpr int M = 0;
 constexpr int P = 3;
@@ -406,6 +407,362 @@ __device__ void reverse_edge(
   }
 }
 
+template <typename S>
+__device__ S triple3(const S* a, const S* b, const S* c) {
+  S crossed[3];
+  cross3(a, b, crossed);
+  return dot3(crossed, c);
+}
+
+template <typename S>
+__device__ void add_triple3_pull(
+    const S* a, const S* b, const S* c, S scale,
+    S* grad_a, S* grad_b, S* grad_c) {
+  S b_cross_c[3], c_cross_a[3], a_cross_b[3];
+  cross3(b, c, b_cross_c);
+  cross3(c, a, c_cross_a);
+  cross3(a, b, a_cross_b);
+  for (int d = 0; d < 3; ++d) {
+    grad_a[d] += scale * b_cross_c[d];
+    grad_b[d] += scale * c_cross_a[d];
+    grad_c[d] += scale * a_cross_b[d];
+  }
+}
+
+template <typename S>
+__device__ void stf_to_matrix(const S* q, S* matrix) {
+  constexpr double InvSqrt6 = 0.40824829046386301637;
+  constexpr double InvSqrt2 = 0.70710678118654752440;
+  matrix[0] = -q[0] * S(InvSqrt6) + q[1] * S(InvSqrt2);
+  matrix[4] = -q[0] * S(InvSqrt6) - q[1] * S(InvSqrt2);
+  matrix[8] = S(2) * q[0] * S(InvSqrt6);
+  matrix[1] = matrix[3] = q[2] * S(InvSqrt2);
+  matrix[5] = matrix[7] = q[3] * S(InvSqrt2);
+  matrix[2] = matrix[6] = q[4] * S(InvSqrt2);
+}
+
+template <typename S>
+__device__ void add_matrix_stf_pull(const S* matrix, S* grad_q) {
+  constexpr double InvSqrt6 = 0.40824829046386301637;
+  constexpr double InvSqrt2 = 0.70710678118654752440;
+  grad_q[0] += (-matrix[0] - matrix[4] + S(2) * matrix[8]) * S(InvSqrt6);
+  grad_q[1] += (matrix[0] - matrix[4]) * S(InvSqrt2);
+  grad_q[2] += (matrix[1] + matrix[3]) * S(InvSqrt2);
+  grad_q[3] += (matrix[5] + matrix[7]) * S(InvSqrt2);
+  grad_q[4] += (matrix[2] + matrix[6]) * S(InvSqrt2);
+}
+
+template <typename S>
+__device__ void stf_matvec(const S* q, const S* vector, S* output) {
+  S matrix[9];
+  stf_to_matrix(q, matrix);
+  for (int row = 0; row < 3; ++row) {
+    output[row] = S(0);
+    for (int column = 0; column < 3; ++column) {
+      output[row] += matrix[3 * row + column] * vector[column];
+    }
+  }
+}
+
+template <typename S>
+__device__ void add_stf_matvec_pull(
+    const S* q, const S* vector, const S* pull,
+    S* grad_q, S* grad_vector) {
+  S matrix[9], grad_matrix[9];
+  stf_to_matrix(q, matrix);
+  for (int row = 0; row < 3; ++row) {
+    for (int column = 0; column < 3; ++column) {
+      grad_vector[column] += matrix[3 * row + column] * pull[row];
+      grad_matrix[3 * row + column] = pull[row] * vector[column];
+    }
+  }
+  add_matrix_stf_pull(grad_matrix, grad_q);
+}
+
+template <typename S, int D>
+__device__ void zero_channels(S values[C][D]) {
+  for (int c = 0; c < C; ++c) {
+    for (int d = 0; d < D; ++d) values[c][d] = S(0);
+  }
+}
+
+template <typename S>
+struct EdgeAnchorState {
+  S weight[C];
+  S rhat[3];
+  S omega[3];
+  S polar[C][3];
+  S geometry_l2[C][5];
+  S polar0[C][3];
+  S polar1[C][3];
+  S q0[C][5];
+  S edge_weight[C];
+};
+
+template <typename S>
+__device__ void make_edge_anchor_state(
+    const S polar[C][3], const S geometry_l2[C][5],
+    const S* auxiliary, const S* mix, EdgeAnchorState<S>* state) {
+  for (int c = 0; c < C; ++c) {
+    state->weight[c] = auxiliary[c];
+    state->edge_weight[c] = S(0);
+    for (int d = 0; d < 3; ++d) state->polar[c][d] = polar[c][d];
+    for (int k = 0; k < 5; ++k) {
+      state->geometry_l2[c][k] = geometry_l2[c][k];
+    }
+  }
+  for (int d = 0; d < 3; ++d) {
+    state->rhat[d] = auxiliary[2 + d];
+    state->omega[d] = auxiliary[5 + d];
+  }
+  for (int r = 0; r < C; ++r) {
+    for (int d = 0; d < 3; ++d) {
+      state->polar0[r][d] = S(0);
+      state->polar1[r][d] = S(0);
+    }
+    for (int k = 0; k < 5; ++k) state->q0[r][k] = S(0);
+    for (int c = 0; c < C; ++c) {
+      const S mix0 = mix[r * C + c];
+      const S mix1 = mix[4 + r * C + c];
+      state->edge_weight[r] += mix0 * state->weight[c];
+      for (int d = 0; d < 3; ++d) {
+        state->polar0[r][d] += mix0 * state->polar[c][d];
+        state->polar1[r][d] += mix1 * state->polar[c][d];
+      }
+      for (int k = 0; k < 5; ++k) {
+        state->q0[r][k] += mix0 * state->geometry_l2[c][k];
+      }
+    }
+  }
+}
+
+template <typename S>
+__device__ void edge_anchor_forward(
+    const EdgeAnchorState<S>& state, S* output) {
+  const S edge_response = dot3(state.rhat, state.omega);
+  for (int r = 0; r < C; ++r) {
+    S q_on_r[3], q_on_p1[3];
+    stf_matvec(state.q0[r], state.rhat, q_on_r);
+    stf_matvec(state.q0[r], state.polar1[r], q_on_p1);
+    output[r] = state.edge_weight[r] * triple3(
+        state.polar0[r], state.rhat, state.omega);
+    output[2 + r] = state.edge_weight[r] * triple3(
+        state.rhat, q_on_r, state.omega);
+    output[4 + r] = state.edge_weight[r] * edge_response * triple3(
+        state.polar0[r], state.polar1[r], q_on_p1);
+  }
+}
+
+template <typename S>
+__device__ void edge_anchor_reverse(
+    const EdgeAnchorState<S>& state, const S* mix, const S* grad_output,
+    S grad_polar[C][3], S grad_geometry_l2[C][5],
+    S* grad_auxiliary, S* grad_mix) {
+  zero_channels<S, 3>(grad_polar);
+  zero_channels<S, 5>(grad_geometry_l2);
+  for (int k = 0; k < AuxWidth; ++k) grad_auxiliary[k] = S(0);
+  for (int k = 0; k < 16; ++k) grad_mix[k] = S(0);
+  S grad_polar0[C][3], grad_polar1[C][3], grad_q0[C][5];
+  zero_channels<S, 3>(grad_polar0);
+  zero_channels<S, 3>(grad_polar1);
+  zero_channels<S, 5>(grad_q0);
+  S grad_edge_weight[C] = {S(0), S(0)};
+  S grad_rhat[3] = {S(0), S(0), S(0)};
+  S grad_omega[3] = {S(0), S(0), S(0)};
+  const S edge_response = dot3(state.rhat, state.omega);
+
+  for (int r = 0; r < C; ++r) {
+    S q_on_r[3], q_on_p1[3];
+    stf_matvec(state.q0[r], state.rhat, q_on_r);
+    stf_matvec(state.q0[r], state.polar1[r], q_on_p1);
+
+    const S l11 = triple3(state.polar0[r], state.rhat, state.omega);
+    grad_edge_weight[r] += grad_output[r] * l11;
+    add_triple3_pull(
+        state.polar0[r], state.rhat, state.omega,
+        grad_output[r] * state.edge_weight[r],
+        grad_polar0[r], grad_rhat, grad_omega);
+
+    const S l22 = triple3(state.rhat, q_on_r, state.omega);
+    grad_edge_weight[r] += grad_output[2 + r] * l22;
+    S grad_q_on_r[3] = {S(0), S(0), S(0)};
+    add_triple3_pull(
+        state.rhat, q_on_r, state.omega,
+        grad_output[2 + r] * state.edge_weight[r],
+        grad_rhat, grad_q_on_r, grad_omega);
+    add_stf_matvec_pull(
+        state.q0[r], state.rhat, grad_q_on_r,
+        grad_q0[r], grad_rhat);
+
+    const S mixed = triple3(
+        state.polar0[r], state.polar1[r], q_on_p1);
+    const S a112 = grad_output[4 + r];
+    grad_edge_weight[r] += a112 * edge_response * mixed;
+    const S grad_edge_response = a112 * state.edge_weight[r] * mixed;
+    for (int d = 0; d < 3; ++d) {
+      grad_rhat[d] += grad_edge_response * state.omega[d];
+      grad_omega[d] += grad_edge_response * state.rhat[d];
+    }
+    S grad_q_on_p1[3] = {S(0), S(0), S(0)};
+    add_triple3_pull(
+        state.polar0[r], state.polar1[r], q_on_p1,
+        a112 * state.edge_weight[r] * edge_response,
+        grad_polar0[r], grad_polar1[r], grad_q_on_p1);
+    add_stf_matvec_pull(
+        state.q0[r], state.polar1[r], grad_q_on_p1,
+        grad_q0[r], grad_polar1[r]);
+  }
+
+  for (int r = 0; r < C; ++r) {
+    for (int c = 0; c < C; ++c) {
+      const S mix0 = mix[r * C + c];
+      const S mix1 = mix[4 + r * C + c];
+      grad_auxiliary[c] += mix0 * grad_edge_weight[r];
+      grad_mix[r * C + c] += grad_edge_weight[r] * state.weight[c];
+      for (int d = 0; d < 3; ++d) {
+        grad_polar[c][d] += mix0 * grad_polar0[r][d] +
+            mix1 * grad_polar1[r][d];
+        grad_mix[r * C + c] +=
+            grad_polar0[r][d] * state.polar[c][d];
+        grad_mix[4 + r * C + c] +=
+            grad_polar1[r][d] * state.polar[c][d];
+      }
+      for (int k = 0; k < 5; ++k) {
+        grad_geometry_l2[c][k] += mix0 * grad_q0[r][k];
+        grad_mix[r * C + c] +=
+            grad_q0[r][k] * state.geometry_l2[c][k];
+      }
+    }
+  }
+  for (int d = 0; d < 3; ++d) {
+    grad_auxiliary[2 + d] += grad_rhat[d];
+    grad_auxiliary[5 + d] += grad_omega[d];
+  }
+}
+
+template <typename scalar_t>
+__global__ void edge_anchor_forward_kernel(
+    const scalar_t* bank, const scalar_t* auxiliary, const int64_t* pair_i,
+    const scalar_t* mix, int64_t edges, scalar_t* output) {
+  const int64_t edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edges) return;
+  const int64_t atom = pair_i[edge];
+  scalar_t polar[C][3], geometry_l2[C][5];
+  for (int c = 0; c < C; ++c) {
+    const int base = atom * BankWidth + c * ChannelStride;
+    for (int d = 0; d < 3; ++d) polar[c][d] = bank[base + P + d];
+    for (int k = 0; k < 5; ++k) geometry_l2[c][k] = bank[base + Q + k];
+  }
+  EdgeAnchorState<scalar_t> state;
+  make_edge_anchor_state(
+      polar, geometry_l2, auxiliary + edge * AuxWidth, mix, &state);
+  scalar_t local_output[EdgeAnchorWidth];
+  edge_anchor_forward(state, local_output);
+  for (int k = 0; k < EdgeAnchorWidth; ++k) {
+    atomicAdd(output + atom * EdgeAnchorWidth + k, local_output[k]);
+  }
+}
+
+template <typename scalar_t>
+__global__ void edge_anchor_backward_kernel(
+    const scalar_t* grad_output, const scalar_t* bank,
+    const scalar_t* auxiliary, const int64_t* pair_i, const scalar_t* mix,
+    int64_t edges, scalar_t* grad_bank, scalar_t* grad_auxiliary,
+    scalar_t* grad_mix) {
+  const int64_t edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edges) return;
+  const int64_t atom = pair_i[edge];
+  scalar_t polar[C][3], geometry_l2[C][5];
+  for (int c = 0; c < C; ++c) {
+    const int base = atom * BankWidth + c * ChannelStride;
+    for (int d = 0; d < 3; ++d) polar[c][d] = bank[base + P + d];
+    for (int k = 0; k < 5; ++k) geometry_l2[c][k] = bank[base + Q + k];
+  }
+  EdgeAnchorState<scalar_t> state;
+  make_edge_anchor_state(
+      polar, geometry_l2, auxiliary + edge * AuxWidth, mix, &state);
+  scalar_t grad_polar[C][3], grad_q[C][5];
+  scalar_t local_aux[AuxWidth], local_mix[16];
+  edge_anchor_reverse(
+      state, mix, grad_output + atom * EdgeAnchorWidth,
+      grad_polar, grad_q, local_aux, local_mix);
+  for (int c = 0; c < C; ++c) {
+    const int base = atom * BankWidth + c * ChannelStride;
+    for (int d = 0; d < 3; ++d) {
+      atomicAdd(grad_bank + base + P + d, grad_polar[c][d]);
+    }
+    for (int k = 0; k < 5; ++k) {
+      atomicAdd(grad_bank + base + Q + k, grad_q[c][k]);
+    }
+  }
+  for (int k = 0; k < AuxWidth; ++k) {
+    grad_auxiliary[edge * AuxWidth + k] = local_aux[k];
+  }
+  for (int k = 0; k < 16; ++k) atomicAdd(grad_mix + k, local_mix[k]);
+}
+
+template <typename scalar_t>
+__global__ void edge_anchor_double_backward_kernel(
+    const scalar_t* grad_output, const scalar_t* bank,
+    const scalar_t* auxiliary, const int64_t* pair_i, const scalar_t* mix,
+    const scalar_t* h_bank, const scalar_t* h_auxiliary,
+    const scalar_t* h_mix, int64_t edges, scalar_t* grad2_output,
+    scalar_t* grad2_bank, scalar_t* grad2_auxiliary, scalar_t* grad2_mix) {
+  const int64_t edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edges) return;
+  const int64_t atom = pair_i[edge];
+  Dual<scalar_t> polar[C][3], geometry_l2[C][5];
+  Dual<scalar_t> local_auxiliary[AuxWidth], local_mix[16];
+  for (int c = 0; c < C; ++c) {
+    const int base = atom * BankWidth + c * ChannelStride;
+    for (int d = 0; d < 3; ++d) {
+      polar[c][d] = {bank[base + P + d], h_bank[base + P + d]};
+    }
+    for (int k = 0; k < 5; ++k) {
+      geometry_l2[c][k] = {bank[base + Q + k], h_bank[base + Q + k]};
+    }
+  }
+  for (int k = 0; k < AuxWidth; ++k) {
+    local_auxiliary[k] = {
+        auxiliary[edge * AuxWidth + k], h_auxiliary[edge * AuxWidth + k]};
+  }
+  for (int k = 0; k < 16; ++k) local_mix[k] = {mix[k], h_mix[k]};
+  EdgeAnchorState<Dual<scalar_t>> state;
+  make_edge_anchor_state(
+      polar, geometry_l2, local_auxiliary, local_mix, &state);
+  Dual<scalar_t> local_output[EdgeAnchorWidth];
+  edge_anchor_forward(state, local_output);
+  for (int k = 0; k < EdgeAnchorWidth; ++k) {
+    atomicAdd(
+        grad2_output + atom * EdgeAnchorWidth + k, local_output[k].d);
+  }
+  Dual<scalar_t> local_grad_output[EdgeAnchorWidth];
+  for (int k = 0; k < EdgeAnchorWidth; ++k) {
+    local_grad_output[k] = {
+        grad_output[atom * EdgeAnchorWidth + k], scalar_t(0)};
+  }
+  Dual<scalar_t> grad_polar[C][3], grad_q[C][5];
+  Dual<scalar_t> local_grad_aux[AuxWidth], local_grad_mix[16];
+  edge_anchor_reverse(
+      state, local_mix, local_grad_output, grad_polar, grad_q,
+      local_grad_aux, local_grad_mix);
+  for (int c = 0; c < C; ++c) {
+    const int base = atom * BankWidth + c * ChannelStride;
+    for (int d = 0; d < 3; ++d) {
+      atomicAdd(grad2_bank + base + P + d, grad_polar[c][d].d);
+    }
+    for (int k = 0; k < 5; ++k) {
+      atomicAdd(grad2_bank + base + Q + k, grad_q[c][k].d);
+    }
+  }
+  for (int k = 0; k < AuxWidth; ++k) {
+    grad2_auxiliary[edge * AuxWidth + k] = local_grad_aux[k].d;
+  }
+  for (int k = 0; k < 16; ++k) {
+    atomicAdd(grad2_mix + k, local_grad_mix[k].d);
+  }
+}
+
 template <typename scalar_t>
 __global__ void bank_forward_kernel(
     const scalar_t* rij, const int64_t* pair_i, const int64_t* pair_j,
@@ -573,6 +930,30 @@ void check_inputs(
               "coefficient must be [1,T,T,2,9]");
 }
 
+void check_edge_anchor_inputs(
+    const torch::Tensor& bank, const torch::Tensor& auxiliary,
+    const torch::Tensor& pair_i, const torch::Tensor& mix) {
+  TORCH_CHECK(
+      bank.is_cuda() && auxiliary.is_cuda() && pair_i.is_cuda() && mix.is_cuda(),
+      "all edge-anchor tensors must be CUDA tensors");
+  TORCH_CHECK(
+      bank.is_contiguous() && auxiliary.is_contiguous() &&
+      pair_i.is_contiguous() && mix.is_contiguous(),
+      "all edge-anchor tensors must be contiguous");
+  TORCH_CHECK(bank.dim() == 2 && bank.size(1) == BankWidth,
+              "bank must be [atoms,85]");
+  TORCH_CHECK(auxiliary.dim() == 2 && auxiliary.size(1) == AuxWidth,
+              "auxiliary must be [edges,8]");
+  TORCH_CHECK(pair_i.dim() == 1 && pair_i.numel() == auxiliary.size(0) &&
+              pair_i.scalar_type() == torch::kInt64,
+              "pair_i must be int64 [edges]");
+  TORCH_CHECK(mix.dim() == 3 && mix.size(0) == 4 && mix.size(1) == C &&
+              mix.size(2) == C, "radial_leg_mix must be [4,2,2]");
+  TORCH_CHECK(bank.scalar_type() == auxiliary.scalar_type() &&
+              bank.scalar_type() == mix.scalar_type(),
+              "edge-anchor floating tensors must share dtype");
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> density_bank_forward(
@@ -697,10 +1078,120 @@ std::vector<torch::Tensor> density_bank_double_backward(
   return {grad2_bank, grad2_aux, grad2_rij, grad2_spins, grad2_coefficient};
 }
 
+torch::Tensor edge_anchor_sector_forward(
+    torch::Tensor bank, torch::Tensor auxiliary, torch::Tensor pair_i,
+    torch::Tensor mix) {
+  check_edge_anchor_inputs(bank, auxiliary, pair_i, mix);
+  c10::cuda::CUDAGuard guard(bank.device());
+  auto output = torch::zeros({bank.size(0), EdgeAnchorWidth}, bank.options());
+  const int threads = 128;
+  const int blocks = static_cast<int>((auxiliary.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        bank.scalar_type(), "edge_anchor_sector_forward", [&] {
+      edge_anchor_forward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          bank.data_ptr<scalar_t>(), auxiliary.data_ptr<scalar_t>(),
+          pair_i.data_ptr<int64_t>(), mix.data_ptr<scalar_t>(),
+          auxiliary.size(0), output.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return output;
+}
+
+std::vector<torch::Tensor> edge_anchor_sector_backward(
+    torch::Tensor grad_output, torch::Tensor bank, torch::Tensor auxiliary,
+    torch::Tensor pair_i, torch::Tensor mix) {
+  check_edge_anchor_inputs(bank, auxiliary, pair_i, mix);
+  TORCH_CHECK(
+      grad_output.is_cuda() && grad_output.is_contiguous() &&
+      grad_output.dim() == 2 && grad_output.size(0) == bank.size(0) &&
+      grad_output.size(1) == EdgeAnchorWidth &&
+      grad_output.scalar_type() == bank.scalar_type(),
+      "grad_output must be contiguous CUDA [atoms,6]");
+  c10::cuda::CUDAGuard guard(bank.device());
+  auto grad_bank = torch::zeros_like(bank);
+  auto grad_auxiliary = torch::empty_like(auxiliary);
+  auto grad_mix = torch::zeros_like(mix);
+  const int threads = 128;
+  const int blocks = static_cast<int>((auxiliary.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        bank.scalar_type(), "edge_anchor_sector_backward", [&] {
+      edge_anchor_backward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          grad_output.data_ptr<scalar_t>(), bank.data_ptr<scalar_t>(),
+          auxiliary.data_ptr<scalar_t>(), pair_i.data_ptr<int64_t>(),
+          mix.data_ptr<scalar_t>(), auxiliary.size(0),
+          grad_bank.data_ptr<scalar_t>(), grad_auxiliary.data_ptr<scalar_t>(),
+          grad_mix.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {grad_bank, grad_auxiliary, grad_mix};
+}
+
+std::vector<torch::Tensor> edge_anchor_sector_double_backward(
+    torch::Tensor grad_output, torch::Tensor bank, torch::Tensor auxiliary,
+    torch::Tensor pair_i, torch::Tensor mix, torch::Tensor h_bank,
+    torch::Tensor h_auxiliary, torch::Tensor h_mix) {
+  check_edge_anchor_inputs(bank, auxiliary, pair_i, mix);
+  TORCH_CHECK(
+      grad_output.is_cuda() && grad_output.is_contiguous() &&
+      grad_output.dim() == 2 && grad_output.size(0) == bank.size(0) &&
+      grad_output.size(1) == EdgeAnchorWidth &&
+      grad_output.scalar_type() == bank.scalar_type(),
+      "grad_output must be contiguous CUDA [atoms,6]");
+  TORCH_CHECK(
+      h_bank.is_cuda() && h_auxiliary.is_cuda() && h_mix.is_cuda() &&
+      h_bank.is_contiguous() && h_auxiliary.is_contiguous() &&
+      h_mix.is_contiguous() && h_bank.sizes() == bank.sizes() &&
+      h_auxiliary.sizes() == auxiliary.sizes() && h_mix.sizes() == mix.sizes(),
+      "edge-anchor tangents must be contiguous CUDA shape matches");
+  TORCH_CHECK(
+      h_bank.scalar_type() == bank.scalar_type() &&
+      h_auxiliary.scalar_type() == bank.scalar_type() &&
+      h_mix.scalar_type() == bank.scalar_type(),
+      "edge-anchor tangents must match primal dtype");
+  c10::cuda::CUDAGuard guard(bank.device());
+  auto grad2_output = torch::zeros_like(grad_output);
+  auto grad2_bank = torch::zeros_like(bank);
+  auto grad2_auxiliary = torch::empty_like(auxiliary);
+  auto grad2_mix = torch::zeros_like(mix);
+  const int threads = 128;
+  const int blocks = static_cast<int>((auxiliary.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        bank.scalar_type(), "edge_anchor_sector_double_backward", [&] {
+      edge_anchor_double_backward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          grad_output.data_ptr<scalar_t>(), bank.data_ptr<scalar_t>(),
+          auxiliary.data_ptr<scalar_t>(), pair_i.data_ptr<int64_t>(),
+          mix.data_ptr<scalar_t>(), h_bank.data_ptr<scalar_t>(),
+          h_auxiliary.data_ptr<scalar_t>(), h_mix.data_ptr<scalar_t>(),
+          auxiliary.size(0), grad2_output.data_ptr<scalar_t>(),
+          grad2_bank.data_ptr<scalar_t>(),
+          grad2_auxiliary.data_ptr<scalar_t>(), grad2_mix.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {grad2_output, grad2_bank, grad2_auxiliary, grad2_mix};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("forward", &density_bank_forward, "O3-C2 primitive bank (CUDA)");
   module.def("backward", &density_bank_backward, "O3-C2 primitive bank VJP (CUDA)");
   module.def(
       "double_backward", &density_bank_double_backward,
       "O3-C2 primitive bank analytic directional HVP (CUDA)");
+  module.def(
+      "edge_anchor_forward", &edge_anchor_sector_forward,
+      "O3-C2 edge-anchored sectors (CUDA)");
+  module.def(
+      "edge_anchor_backward", &edge_anchor_sector_backward,
+      "O3-C2 edge-anchored sector VJP (CUDA)");
+  module.def(
+      "edge_anchor_double_backward", &edge_anchor_sector_double_backward,
+      "O3-C2 edge-anchored sector directional HVP (CUDA)");
 }

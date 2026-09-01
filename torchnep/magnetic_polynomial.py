@@ -621,63 +621,11 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         return result
 
     def _forward_fused_center(
-        self, primitive, auxiliary, pair_i, spins, local_block, center
+        self, primitive, spins, local_block, center, edge_anchor
     ):
-        """Assemble the exact 49D O3-C2 schema around the center CUDA family."""
+        """Assemble the exact 49D schema from analytic CUDA sector families."""
         n_atoms = primitive.shape[0]
         channel = primitive[:, :76].reshape(n_atoms, 2, 38)
-        weights = auxiliary[:, :2]
-        rhat = auxiliary[:, 2:5]
-        edge_omega = auxiliary[:, 5:8]
-        polar = channel[..., 3:6]
-        geometry_l2 = channel[..., 18:23]
-
-        polar_left = self._project(polar, 0)
-        polar_right = self._project(polar, 1)
-        polar_i = polar_left.index_select(0, pair_i)
-        edge_axis_l1 = torch.cross(polar_i, rhat.unsqueeze(1), dim=-1)
-        edge_weight = self._project_weights(weights, 0)
-        edge_l11 = _index_sum(
-            spins,
-            pair_i,
-            edge_weight
-            * self._inner(edge_axis_l1, edge_omega.unsqueeze(1)),
-            n_atoms,
-        )
-
-        q_left = self._project(geometry_l2, 0)
-        q_i = _stf5_to_matrix(q_left).index_select(0, pair_i)
-        q_on_r = torch.matmul(
-            q_i, rhat[:, None, :, None]
-        ).squeeze(-1)
-        edge_axis_l2 = torch.cross(
-            rhat.unsqueeze(1).expand_as(q_on_r), q_on_r, dim=-1
-        )
-        edge_l22 = _index_sum(
-            spins,
-            pair_i,
-            edge_weight
-            * self._inner(edge_axis_l2, edge_omega.unsqueeze(1)),
-            n_atoms,
-        )
-
-        q0 = _stf5_to_matrix(q_left)
-        q_on_p1 = torch.matmul(
-            q0, polar_right.unsqueeze(-1)
-        ).squeeze(-1)
-        mixed_chirality = self._inner(
-            polar_left,
-            torch.cross(polar_right, q_on_p1, dim=-1),
-        )
-        edge_response = (rhat * edge_omega).sum(-1, keepdim=True)
-        edge_l112 = _index_sum(
-            spins,
-            pair_i,
-            edge_weight
-            * mixed_chirality.index_select(0, pair_i)
-            * edge_response,
-            n_atoms,
-        )
 
         result = torch.cat(
             (
@@ -694,12 +642,12 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 primitive[:, 76:79],
                 center[:, 14:17],
                 center[:, 17:19],
-                edge_l11,
+                edge_anchor[:, 0:2],
                 center[:, 19:21],
-                edge_l22,
+                edge_anchor[:, 2:4],
                 primitive[:, 83:85],
                 center[:, 21:29],
-                edge_l112,
+                edge_anchor[:, 4:6],
             ),
             -1,
         )
@@ -800,11 +748,12 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             spin_dof_type_active, spin_env_type_active,
         )
         if fused is not None:
-            primitive, auxiliary = fused
+            primitive, auxiliary = fused[:2]
             center = _oc_cuda_center_sector(self, primitive, spins)
             if center is not None:
+                edge_anchor = fused[2]
                 return self._forward_fused_center(
-                    primitive, auxiliary, pair_i, spins, blocks[0], center
+                    primitive, spins, blocks[0], center, edge_anchor
                 )
             channel = primitive[:, :76].reshape(N, self.spin_compress, 38)
             weights = auxiliary[:, :2]
