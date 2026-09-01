@@ -17,7 +17,7 @@ CENTER_WIDTH = 29
 
 
 def _enabled() -> bool:
-    return os.environ.get("TORCHNEP_OC_CUDA_CENTER", "0") == "1"
+    return os.environ.get("TORCHNEP_OC_CUDA_CENTER", "1") != "0"
 
 
 def _load_extension():

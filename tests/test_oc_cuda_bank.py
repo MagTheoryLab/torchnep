@@ -7,6 +7,10 @@ import torch
 from test_oc_cuda_full import _config, _inputs
 from test_oc_cuda_graph import _config as _general_config
 from torchnep.model import NEPModel
+from torchnep.oc_cuda_bank import _enabled as bank_enabled
+from torchnep.oc_cuda_center import _enabled as center_enabled
+from torchnep.oc_cuda_graph import graph_cache_requested
+from torchnep.oc_cuda_struct_center import _enabled as struct_center_enabled
 
 
 def _descriptor(model, values, enabled):
@@ -38,6 +42,28 @@ def _stats(actual, expected):
     error = (actual - expected).abs()
     relative = error / expected.abs().clamp_min(1.0e-12)
     return error.max().item(), relative.max().item()
+
+
+def test_analytic_cuda_defaults_on_but_graph_cache_defaults_off(monkeypatch):
+    for name in (
+        "TORCHNEP_OC_CUDA_FULL",
+        "TORCHNEP_OC_CUDA_BANK",
+        "TORCHNEP_OC_CUDA_CENTER",
+        "TORCHNEP_OC_CUDA_STRUCT_CENTER",
+        "TORCHNEP_OC_CUDA_TRAIN_GRAPH_CACHE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert bank_enabled()
+    assert center_enabled()
+    assert struct_center_enabled()
+    assert not graph_cache_requested()
+
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_BANK", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_CENTER", "0")
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_STRUCT_CENTER", "0")
+    assert not bank_enabled()
+    assert not center_enabled()
+    assert not struct_center_enabled()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

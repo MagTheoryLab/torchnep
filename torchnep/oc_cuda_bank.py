@@ -28,7 +28,9 @@ EDGE_ANCHOR_WIDTH = 6
 
 
 def _enabled() -> bool:
-    return os.environ.get("TORCHNEP_OC_CUDA_BANK", "0") == "1"
+    if os.environ.get("TORCHNEP_OC_CUDA_FULL", "0") == "1":
+        return False
+    return os.environ.get("TORCHNEP_OC_CUDA_BANK", "1") != "0"
 
 
 def _load_extension():
@@ -248,7 +250,7 @@ def edge_anchored_sector(descriptor, bank, auxiliary, pair_i):
     )
     if generic is not None:
         return generic
-    if os.environ.get("TORCHNEP_OC_CUDA_CENTER", "0") != "1":
+    if os.environ.get("TORCHNEP_OC_CUDA_CENTER", "1") == "0":
         return None
     return _EdgeAnchoredSector.apply(
         bank, auxiliary, pair_i, descriptor.radial_leg_mix

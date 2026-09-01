@@ -18,7 +18,7 @@ _TERM_CACHE = {}
 
 
 def _enabled() -> bool:
-    return os.environ.get("TORCHNEP_OC_CUDA_STRUCT_CENTER", "0") == "1"
+    return os.environ.get("TORCHNEP_OC_CUDA_STRUCT_CENTER", "1") != "0"
 
 
 def _load_extension():
