@@ -34,6 +34,7 @@ import math
 import torch
 
 from . import ops
+from .oc_cuda_train import moment_gate as _oc_cuda_moment_gate
 
 
 @dataclass(frozen=True)
@@ -851,13 +852,9 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 )
 
         if self.spin_order >= 3:
-            moment_gate = dot * (si2 + sj2)
             blocks.append(
-                _index_sum(
-                    spins,
-                    pair_i,
-                    weights * moment_gate.unsqueeze(-1),
-                    N,
+                _oc_cuda_moment_gate(
+                    weights, pair_i, pair_j, spins
                 )
             )
             if self.spin_soc and self.spin_l_max >= 1:
