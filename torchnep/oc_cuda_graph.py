@@ -26,6 +26,7 @@ import torch
 
 _GRAPH_ENV = "TORCHNEP_OC_CUDA_TRAIN_GRAPH_CACHE"
 _GRAPH_CACHE_SIZE_ENV = "TORCHNEP_OC_CUDA_GRAPH_CACHE_SIZE"
+_COMPILE_TAIL_ENV = "TORCHNEP_OC_CUDA_COMPILE_TAIL"
 _VIRIAL_6 = [0, 1, 2, 4, 5, 8]
 _INPUT_KEYS = (
     "rij_rad", "rij_ang", "pair_i_rad", "pair_j_rad",
@@ -147,6 +148,7 @@ def _joint_loss_metrics(
     need_mforce: bool,
     need_tau: bool,
     backend: str,
+    loss_tail=None,
 ):
     result = model.compute_properties(
         batch["rij_rad"], batch["rij_ang"],
@@ -159,6 +161,25 @@ def _joint_loss_metrics(
         rij_spin=batch["rij_spin"], pi_spin=batch["pair_i_spin"],
         pj_spin=batch["pair_j_spin"], create_graph=True,
     )
+    if loss_tail is not None:
+        return loss_tail(result, batch, weights)
+    return _joint_loss_from_result(
+        model, result, batch, weights, need_forces, need_virial,
+        need_mforce, need_tau,
+    )
+
+
+def _joint_loss_from_result(
+    model,
+    result: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+    weights: torch.Tensor,
+    need_forces: bool,
+    need_virial: bool,
+    need_mforce: bool,
+    need_tau: bool,
+):
+    """Pure tensor tail from E/F/V/MF/Tau responses to loss and metrics."""
     zero = result["Etot"].sum() * 0.0
     metrics = {
         name: zero.clone() for name in (
@@ -290,6 +311,27 @@ class OCCudaGraphTrainCache:
         self.misses = 0
         self.evictions = 0
         self.total_capture_ms = 0.0
+        self._compiled_loss_tails = {}
+
+    def _loss_tail(
+        self, need_forces: bool, need_virial: bool,
+        need_mforce: bool, need_tau: bool,
+    ):
+        if os.environ.get(_COMPILE_TAIL_ENV, "0") != "1":
+            return None
+        key = (need_forces, need_virial, need_mforce, need_tau)
+        compiled = self._compiled_loss_tails.get(key)
+        if compiled is None:
+            model = self.model
+
+            def tail(result, batch, weights):
+                return _joint_loss_from_result(
+                    model, result, batch, weights, *key
+                )
+
+            compiled = torch.compile(tail, dynamic=True, fullgraph=True)
+            self._compiled_loss_tails[key] = compiled
+        return compiled
 
     def __len__(self):
         return len(self._entries)
@@ -344,12 +386,15 @@ class OCCudaGraphTrainCache:
             parameter for group in self.optimizer.param_groups
             for parameter in group["params"] if parameter.requires_grad
         ]
+        loss_tail = self._loss_tail(
+            need_forces, need_virial, need_mforce, need_tau
+        )
 
         def train_step():
             self.optimizer.zero_grad(set_to_none=False)
             loss, metrics = _joint_loss_metrics(
                 self.model, static_batch, controls[:5], need_forces,
-                need_virial, need_mforce, need_tau, self.backend,
+                need_virial, need_mforce, need_tau, self.backend, loss_tail,
             )
             loss.backward()
             grads = [parameter.grad for parameter in parameters]

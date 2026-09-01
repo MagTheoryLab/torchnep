@@ -101,10 +101,14 @@ def _optimizer(model, lr=2.0e-4):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_o3c2_graph_step_matches_fused_eager_adam(monkeypatch):
+@pytest.mark.parametrize("compile_tail", [False, True])
+def test_o3c2_graph_step_matches_fused_eager_adam(monkeypatch, compile_tail):
     monkeypatch.setenv("TORCHNEP_OC_CUDA_FULL", "0")
     monkeypatch.setenv("TORCHNEP_OC_CUDA_TRAIN", "0")
     monkeypatch.setenv("TORCHNEP_OC_CUDA_GRAPH", "1")
+    monkeypatch.setenv(
+        "TORCHNEP_OC_CUDA_COMPILE_TAIL", "1" if compile_tail else "0"
+    )
     torch.manual_seed(11)
     base = NEPModel(_config()).cuda().train()
     eager = copy.deepcopy(base)

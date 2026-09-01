@@ -20,6 +20,7 @@ from typing import List, Literal, Optional, Tuple
 
 from .constants import (PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B,
                         Q123_TERMS, Q233_TERMS, Q134_TERMS)
+from .oc_cuda_struct_center import structural_center_sector
 
 
 # ---------------------------------------------------------------------------
@@ -341,19 +342,33 @@ def compute_descriptors(
                        gn_blm)
 
         # 3-body q
-        q_3b_list = []
-        for li in range(l_max_3b):
-            L = li + 1
-            nt = 2 * L + 1
-            st = L * L - 1
-            c = c3b_coeffs[st:st + nt]
-            sb2 = s[:, :, st:st + nt] ** 2
-            ql = c[0] * sb2[:, :, 0]
-            if nt > 1:
-                ql = ql + 2.0 * (c[1:] * sb2[:, :, 1:]).sum(-1)
-            q_3b_list.append(ql)
-        q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
-        parts.append(q_3b)
+        fused_center = structural_center_sector(
+            s, c3b_coeffs, c4b_coeffs,
+            n_max_angular=n_max_angular,
+            l_max_3b=l_max_3b,
+            has_q_222=has_q_222,
+            has_q_1111=has_q_1111,
+            has_q_112=has_q_112,
+            has_q_123=has_q_123,
+            has_q_233=has_q_233,
+            has_q_134=has_q_134,
+        )
+        if fused_center is not None:
+            parts.append(fused_center)
+        else:
+            q_3b_list = []
+            for li in range(l_max_3b):
+                L = li + 1
+                nt = 2 * L + 1
+                st = L * L - 1
+                c = c3b_coeffs[st:st + nt]
+                sb2 = s[:, :, st:st + nt] ** 2
+                ql = c[0] * sb2[:, :, 0]
+                if nt > 1:
+                    ql = ql + 2.0 * (c[1:] * sb2[:, :, 1:]).sum(-1)
+                q_3b_list.append(ql)
+            q_3b = torch.stack(q_3b_list, dim=-1).transpose(1, 2).reshape(N, -1)
+            parts.append(q_3b)
 
         # Mixed-body blocks. Order (222 -> 1111 -> 112) must match GPUMD's
         # nep_utilities.cuh::find_q and save_nep_txt below.
@@ -363,7 +378,7 @@ def compute_descriptors(
         if has_q_1111 or has_q_112:
             s10, s11r, s11i = s[:, :, 0], s[:, :, 1], s[:, :, 2]
 
-        if has_q_222:
+        if has_q_222 and fused_center is None:
             cb = c4b_coeffs
             q4 = (cb[0]*s20**3
                   + cb[1]*s20*(s21r**2 + s21i**2)

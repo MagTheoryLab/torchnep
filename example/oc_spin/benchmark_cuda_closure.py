@@ -45,6 +45,7 @@ def configure_candidate():
     os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
     os.environ["TORCHNEP_OC_CUDA_BANK"] = "1"
     os.environ["TORCHNEP_OC_CUDA_CENTER"] = "1"
+    os.environ["TORCHNEP_OC_CUDA_STRUCT_CENTER"] = "1"
     os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
     pullback.CANDIDATE_KIND = "center"
 

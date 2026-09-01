@@ -20,6 +20,10 @@ os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
 os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
 os.environ["TORCHNEP_OC_CUDA_BANK"] = "1"
 os.environ["TORCHNEP_OC_CUDA_CENTER"] = "1"
+os.environ["TORCHNEP_OC_CUDA_STRUCT_CENTER"] = "1"
+os.environ["TORCHNEP_OC_CUDA_COMPILE_TAIL"] = os.environ.get(
+    "TORCHNEP_OC_CUDA_COMPILE_TAIL", "0"
+)
 os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
 torch.manual_seed(19)
 batch = training_batch(256, 16, 1256)

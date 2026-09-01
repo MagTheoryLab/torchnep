@@ -116,6 +116,9 @@ def set_cuda_slice(enabled):
     os.environ["TORCHNEP_OC_CUDA_CENTER"] = (
         "1" if enabled and CANDIDATE_KIND == "center" else "0"
     )
+    os.environ["TORCHNEP_OC_CUDA_STRUCT_CENTER"] = (
+        "1" if enabled and CANDIDATE_KIND == "center" else "0"
+    )
 
 
 def descriptors(model, batch, enabled):
