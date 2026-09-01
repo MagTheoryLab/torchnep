@@ -111,7 +111,10 @@ def set_cuda_slice(enabled):
         "1" if enabled and CANDIDATE_KIND == "full" else "0"
     )
     os.environ["TORCHNEP_OC_CUDA_BANK"] = (
-        "1" if enabled and CANDIDATE_KIND == "bank" else "0"
+        "1" if enabled and CANDIDATE_KIND in ("bank", "center") else "0"
+    )
+    os.environ["TORCHNEP_OC_CUDA_CENTER"] = (
+        "1" if enabled and CANDIDATE_KIND == "center" else "0"
     )
 
 
@@ -487,7 +490,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument(
-        "--candidate", choices=("reference", "narrow", "full", "bank"),
+        "--candidate",
+        choices=("reference", "narrow", "full", "bank", "center"),
         default="narrow",
     )
     parser.add_argument("--cuda-graph", action="store_true")

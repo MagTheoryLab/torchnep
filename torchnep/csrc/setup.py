@@ -26,6 +26,11 @@ setup(
             sources=[str(HERE / "oc_density_bank.cu")],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
         ),
+        CUDAExtension(
+            name="torchnep_oc_center_sector_v1",
+            sources=[str(HERE / "oc_center_sector.cu")],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
+        ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=False)},
 )

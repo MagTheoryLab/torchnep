@@ -110,11 +110,15 @@ def main():
     parser.add_argument("--cycles", type=int, default=6)
     parser.add_argument("--cache-size", type=int, default=3)
     parser.add_argument("--bank", action="store_true")
+    parser.add_argument("--center", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
     os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
-    os.environ["TORCHNEP_OC_CUDA_BANK"] = "1" if args.bank else "0"
+    os.environ["TORCHNEP_OC_CUDA_BANK"] = (
+        "1" if args.bank or args.center else "0"
+    )
+    os.environ["TORCHNEP_OC_CUDA_CENTER"] = "1" if args.center else "0"
     os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
     torch.manual_seed(19)
     base = NEPModel(config()).cuda().train()
@@ -193,7 +197,8 @@ def main():
     payload = {
         "device": torch.cuda.get_device_name(), "dtype": "float32",
         "repeats": args.repeats, "cycles": args.cycles,
-        "analytic_bank": args.bank,
+        "analytic_bank": args.bank or args.center,
+        "analytic_center": args.center,
         "results": results,
         "trace": {
             "eager_ms": eager_trace, "graph_cold_amortized_ms": graph_trace,

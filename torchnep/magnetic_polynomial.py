@@ -35,6 +35,7 @@ import torch
 
 from . import ops
 from .oc_cuda_bank import density_bank as _oc_cuda_density_bank
+from .oc_cuda_center import center_sector as _oc_cuda_center_sector
 from .oc_cuda_full import full_descriptor as _oc_cuda_full_descriptor
 from .oc_cuda_train import moment_gate as _oc_cuda_moment_gate
 
@@ -619,6 +620,96 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             result = result + matrix[..., :, component]
         return result
 
+    def _forward_fused_center(
+        self, primitive, auxiliary, pair_i, spins, local_block, center
+    ):
+        """Assemble the exact 49D O3-C2 schema around the center CUDA family."""
+        n_atoms = primitive.shape[0]
+        channel = primitive[:, :76].reshape(n_atoms, 2, 38)
+        weights = auxiliary[:, :2]
+        rhat = auxiliary[:, 2:5]
+        edge_omega = auxiliary[:, 5:8]
+        polar = channel[..., 3:6]
+        geometry_l2 = channel[..., 18:23]
+
+        polar_left = self._project(polar, 0)
+        polar_right = self._project(polar, 1)
+        polar_i = polar_left.index_select(0, pair_i)
+        edge_axis_l1 = torch.cross(polar_i, rhat.unsqueeze(1), dim=-1)
+        edge_weight = self._project_weights(weights, 0)
+        edge_l11 = _index_sum(
+            spins,
+            pair_i,
+            edge_weight
+            * self._inner(edge_axis_l1, edge_omega.unsqueeze(1)),
+            n_atoms,
+        )
+
+        q_left = self._project(geometry_l2, 0)
+        q_i = _stf5_to_matrix(q_left).index_select(0, pair_i)
+        q_on_r = torch.matmul(
+            q_i, rhat[:, None, :, None]
+        ).squeeze(-1)
+        edge_axis_l2 = torch.cross(
+            rhat.unsqueeze(1).expand_as(q_on_r), q_on_r, dim=-1
+        )
+        edge_l22 = _index_sum(
+            spins,
+            pair_i,
+            edge_weight
+            * self._inner(edge_axis_l2, edge_omega.unsqueeze(1)),
+            n_atoms,
+        )
+
+        q0 = _stf5_to_matrix(q_left)
+        q_on_p1 = torch.matmul(
+            q0, polar_right.unsqueeze(-1)
+        ).squeeze(-1)
+        mixed_chirality = self._inner(
+            polar_left,
+            torch.cross(polar_right, q_on_p1, dim=-1),
+        )
+        edge_response = (rhat * edge_omega).sum(-1, keepdim=True)
+        edge_l112 = _index_sum(
+            spins,
+            pair_i,
+            edge_weight
+            * mixed_chirality.index_select(0, pair_i)
+            * edge_response,
+            n_atoms,
+        )
+
+        result = torch.cat(
+            (
+                local_block,
+                self._inner(channel[..., 0:3], spins[:, None, :]),
+                primitive[:, 79:81],
+                self._inner(
+                    self._l2_product_on_spin(channel[..., 23:38]),
+                    spins[:, None, :],
+                ),
+                center[:, 0:2],
+                primitive[:, 81:83],
+                center[:, 2:14],
+                primitive[:, 76:79],
+                center[:, 14:17],
+                center[:, 17:19],
+                edge_l11,
+                center[:, 19:21],
+                edge_l22,
+                primitive[:, 83:85],
+                center[:, 21:29],
+                edge_l112,
+            ),
+            -1,
+        )
+        if result.shape[-1] != self.dim:
+            raise RuntimeError(
+                "center CUDA sector schema mismatch: "
+                f"{result.shape[-1]} != {self.dim}"
+            )
+        return result
+
     def forward(
         self,
         rij: torch.Tensor,
@@ -710,6 +801,11 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         )
         if fused is not None:
             primitive, auxiliary = fused
+            center = _oc_cuda_center_sector(self, primitive, spins)
+            if center is not None:
+                return self._forward_fused_center(
+                    primitive, auxiliary, pair_i, spins, blocks[0], center
+                )
             channel = primitive[:, :76].reshape(N, self.spin_compress, 38)
             weights = auxiliary[:, :2]
             rhat = auxiliary[:, 2:5]
