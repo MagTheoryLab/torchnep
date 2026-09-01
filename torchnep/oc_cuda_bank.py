@@ -16,6 +16,9 @@ import threading
 
 import torch
 
+from .oc_cuda_bank_generic import generic_density_bank
+from .oc_cuda_edge_generic import edge_sector as generic_edge_sector
+
 
 _EXTENSION = None
 _EXTENSION_LOCK = threading.Lock()
@@ -238,9 +241,14 @@ class _EdgeAnchoredSector(torch.autograd.Function):
 
 def edge_anchored_sector(descriptor, bank, auxiliary, pair_i):
     """Fuse the remaining l11/l22/l112 edge-anchored O3-C2 families."""
-    if os.environ.get("TORCHNEP_OC_CUDA_CENTER", "0") != "1":
-        return None
     if not bank.is_cuda:
+        return None
+    generic = generic_edge_sector(
+        bank, auxiliary, pair_i, descriptor.radial_leg_mix
+    )
+    if generic is not None:
+        return generic
+    if os.environ.get("TORCHNEP_OC_CUDA_CENTER", "0") != "1":
         return None
     return _EdgeAnchoredSector.apply(
         bank, auxiliary, pair_i, descriptor.radial_leg_mix
@@ -258,10 +266,10 @@ def density_bank(
     dof_active,
     env_active,
 ):
-    """Return ``None`` outside the exact internal O3-C2 CUDA surface."""
+    """Use the specialized O3-C2 bank, otherwise the runtime-C/B bank."""
     if not _enabled() or not rij.is_cuda:
         return None
-    if not (
+    exact_o3c2 = (
         descriptor.spin_compress == 2
         and descriptor.spin_l_max == 2
         and descriptor.spin_order == 3
@@ -271,8 +279,21 @@ def density_bank(
         and coefficient is not None
         and dof_active is not None
         and env_active is not None
-    ):
-        return None
+    )
+    if not exact_o3c2:
+        generic = generic_density_bank(
+            descriptor, rij, pair_i, pair_j, spins, atom_types, coefficient,
+            dof_active, env_active,
+        )
+        if generic is None:
+            return None
+        bank, auxiliary = generic
+        edge_anchor = edge_anchored_sector(
+            descriptor, bank, auxiliary, pair_i
+        )
+        return (bank, auxiliary) if edge_anchor is None else (
+            bank, auxiliary, edge_anchor
+        )
     bank, auxiliary = _DensityBank.apply(
         rij, pair_i, pair_j, spins, atom_types, coefficient,
         dof_active, env_active, descriptor.cutoff_radial, descriptor.eps,

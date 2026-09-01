@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 
 import torch
+from .oc_cuda_center_generic import center_sector as generic_center_sector
 
 
 _EXTENSION = None
@@ -106,8 +107,15 @@ class _CenterSector(torch.autograd.Function):
 
 def center_sector(descriptor, primitive, spins):
     """Return ``None`` outside the exact internal O3-C2 CUDA surface."""
-    if not _enabled() or not primitive.is_cuda:
+    if not primitive.is_cuda:
         return None
+    if not _enabled():
+        return None
+    generic = generic_center_sector(
+        primitive, spins, descriptor.radial_leg_mix
+    )
+    if generic is not None:
+        return generic
     if not (
         descriptor.spin_compress == 2
         and descriptor.spin_l_max == 2

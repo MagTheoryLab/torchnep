@@ -27,6 +27,21 @@ setup(
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
         ),
         CUDAExtension(
+            name="torchnep_oc_density_bank_generic_v1",
+            sources=[str(HERE / "oc_density_bank_generic.cu")],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
+        ),
+        CUDAExtension(
+            name="torchnep_oc_edge_sector_generic_v1",
+            sources=[str(HERE / "oc_edge_sector_generic.cu")],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
+        ),
+        CUDAExtension(
+            name="torchnep_oc_center_sector_generic_v1",
+            sources=[str(HERE / "oc_center_sector_generic.cu")],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
+        ),
+        CUDAExtension(
             name="torchnep_oc_center_sector_v1",
             sources=[str(HERE / "oc_center_sector.cu")],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},

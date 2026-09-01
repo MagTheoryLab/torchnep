@@ -5,20 +5,33 @@ import pytest
 import torch
 
 from test_oc_cuda_full import _config, _inputs
+from test_oc_cuda_graph import _config as _general_config
 from torchnep.model import NEPModel
 
 
 def _descriptor(model, values, enabled):
-    os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
-    os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
-    os.environ["TORCHNEP_OC_CUDA_BANK"] = "1" if enabled else "0"
-    os.environ["TORCHNEP_OC_CUDA_CENTER"] = "0"
-    rij, pair_i, pair_j, spins, atom_types = values
-    return model.spin_descriptor(
-        rij, pair_i, pair_j, spins, spins.shape[0], atom_types,
-        model.c_param_spin, None, model.spin_dof_type_active,
-        model.spin_env_type_active,
+    names = (
+        "TORCHNEP_OC_CUDA_FULL", "TORCHNEP_OC_CUDA_TRAIN",
+        "TORCHNEP_OC_CUDA_BANK", "TORCHNEP_OC_CUDA_CENTER",
     )
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
+        os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
+        os.environ["TORCHNEP_OC_CUDA_BANK"] = "1" if enabled else "0"
+        os.environ["TORCHNEP_OC_CUDA_CENTER"] = "0"
+        rij, pair_i, pair_j, spins, atom_types = values
+        return model.spin_descriptor(
+            rij, pair_i, pair_j, spins, spins.shape[0], atom_types,
+            model.c_param_spin, None, model.spin_dof_type_active,
+            model.spin_env_type_active,
+        )
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _stats(actual, expected):
@@ -121,3 +134,72 @@ def test_o3c2_density_bank_forward_vjp_hvp(monkeypatch):
     for value, oracle in zip(second_cuda, second_ref):
         torch.testing.assert_close(value, oracle, rtol=2.0e-8, atol=3.0e-9)
     torch.testing.assert_close(lhs, rhs, rtol=2.0e-8, atol=3.0e-9)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "case",
+    (
+        dict(order=1, compress=1, spin_l=0, soc=0, spin_basis=0),
+        dict(order=2, compress=3, spin_l=1, soc=0, spin_basis=4),
+        dict(order=2, compress=2, spin_l=1, soc=1, spin_basis=4),
+        dict(order=2, compress=3, spin_l=2, soc=1, spin_basis=4),
+        dict(order=3, compress=5, spin_l=2, soc=1, spin_basis=6),
+        dict(order=3, compress=9, spin_l=2, soc=1, spin_basis=8),
+    ),
+)
+def test_runtime_cb_density_bank_forward_vjp_hvp(monkeypatch, case):
+    """Generic CUDA bank covers scalar through wide C and SOC-off raw l1."""
+    monkeypatch.setenv("TORCHNEP_OC_CUDA_PREBUILT", "1")
+    config = _general_config(**case, neuron=8)
+    source = NEPModel(config).cuda().double()
+    reference = copy.deepcopy(source)
+    candidate = copy.deepcopy(source)
+    raw = _inputs()
+    ref_values = tuple(value.detach().clone() for value in raw)
+    cuda_values = tuple(value.detach().clone() for value in raw)
+    for values in (ref_values, cuda_values):
+        values[0].requires_grad_(True)
+        values[3].requires_grad_(True)
+
+    expected = _descriptor(reference, ref_values, False)
+    actual = _descriptor(candidate, cuda_values, True)
+    forward = _stats(actual, expected)
+    generator = torch.Generator(device="cuda").manual_seed(
+        20260901 + case["compress"]
+    )
+    pull = torch.randn(
+        expected.shape, generator=generator, dtype=expected.dtype,
+        device=expected.device,
+    )
+    ref_inputs = (ref_values[0], ref_values[3], reference.c_param_spin)
+    cuda_inputs = (cuda_values[0], cuda_values[3], candidate.c_param_spin)
+    first_ref = torch.autograd.grad(
+        (expected * pull).sum(), ref_inputs, create_graph=True
+    )
+    first_cuda = torch.autograd.grad(
+        (actual * pull).sum(), cuda_inputs, create_graph=True
+    )
+    first = [_stats(value, oracle) for value, oracle in zip(first_cuda, first_ref)]
+    tangents = tuple(
+        torch.randn(
+            value.shape, generator=generator, dtype=value.dtype,
+            device=value.device,
+        )
+        for value in first_ref
+    )
+    scalar_ref = sum(
+        (value * tangent).sum() for value, tangent in zip(first_ref, tangents)
+    )
+    scalar_cuda = sum(
+        (value * tangent).sum() for value, tangent in zip(first_cuda, tangents)
+    )
+    second_ref = torch.autograd.grad(scalar_ref, ref_inputs)
+    second_cuda = torch.autograd.grad(scalar_cuda, cuda_inputs)
+    second = [_stats(value, oracle) for value, oracle in zip(second_cuda, second_ref)]
+    print(f"runtime_cb={case} forward={forward} vjp={first} hvp={second}")
+    torch.testing.assert_close(actual, expected, rtol=5.0e-11, atol=5.0e-11)
+    for value, oracle in zip(first_cuda, first_ref):
+        torch.testing.assert_close(value, oracle, rtol=5.0e-9, atol=5.0e-9)
+    for value, oracle in zip(second_cuda, second_ref):
+        torch.testing.assert_close(value, oracle, rtol=5.0e-8, atol=8.0e-9)

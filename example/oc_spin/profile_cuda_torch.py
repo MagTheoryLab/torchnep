@@ -18,15 +18,36 @@ from torchnep.oc_cuda_graph import OCCudaGraphTrainCache, _joint_loss_metrics
 
 os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
 os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
-os.environ["TORCHNEP_OC_CUDA_BANK"] = "1"
-os.environ["TORCHNEP_OC_CUDA_CENTER"] = "1"
+os.environ["TORCHNEP_OC_CUDA_BANK"] = os.environ.get(
+    "TORCHNEP_OC_CUDA_BANK", "1"
+)
+os.environ["TORCHNEP_OC_CUDA_CENTER"] = os.environ.get(
+    "TORCHNEP_OC_CUDA_CENTER", "1"
+)
 os.environ["TORCHNEP_OC_CUDA_STRUCT_CENTER"] = "1"
 os.environ["TORCHNEP_OC_CUDA_COMPILE_TAIL"] = os.environ.get(
     "TORCHNEP_OC_CUDA_COMPILE_TAIL", "0"
 )
 os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
 torch.manual_seed(19)
-batch = training_batch(256, 16, 1256)
+PROFILE_ATOMS = int(os.environ.get("TORCHNEP_PROFILE_ATOMS", "256"))
+PROFILE_COMPRESS = int(os.environ.get("TORCHNEP_PROFILE_COMPRESS", "2"))
+PROFILE_ORDER = int(os.environ.get("TORCHNEP_PROFILE_ORDER", "3"))
+PROFILE_L = int(os.environ.get("TORCHNEP_PROFILE_L", "2"))
+PROFILE_SOC = int(os.environ.get("TORCHNEP_PROFILE_SOC", "1"))
+PROFILE_BASIS = int(os.environ.get(
+    "TORCHNEP_PROFILE_BASIS", str(max(8, PROFILE_COMPRESS - 1))
+))
+MODEL_CONFIG = config()
+MODEL_CONFIG.update({
+    "spin_compress": PROFILE_COMPRESS,
+    "spin_order": PROFILE_ORDER,
+    "spin_l_max": [PROFILE_L, 0, 0],
+    "spin_soc": PROFILE_SOC,
+    "spin_basis_size": [PROFILE_BASIS, 0],
+    "spin_curriculum": False,
+})
+batch = training_batch(PROFILE_ATOMS, 16, 1000 + PROFILE_ATOMS)
 weights = torch.tensor(WEIGHTS, device="cuda")
 
 
@@ -95,7 +116,7 @@ def profile_call(call):
 
 
 def eager_model():
-    model = copy.deepcopy(NEPModel(config()).cuda().train())
+    model = copy.deepcopy(NEPModel(MODEL_CONFIG).cuda().train())
     opt = optimizer(model)
     for _ in range(3):
         opt.zero_grad(set_to_none=False)
@@ -131,7 +152,7 @@ def main():
         ))
     )
 
-    graph_model = copy.deepcopy(NEPModel(config()).cuda().train())
+    graph_model = copy.deepcopy(NEPModel(MODEL_CONFIG).cuda().train())
     graph_optimizer = optimizer(graph_model)
     cache = OCCudaGraphTrainCache(
         graph_model, graph_optimizer, backend="bmm", max_entries=1, warmup=1
@@ -147,6 +168,12 @@ def main():
     payload = {
         "device": torch.cuda.get_device_name(0),
         "torch": torch.__version__, "cuda": torch.version.cuda,
+        "spin_config": {
+            "order": PROFILE_ORDER, "compress": PROFILE_COMPRESS,
+            "l_max": PROFILE_L, "soc": PROFILE_SOC,
+            "basis_size": PROFILE_BASIS,
+            "descriptor_dim": graph_model.spin_dim,
+        },
         "shape": {"atoms": batch["N"], "edges": batch["edges"]},
         "response_5": response,
         "outer_backward_1": backward,

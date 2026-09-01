@@ -743,22 +743,38 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 (blocks[0], spins.new_zeros((N, self.dim - 1))), -1
             )
 
+        edge_anchor = None
+        center = None
         fused = _oc_cuda_density_bank(
             self, rij, pair_i, pair_j, spins, atom_types, c_spin_2body,
             spin_dof_type_active, spin_env_type_active,
         )
         if fused is not None:
             primitive, auxiliary = fused[:2]
+            edge_anchor = fused[2] if len(fused) > 2 else None
             center = _oc_cuda_center_sector(self, primitive, spins)
-            if center is not None:
-                edge_anchor = fused[2]
+            if center is not None and primitive.shape[1] == 85:
                 return self._forward_fused_center(
                     primitive, spins, blocks[0], center, edge_anchor
                 )
-            channel = primitive[:, :76].reshape(N, self.spin_compress, 38)
-            weights = auxiliary[:, :2]
-            rhat = auxiliary[:, 2:5]
-            omega = auxiliary[:, 5:8]
+            channel_stride = 38 if primitive.shape[1] == 85 else 47
+            pair_width = self.spin_compress * (self.spin_compress + 1) // 2
+            same_offset = channel_stride * self.spin_compress
+            edge_sj2_offset = same_offset + pair_width
+            edge_dot2_offset = edge_sj2_offset + self.spin_compress
+            edge_gate_offset = edge_dot2_offset + self.spin_compress
+            center_pair_offset = 7 * self.spin_compress
+            center_projected_offset = center_pair_offset + pair_width
+            channel = primitive[:, :same_offset].reshape(
+                N, self.spin_compress, channel_stride
+            )
+            weights = auxiliary[:, :self.spin_compress]
+            rhat = auxiliary[
+                :, self.spin_compress:self.spin_compress + 3
+            ]
+            omega = auxiliary[
+                :, self.spin_compress + 3:self.spin_compress + 6
+            ]
             density = {
                 "spin": channel[..., 0:3],
                 "polar": channel[..., 3:6],
@@ -769,6 +785,8 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 "geometry_l2": channel[..., 18:23],
                 "l2_product": channel[..., 23:38],
             }
+            if channel_stride == 47:
+                density["l1_product"] = channel[..., 38:47]
             density["omega"] = torch.cross(
                 spins[:, None, :], density["spin"], dim=-1
             )
@@ -778,13 +796,17 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             density["l2_on_spin"] = self._l2_product_on_spin(
                 density["l2_product"]
             )
-            blocks.extend(
-                (
-                    (density["spin"] * spins[:, None, :]).sum(-1),
-                    primitive[:, 79:81],
-                    (density["l2_on_spin"] * spins[:, None, :]).sum(-1),
+            blocks.extend((
+                (density["spin"] * spins[:, None, :]).sum(-1),
+                primitive[
+                    :, edge_sj2_offset:
+                    edge_sj2_offset + self.spin_compress
+                ],
+            ))
+            if self.spin_soc and self.spin_l_max >= 2:
+                blocks.append(
+                    (density["l2_on_spin"] * spins[:, None, :]).sum(-1)
                 )
-            )
         else:
             distance = torch.linalg.norm(rij, dim=-1).clamp_min(self.eps)
             rhat = rij / distance.unsqueeze(-1)
@@ -876,31 +898,41 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             density = self._density_bank(features, weights, pair_i, N)
         if self.spin_soc and self.spin_l_max >= 2:
             local_q = _stf5(spins, spins)
-            blocks.append((density["geometry_l2"] * local_q[:, None]).sum(-1))
+            blocks.append(
+                center[:, :self.spin_compress] if center is not None else
+                (density["geometry_l2"] * local_q[:, None]).sum(-1)
+            )
 
         if self.spin_order >= 2:
             blocks.append(
-                primitive[:, 81:83] if fused is not None else _index_sum(
+                primitive[
+                    :, edge_dot2_offset:
+                    edge_dot2_offset + self.spin_compress
+                ] if fused is not None else _index_sum(
                     spins,
                     pair_i,
                     weights * dot.square().unsqueeze(-1),
                     N,
                 )
             )
-            blocks.append(self._inner(density["spin"], density["spin"]))
+            blocks.append(
+                center[:, self.spin_compress:2 * self.spin_compress]
+                if center is not None else
+                self._inner(density["spin"], density["spin"])
+            )
             if self.spin_l_max >= 1:
                 if self.spin_soc:
-                    blocks.extend(
-                        (
-                            density["l1_long"].square().squeeze(-1),
-                            self._inner(
-                                density["l1_axial"], density["l1_axial"]
-                            ),
-                            self._inner(
-                                density["l1_stf"], density["l1_stf"]
-                            ),
-                        )
-                    )
+                    blocks.extend((
+                        center[:, 2 * self.spin_compress:3 * self.spin_compress]
+                        if center is not None else
+                        density["l1_long"].square().squeeze(-1),
+                        center[:, 3 * self.spin_compress:4 * self.spin_compress]
+                        if center is not None else
+                        self._inner(density["l1_axial"], density["l1_axial"]),
+                        center[:, 4 * self.spin_compress:5 * self.spin_compress]
+                        if center is not None else
+                        self._inner(density["l1_stf"], density["l1_stf"]),
+                    ))
                 else:
                     blocks.append(
                         self._inner(
@@ -909,11 +941,14 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     )
             if self.spin_l_max >= 2:
                 blocks.append(
-                    self._inner(
+                    center[:, 5 * self.spin_compress:6 * self.spin_compress]
+                    if center is not None else self._inner(
                         density["l2_product"], density["l2_product"]
                     )
                 )
             blocks.append(
+                center[:, 6 * self.spin_compress:7 * self.spin_compress]
+                if center is not None else
                 self._inner(density["spin"], density["dot_spin"])
             )
 
@@ -927,7 +962,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             pair_left = self.radial_pair_left
             pair_right = self.radial_pair_right
             same = (
-                primitive[:, 76:79]
+                primitive[:, same_offset:same_offset + pair_width]
                 if fused is not None
                 else _index_sum(
                     spins,
@@ -939,9 +974,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 )
             )
             distinct = (
+                center[:, center_pair_offset:center_projected_offset]
+                if center is not None else
                 first_dot.index_select(1, pair_left)
-                * first_dot.index_select(1, pair_right)
-                - same
+                * first_dot.index_select(1, pair_right) - same
             )
             blocks.extend((same, distinct))
 
@@ -951,7 +987,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 omega_response = self._project(density["omega"], 0)
                 if "coupling_l11_axial" in self._channel_names:
                     blocks.append(
-                        self._inner(
+                        center[
+                            :, center_projected_offset:
+                            center_projected_offset + self.spin_compress
+                        ] if center is not None else self._inner(
                             torch.cross(polar_left, polar_right, dim=-1),
                             omega_response,
                         )
@@ -962,7 +1001,8 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 )
                 edge_weight = self._project_weights(weights, 0)
                 blocks.append(
-                    _index_sum(
+                    edge_anchor[:, :self.spin_compress]
+                    if edge_anchor is not None else _index_sum(
                         spins,
                         pair_i,
                         edge_weight
@@ -976,7 +1016,13 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 omega_response = self._project(density["omega"], 0)
                 if "coupling_l22_axial" in self._channel_names:
                     q_axis = self._commutator_axial(q_left, q_right)
-                    blocks.append(self._inner(q_axis, omega_response))
+                    blocks.append(
+                        center[
+                            :, center_projected_offset + self.spin_compress:
+                            center_projected_offset + 2 * self.spin_compress
+                        ] if center is not None else
+                        self._inner(q_axis, omega_response)
+                    )
                 q_i = _stf5_to_matrix(q_left).index_select(0, pair_i)
                 q_on_r = torch.matmul(
                     q_i, rhat[:, None, :, None]
@@ -986,7 +1032,9 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 )
                 edge_weight = self._project_weights(weights, 0)
                 blocks.append(
-                    _index_sum(
+                    edge_anchor[
+                        :, self.spin_compress:2 * self.spin_compress
+                    ] if edge_anchor is not None else _index_sum(
                         spins,
                         pair_i,
                         edge_weight
@@ -997,7 +1045,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
 
         if self.spin_order >= 3:
             blocks.append(
-                primitive[:, 83:85] if fused is not None else
+                primitive[
+                    :, edge_gate_offset:
+                    edge_gate_offset + self.spin_compress
+                ] if fused is not None else
                 _oc_cuda_moment_gate(weights, pair_i, pair_j, spins)
             )
             if self.spin_soc and self.spin_l_max >= 1:
@@ -1006,7 +1057,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 dot_response = self._project(density["dot_omega"], 0)
                 if "coupling_l11_dot_response" in self._channel_names:
                     blocks.append(
-                        self._inner(
+                        center[
+                            :, center_projected_offset + 2 * self.spin_compress:
+                            center_projected_offset + 3 * self.spin_compress
+                        ] if center is not None else self._inner(
                             torch.cross(polar_left, polar_right, dim=-1),
                             dot_response,
                         )
@@ -1015,6 +1069,10 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 m1 = self._project(density["spin"], 1)
                 x2 = self._project(density["l1_axial"], 2)
                 blocks.append(
+                    center[
+                        :, center_projected_offset + 3 * self.spin_compress:
+                        center_projected_offset + 4 * self.spin_compress
+                    ] if center is not None else
                     self._inner(p0, torch.cross(m1, x2, dim=-1))
                 )
             if self.spin_soc and self.spin_l_max >= 2:
@@ -1023,11 +1081,21 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 dot_response = self._project(density["dot_omega"], 0)
                 if "coupling_l22_dot_response" in self._channel_names:
                     q_axis = self._commutator_axial(q_left, q_right)
-                    blocks.append(self._inner(q_axis, dot_response))
+                    blocks.append(
+                        center[
+                            :, center_projected_offset + 4 * self.spin_compress:
+                            center_projected_offset + 5 * self.spin_compress
+                        ] if center is not None else
+                        self._inner(q_axis, dot_response)
+                    )
                 p0 = self._project(density["polar"], 0)
                 qs1 = self._project(density["l2_on_spin"], 1)
                 x2 = self._project(density["l1_axial"], 2)
                 blocks.append(
+                    center[
+                        :, center_projected_offset + 5 * self.spin_compress:
+                            center_projected_offset + 6 * self.spin_compress
+                    ] if center is not None else
                     self._inner(p0, torch.cross(qs1, x2, dim=-1))
                 )
                 p1 = self._project(density["polar"], 1)
@@ -1042,7 +1110,8 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     edge_weight = self._project_weights(weights, 0)
                     edge_response = (rhat * omega).sum(-1, keepdim=True)
                     blocks.append(
-                        _index_sum(
+                        edge_anchor[:, 2 * self.spin_compress:]
+                        if edge_anchor is not None else _index_sum(
                             spins,
                             pair_i,
                             edge_weight
