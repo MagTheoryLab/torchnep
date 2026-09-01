@@ -110,6 +110,9 @@ def set_cuda_slice(enabled):
     os.environ["TORCHNEP_OC_CUDA_FULL"] = (
         "1" if enabled and CANDIDATE_KIND == "full" else "0"
     )
+    os.environ["TORCHNEP_OC_CUDA_BANK"] = (
+        "1" if enabled and CANDIDATE_KIND == "bank" else "0"
+    )
 
 
 def descriptors(model, batch, enabled):
@@ -484,7 +487,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument(
-        "--candidate", choices=("reference", "narrow", "full"),
+        "--candidate", choices=("reference", "narrow", "full", "bank"),
         default="narrow",
     )
     parser.add_argument("--cuda-graph", action="store_true")

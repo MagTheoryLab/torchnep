@@ -109,10 +109,12 @@ def main():
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument("--cycles", type=int, default=6)
     parser.add_argument("--cache-size", type=int, default=3)
+    parser.add_argument("--bank", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
     os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
+    os.environ["TORCHNEP_OC_CUDA_BANK"] = "1" if args.bank else "0"
     os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
     torch.manual_seed(19)
     base = NEPModel(config()).cuda().train()
@@ -191,6 +193,7 @@ def main():
     payload = {
         "device": torch.cuda.get_device_name(), "dtype": "float32",
         "repeats": args.repeats, "cycles": args.cycles,
+        "analytic_bank": args.bank,
         "results": results,
         "trace": {
             "eager_ms": eager_trace, "graph_cold_amortized_ms": graph_trace,

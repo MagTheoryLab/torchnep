@@ -34,6 +34,7 @@ import math
 import torch
 
 from . import ops
+from .oc_cuda_bank import density_bank as _oc_cuda_density_bank
 from .oc_cuda_full import full_descriptor as _oc_cuda_full_descriptor
 from .oc_cuda_train import moment_gate as _oc_cuda_moment_gate
 
@@ -608,6 +609,16 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             -1,
         )
 
+    @staticmethod
+    def _l2_product_on_spin(product):
+        """Contract a summed ``q(rhat) outer spin`` bank as ``Q @ spin``."""
+        product = product.reshape(product.shape[:-1] + (5, 3))
+        result = product.new_zeros(product.shape[:-2] + (3,))
+        for component in range(3):
+            matrix = _stf5_to_matrix(product[..., :, component])
+            result = result + matrix[..., :, component]
+        return result
+
     def forward(
         self,
         rij: torch.Tensor,
@@ -693,104 +704,138 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 (blocks[0], spins.new_zeros((N, self.dim - 1))), -1
             )
 
-        distance = torch.linalg.norm(rij, dim=-1).clamp_min(self.eps)
-        rhat = rij / distance.unsqueeze(-1)
-        weights, _ = self._radial_weights(
-            distance,
-            pair_i,
-            pair_j,
-            atom_types,
-            c_spin_2body,
+        fused = _oc_cuda_density_bank(
+            self, rij, pair_i, pair_j, spins, atom_types, c_spin_2body,
+            spin_dof_type_active, spin_env_type_active,
         )
-        if dof_atoms is not None or env_atoms is not None:
-            center_active = (
-                torch.ones_like(pair_i, dtype=torch.bool)
-                if dof_atoms is None
-                else dof_atoms.index_select(0, pair_i)
+        if fused is not None:
+            primitive, auxiliary = fused
+            channel = primitive[:, :76].reshape(N, self.spin_compress, 38)
+            weights = auxiliary[:, :2]
+            rhat = auxiliary[:, 2:5]
+            omega = auxiliary[:, 5:8]
+            density = {
+                "spin": channel[..., 0:3],
+                "polar": channel[..., 3:6],
+                "l1_axial": channel[..., 6:9],
+                "dot_spin": channel[..., 9:12],
+                "l1_long": channel[..., 12:13],
+                "l1_stf": channel[..., 13:18],
+                "geometry_l2": channel[..., 18:23],
+                "l2_product": channel[..., 23:38],
+            }
+            density["omega"] = torch.cross(
+                spins[:, None, :], density["spin"], dim=-1
             )
-            neighbor_active = (
-                torch.ones_like(pair_j, dtype=torch.bool)
-                if env_atoms is None
-                else env_atoms.index_select(0, pair_j)
+            density["dot_omega"] = torch.cross(
+                spins[:, None, :], density["dot_spin"], dim=-1
             )
-            weights = weights * (
-                center_active & neighbor_active
-            ).to(weights).unsqueeze(-1)
+            density["l2_on_spin"] = self._l2_product_on_spin(
+                density["l2_product"]
+            )
+            blocks.extend(
+                (
+                    (density["spin"] * spins[:, None, :]).sum(-1),
+                    primitive[:, 79:81],
+                    (density["l2_on_spin"] * spins[:, None, :]).sum(-1),
+                )
+            )
+        else:
+            distance = torch.linalg.norm(rij, dim=-1).clamp_min(self.eps)
+            rhat = rij / distance.unsqueeze(-1)
+            weights, _ = self._radial_weights(
+                distance, pair_i, pair_j, atom_types, c_spin_2body,
+            )
+            if dof_atoms is not None or env_atoms is not None:
+                center_active = (
+                    torch.ones_like(pair_i, dtype=torch.bool)
+                    if dof_atoms is None
+                    else dof_atoms.index_select(0, pair_i)
+                )
+                neighbor_active = (
+                    torch.ones_like(pair_j, dtype=torch.bool)
+                    if env_atoms is None
+                    else env_atoms.index_select(0, pair_j)
+                )
+                weights = weights * (
+                    center_active & neighbor_active
+                ).to(weights).unsqueeze(-1)
 
-        si = spins.index_select(0, pair_i)
-        sj = spins.index_select(0, pair_j)
-        si2 = spin2.index_select(0, pair_i)
-        sj2 = spin2.index_select(0, pair_j)
-        dot = (si * sj).sum(-1)
-        omega = torch.cross(si, sj, dim=-1)
-        qrr = _stf5(rhat, rhat)
+            si = spins.index_select(0, pair_i)
+            sj = spins.index_select(0, pair_j)
+            sj2 = spin2.index_select(0, pair_j)
+            dot = (si * sj).sum(-1)
+            omega = torch.cross(si, sj, dim=-1)
+            qrr = _stf5(rhat, rhat)
 
-        edge_terms = [dot, sj2]
-        if self.spin_soc and self.spin_l_max >= 2:
-            edge_terms.append((_stf5(si, sj) * qrr).sum(-1))
-        edge_order1 = torch.stack(edge_terms, -1)
-        edge_order1 = _index_sum(
-            spins,
-            pair_i,
-            (
-                edge_order1[:, :, None] * weights[:, None, :]
-            ).reshape(pair_i.shape[0], -1),
-            N,
-        ).reshape(N, len(edge_terms), self.spin_compress)
-        blocks.extend(edge_order1.unbind(1))
+            edge_terms = [dot, sj2]
+            if self.spin_soc and self.spin_l_max >= 2:
+                edge_terms.append((_stf5(si, sj) * qrr).sum(-1))
+            edge_order1 = torch.stack(edge_terms, -1)
+            edge_order1 = _index_sum(
+                spins, pair_i,
+                (edge_order1[:, :, None] * weights[:, None, :]).reshape(
+                    pair_i.shape[0], -1
+                ),
+                N,
+            ).reshape(N, len(edge_terms), self.spin_compress)
+            blocks.extend(edge_order1.unbind(1))
 
-        features = [("spin", sj)]
-        r_dot_s = (rhat * sj).sum(-1, keepdim=True)
-        if self.spin_l_max >= 1:
-            if self.spin_soc:
+            features = [("spin", sj)]
+            r_dot_s = (rhat * sj).sum(-1, keepdim=True)
+            if self.spin_l_max >= 1:
+                if self.spin_soc:
+                    features.extend(
+                        (
+                            ("polar", rhat),
+                            ("l1_long", r_dot_s),
+                            ("l1_axial", torch.cross(rhat, sj, dim=-1)),
+                            ("l1_stf", _stf5(rhat, sj)),
+                        )
+                    )
+                else:
+                    features.append(
+                        (
+                            "l1_product",
+                            (rhat[..., :, None] * sj[..., None, :]).reshape(
+                                -1, 9
+                            ),
+                        )
+                    )
+            if self.spin_l_max >= 2:
+                q_matrix = _stf5_to_matrix(qrr)
                 features.extend(
                     (
-                        ("polar", rhat),
-                        ("l1_long", r_dot_s),
-                        ("l1_axial", torch.cross(rhat, sj, dim=-1)),
-                        ("l1_stf", _stf5(rhat, sj)),
+                        ("geometry_l2", qrr),
+                        (
+                            "l2_product",
+                            (qrr[..., :, None] * sj[..., None, :]).reshape(
+                                -1, 15
+                            ),
+                        ),
                     )
                 )
-            else:
-                features.append(
-                    (
-                        "l1_product",
-                        (rhat[..., :, None] * sj[..., None, :]).reshape(-1, 9),
+                if self.spin_soc:
+                    features.append(
+                        (
+                            "l2_on_spin",
+                            torch.matmul(q_matrix, sj.unsqueeze(-1)).squeeze(-1),
+                        )
                     )
-                )
-        if self.spin_l_max >= 2:
-            q_matrix = _stf5_to_matrix(qrr)
-            features.extend(
-                (
-                    ("geometry_l2", qrr),
-                    (
-                        "l2_product",
-                        (qrr[..., :, None] * sj[..., None, :]).reshape(-1, 15),
-                    ),
-                )
-            )
-            if self.spin_soc:
-                features.append(
-                    (
-                        "l2_on_spin",
-                        torch.matmul(q_matrix, sj.unsqueeze(-1)).squeeze(-1),
-                    )
-                )
-        if self.spin_order >= 2:
-            features.append(("dot_spin", dot.unsqueeze(-1) * sj))
-            if self.spin_soc:
-                features.append(("omega", omega))
-        if self.spin_order >= 3 and self.spin_soc:
-            features.append(("dot_omega", dot.unsqueeze(-1) * omega))
-
-        density = self._density_bank(features, weights, pair_i, N)
+            if self.spin_order >= 2:
+                features.append(("dot_spin", dot.unsqueeze(-1) * sj))
+                if self.spin_soc:
+                    features.append(("omega", omega))
+            if self.spin_order >= 3 and self.spin_soc:
+                features.append(("dot_omega", dot.unsqueeze(-1) * omega))
+            density = self._density_bank(features, weights, pair_i, N)
         if self.spin_soc and self.spin_l_max >= 2:
             local_q = _stf5(spins, spins)
             blocks.append((density["geometry_l2"] * local_q[:, None]).sum(-1))
 
         if self.spin_order >= 2:
             blocks.append(
-                _index_sum(
+                primitive[:, 81:83] if fused is not None else _index_sum(
                     spins,
                     pair_i,
                     weights * dot.square().unsqueeze(-1),
@@ -827,18 +872,26 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                 self._inner(density["spin"], density["dot_spin"])
             )
 
-            first_dot = _index_sum(
-                spins, pair_i, weights * dot.unsqueeze(-1), N
+            first_dot = (
+                (density["spin"] * spins[:, None, :]).sum(-1)
+                if fused is not None
+                else _index_sum(
+                    spins, pair_i, weights * dot.unsqueeze(-1), N
+                )
             )
             pair_left = self.radial_pair_left
             pair_right = self.radial_pair_right
-            same = _index_sum(
-                spins,
-                pair_i,
-                weights.index_select(1, pair_left)
-                * weights.index_select(1, pair_right)
-                * dot.square().unsqueeze(-1),
-                N,
+            same = (
+                primitive[:, 76:79]
+                if fused is not None
+                else _index_sum(
+                    spins,
+                    pair_i,
+                    weights.index_select(1, pair_left)
+                    * weights.index_select(1, pair_right)
+                    * dot.square().unsqueeze(-1),
+                    N,
+                )
             )
             distinct = (
                 first_dot.index_select(1, pair_left)
@@ -899,9 +952,8 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
 
         if self.spin_order >= 3:
             blocks.append(
-                _oc_cuda_moment_gate(
-                    weights, pair_i, pair_j, spins
-                )
+                primitive[:, 83:85] if fused is not None else
+                _oc_cuda_moment_gate(weights, pair_i, pair_j, spins)
             )
             if self.spin_soc and self.spin_l_max >= 1:
                 polar_left = self._project(density["polar"], 0)
