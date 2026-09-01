@@ -82,9 +82,41 @@ def test_o3c2_density_bank_forward_vjp_hvp(monkeypatch):
     second = [
         _stats(value, oracle) for value, oracle in zip(second_cuda, second_ref)
     ]
-    print(f"density_bank forward={forward} vjp={first} hvp={second}")
+    consistency_values = tuple(value.detach().clone() for value in raw)
+    consistency_values[0].requires_grad_(True)
+    consistency_values[3].requires_grad_(True)
+    tangent_rij = torch.randn_like(consistency_values[0])
+    tangent_spins = torch.randn_like(consistency_values[3])
+
+    def candidate_with_inputs(rij, spins):
+        values = (
+            rij, consistency_values[1], consistency_values[2], spins,
+            consistency_values[4],
+        )
+        return _descriptor(candidate, values, True)
+
+    value, jvp = torch.autograd.functional.jvp(
+        candidate_with_inputs,
+        (consistency_values[0], consistency_values[3]),
+        (tangent_rij, tangent_spins),
+    )
+    cotangent = torch.randn_like(value)
+    vjp = torch.autograd.grad(
+        (candidate_with_inputs(
+            consistency_values[0], consistency_values[3]
+        ) * cotangent).sum(),
+        (consistency_values[0], consistency_values[3]),
+    )
+    lhs = (jvp * cotangent).sum()
+    rhs = (vjp[0] * tangent_rij).sum() + (vjp[1] * tangent_spins).sum()
+    adjoint = _stats(lhs.reshape(1), rhs.reshape(1))
+    print(
+        f"density_bank forward={forward} vjp={first} hvp={second} "
+        f"jvp_vjp={adjoint}"
+    )
     torch.testing.assert_close(actual, expected, rtol=3.0e-11, atol=3.0e-11)
     for value, oracle in zip(first_cuda, first_ref):
         torch.testing.assert_close(value, oracle, rtol=2.0e-9, atol=2.0e-9)
     for value, oracle in zip(second_cuda, second_ref):
         torch.testing.assert_close(value, oracle, rtol=2.0e-8, atol=3.0e-9)
+    torch.testing.assert_close(lhs, rhs, rtol=2.0e-8, atol=3.0e-9)
