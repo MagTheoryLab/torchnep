@@ -1,38 +1,552 @@
-#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/extension.h>
 #include <vector>
 
 namespace {
-constexpr int Sx=47,M=0,P=3,X=6,DM=9,L=12,T5=13,Q=18,QP=23;
-template<class T>struct D{T v,d;__device__ D():v(0),d(0){}__device__ D(T x):v(x),d(0){}__device__ D(T x,T h):v(x),d(h){}};
-template<class T>__device__ D<T>operator+(D<T>a,D<T>b){return{a.v+b.v,a.d+b.d};}template<class T>__device__ D<T>operator-(D<T>a,D<T>b){return{a.v-b.v,a.d-b.d};}template<class T>__device__ D<T>operator-(D<T>a){return{-a.v,-a.d};}template<class T>__device__ D<T>operator*(D<T>a,D<T>b){return{a.v*b.v,a.d*b.v+a.v*b.d};}template<class T>__device__ D<T>&operator+=(D<T>&a,D<T>b){a.v+=b.v;a.d+=b.d;return a;}
-template<class T>__device__ T val(T x){return x;}template<class T>__device__ T val(D<T>x){return x.v;}template<class T>__device__ T der(T){return T(0);}template<class T>__device__ T der(D<T>x){return x.d;}
-template<class S,class T>struct Seed;template<class T>struct Seed<T,T>{__device__ static T f(T x,T){return x;}};template<class T>struct Seed<D<T>,T>{__device__ static D<T>f(T x,T h){return{x,h};}};template<class S,class T>__device__ S sd(T x,const T*h){return Seed<S,T>::f(x,h?*h:T(0));}
-template<class S>__device__ S dot(const S*a,const S*b,int n){S z=S(0);for(int k=0;k<n;++k)z+=a[k]*b[k];return z;}template<class S>__device__ void cross(const S*a,const S*b,S*o){o[0]=a[1]*b[2]-a[2]*b[1];o[1]=a[2]*b[0]-a[0]*b[2];o[2]=a[0]*b[1]-a[1]*b[0];}template<class S>__device__ S triple(const S*a,const S*b,const S*c){S x[3];cross(a,b,x);return dot(x,c,3);}template<class S>__device__ void triple_pull(const S*a,const S*b,const S*c,S s,S*ga,S*gb,S*gc){S x[3],y[3],z[3];cross(b,c,x);cross(c,a,y);cross(a,b,z);for(int d=0;d<3;++d){ga[d]+=s*x[d];gb[d]+=s*y[d];gc[d]+=s*z[d];}}template<class S>__device__ void cross_pull(const S*a,const S*b,const S*g,S*ga,S*gb){S x[3],y[3];cross(b,g,x);cross(g,a,y);for(int d=0;d<3;++d){ga[d]+=x[d];gb[d]+=y[d];}}
-template<class S>__device__ void stf(const S*a,const S*b,S*o){S u=S(.40824829046386301637),v=S(.70710678118654752440),xx=a[0]*b[0],yy=a[1]*b[1],zz=a[2]*b[2];o[0]=u*(S(2)*zz-xx-yy);o[1]=v*(xx-yy);o[2]=v*(a[0]*b[1]+a[1]*b[0]);o[3]=v*(a[1]*b[2]+a[2]*b[1]);o[4]=v*(a[2]*b[0]+a[0]*b[2]);}
-template<class S>__device__ void stf_pull(const S*a,const S*b,const S*g,S*ga,S*gb){S u=S(.40824829046386301637),v=S(.70710678118654752440);S g0=g[0],g1=g[1],g2=g[2],g3=g[3],g4=g[4];for(int side=0;side<2;++side){S*t=side?gb:ga;const S*o=side?a:b;t[0]+=(-g0*u+g1*v)*o[0]+g2*v*o[1]+g4*v*o[2];t[1]+=g2*v*o[0]+(-g0*u-g1*v)*o[1]+g3*v*o[2];t[2]+=g4*v*o[0]+g3*v*o[1]+S(2)*g0*u*o[2];}}
-template<class S>__device__ void qmat(const S*q,S*m){S u=S(.40824829046386301637),v=S(.70710678118654752440);m[0]=-q[0]*u+q[1]*v;m[4]=-q[0]*u-q[1]*v;m[8]=S(2)*q[0]*u;m[1]=m[3]=q[2]*v;m[5]=m[7]=q[3]*v;m[2]=m[6]=q[4]*v;}template<class S>__device__ void matq_pull(const S*m,S*g){S u=S(.40824829046386301637),v=S(.70710678118654752440);g[0]+=(-m[0]-m[4]+S(2)*m[8])*u;g[1]+=(m[0]-m[4])*v;g[2]+=(m[1]+m[3])*v;g[3]+=(m[5]+m[7])*v;g[4]+=(m[2]+m[6])*v;}
-template<class S>__device__ void comm(const S*a,const S*b,S*o){S A[9],B[9],ab[9],ba[9];qmat(a,A);qmat(b,B);for(int r=0;r<3;++r)for(int c=0;c<3;++c){ab[3*r+c]=ba[3*r+c]=S(0);for(int k=0;k<3;++k){ab[3*r+c]+=A[3*r+k]*B[3*k+c];ba[3*r+c]+=B[3*r+k]*A[3*k+c];}}o[0]=S(.5)*((ab[7]-ba[7])-(ab[5]-ba[5]));o[1]=S(.5)*((ab[2]-ba[2])-(ab[6]-ba[6]));o[2]=S(.5)*((ab[3]-ba[3])-(ab[1]-ba[1]));}
-template<class S>__device__ void comm_pull(const S*a,const S*b,const S*p,S*ga,S*gb){S A[9],B[9],h[9];qmat(a,A);qmat(b,B);for(int k=0;k<9;++k)h[k]=S(0);h[7]=S(.5)*p[0];h[5]=-S(.5)*p[0];h[2]=S(.5)*p[1];h[6]=-S(.5)*p[1];h[3]=S(.5)*p[2];h[1]=-S(.5)*p[2];S gA[9],gB[9];for(int r=0;r<3;++r)for(int c=0;c<3;++c){gA[3*r+c]=gB[3*r+c]=S(0);for(int k=0;k<3;++k){gA[3*r+c]+=h[3*r+k]*B[3*k+c]-B[3*r+k]*h[3*k+c];gB[3*r+c]+=A[3*r+k]*h[3*k+c]-h[3*r+k]*A[3*k+c];}}matq_pull(gA,ga);matq_pull(gB,gb);}
-template<class S>__device__ void qp_vec(const S*q,S*o){for(int r=0;r<3;++r)o[r]=S(0);for(int c=0;c<3;++c){S z[5],m[9];for(int k=0;k<5;++k)z[k]=q[3*k+c];qmat(z,m);for(int r=0;r<3;++r)o[r]+=m[3*r+c];}}template<class S>__device__ void qp_pull(const S*p,S*g){for(int c=0;c<3;++c){S m[9],q[5]={S(0),S(0),S(0),S(0),S(0)};for(int k=0;k<9;++k)m[k]=S(0);for(int r=0;r<3;++r)m[3*r+c]=p[r];matq_pull(m,q);for(int k=0;k<5;++k)g[3*k+c]+=q[k];}}
-__device__ int64_t pi(int64_t l,int64_t r,int64_t C){return l*C-l*(l-1)/2+(r-l);}
-template<bool Tan,class S,class T>__device__ void put(T*out,int64_t k,S x){atomicAdd(out+k,Tan?der(x):val(x));}
+constexpr int Sx = 47, M = 0, P = 3, X = 6, DM = 9, L = 12, T5 = 13, Q = 18,
+              QP = 23;
+template <class T> struct D {
+  T v, d;
+  __device__ D() : v(0), d(0) {}
+  __device__ D(T x) : v(x), d(0) {}
+  __device__ D(T x, T h) : v(x), d(h) {}
+};
+template <class T> __device__ D<T> operator+(D<T> a, D<T> b) {
+  return {a.v + b.v, a.d + b.d};
+}
+template <class T> __device__ D<T> operator-(D<T> a, D<T> b) {
+  return {a.v - b.v, a.d - b.d};
+}
+template <class T> __device__ D<T> operator-(D<T> a) { return {-a.v, -a.d}; }
+template <class T> __device__ D<T> operator*(D<T> a, D<T> b) {
+  return {a.v * b.v, a.d * b.v + a.v * b.d};
+}
+template <class T> __device__ D<T> &operator+=(D<T> &a, D<T> b) {
+  a.v += b.v;
+  a.d += b.d;
+  return a;
+}
+template <class T> __device__ T val(T x) { return x; }
+template <class T> __device__ T val(D<T> x) { return x.v; }
+template <class T> __device__ T der(T) { return T(0); }
+template <class T> __device__ T der(D<T> x) { return x.d; }
+template <class S, class T> struct Seed;
+template <class T> struct Seed<T, T> {
+  __device__ static T f(T x, T) { return x; }
+};
+template <class T> struct Seed<D<T>, T> {
+  __device__ static D<T> f(T x, T h) { return {x, h}; }
+};
+template <class S, class T> __device__ S sd(T x, const T *h) {
+  return Seed<S, T>::f(x, h ? *h : T(0));
+}
+template <class S> __device__ S dot(const S *a, const S *b, int n) {
+  S z = S(0);
+  for (int k = 0; k < n; ++k)
+    z += a[k] * b[k];
+  return z;
+}
+template <class S> __device__ void cross(const S *a, const S *b, S *o) {
+  o[0] = a[1] * b[2] - a[2] * b[1];
+  o[1] = a[2] * b[0] - a[0] * b[2];
+  o[2] = a[0] * b[1] - a[1] * b[0];
+}
+template <class S> __device__ S triple(const S *a, const S *b, const S *c) {
+  S x[3];
+  cross(a, b, x);
+  return dot(x, c, 3);
+}
+template <class S>
+__device__ void triple_pull(const S *a, const S *b, const S *c, S s, S *ga,
+                            S *gb, S *gc) {
+  S x[3], y[3], z[3];
+  cross(b, c, x);
+  cross(c, a, y);
+  cross(a, b, z);
+  for (int d = 0; d < 3; ++d) {
+    ga[d] += s * x[d];
+    gb[d] += s * y[d];
+    gc[d] += s * z[d];
+  }
+}
+template <class S>
+__device__ void cross_pull(const S *a, const S *b, const S *g, S *ga, S *gb) {
+  S x[3], y[3];
+  cross(b, g, x);
+  cross(g, a, y);
+  for (int d = 0; d < 3; ++d) {
+    ga[d] += x[d];
+    gb[d] += y[d];
+  }
+}
+template <class S> __device__ void stf(const S *a, const S *b, S *o) {
+  S u = S(.40824829046386301637), v = S(.70710678118654752440),
+    xx = a[0] * b[0], yy = a[1] * b[1], zz = a[2] * b[2];
+  o[0] = u * (S(2) * zz - xx - yy);
+  o[1] = v * (xx - yy);
+  o[2] = v * (a[0] * b[1] + a[1] * b[0]);
+  o[3] = v * (a[1] * b[2] + a[2] * b[1]);
+  o[4] = v * (a[2] * b[0] + a[0] * b[2]);
+}
+template <class S>
+__device__ void stf_pull(const S *a, const S *b, const S *g, S *ga, S *gb) {
+  S u = S(.40824829046386301637), v = S(.70710678118654752440);
+  S g0 = g[0], g1 = g[1], g2 = g[2], g3 = g[3], g4 = g[4];
+  for (int side = 0; side < 2; ++side) {
+    S *t = side ? gb : ga;
+    const S *o = side ? a : b;
+    t[0] += (-g0 * u + g1 * v) * o[0] + g2 * v * o[1] + g4 * v * o[2];
+    t[1] += g2 * v * o[0] + (-g0 * u - g1 * v) * o[1] + g3 * v * o[2];
+    t[2] += g4 * v * o[0] + g3 * v * o[1] + S(2) * g0 * u * o[2];
+  }
+}
+template <class S> __device__ void qmat(const S *q, S *m) {
+  S u = S(.40824829046386301637), v = S(.70710678118654752440);
+  m[0] = -q[0] * u + q[1] * v;
+  m[4] = -q[0] * u - q[1] * v;
+  m[8] = S(2) * q[0] * u;
+  m[1] = m[3] = q[2] * v;
+  m[5] = m[7] = q[3] * v;
+  m[2] = m[6] = q[4] * v;
+}
+template <class S> __device__ void matq_pull(const S *m, S *g) {
+  S u = S(.40824829046386301637), v = S(.70710678118654752440);
+  g[0] += (-m[0] - m[4] + S(2) * m[8]) * u;
+  g[1] += (m[0] - m[4]) * v;
+  g[2] += (m[1] + m[3]) * v;
+  g[3] += (m[5] + m[7]) * v;
+  g[4] += (m[2] + m[6]) * v;
+}
+template <class S> __device__ void comm(const S *a, const S *b, S *o) {
+  S A[9], B[9], ab[9], ba[9];
+  qmat(a, A);
+  qmat(b, B);
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c) {
+      ab[3 * r + c] = ba[3 * r + c] = S(0);
+      for (int k = 0; k < 3; ++k) {
+        ab[3 * r + c] += A[3 * r + k] * B[3 * k + c];
+        ba[3 * r + c] += B[3 * r + k] * A[3 * k + c];
+      }
+    }
+  o[0] = S(.5) * ((ab[7] - ba[7]) - (ab[5] - ba[5]));
+  o[1] = S(.5) * ((ab[2] - ba[2]) - (ab[6] - ba[6]));
+  o[2] = S(.5) * ((ab[3] - ba[3]) - (ab[1] - ba[1]));
+}
+template <class S>
+__device__ void comm_pull(const S *a, const S *b, const S *p, S *ga, S *gb) {
+  S A[9], B[9], h[9];
+  qmat(a, A);
+  qmat(b, B);
+  for (int k = 0; k < 9; ++k)
+    h[k] = S(0);
+  h[7] = S(.5) * p[0];
+  h[5] = -S(.5) * p[0];
+  h[2] = S(.5) * p[1];
+  h[6] = -S(.5) * p[1];
+  h[3] = S(.5) * p[2];
+  h[1] = -S(.5) * p[2];
+  S gA[9], gB[9];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c) {
+      gA[3 * r + c] = gB[3 * r + c] = S(0);
+      for (int k = 0; k < 3; ++k) {
+        gA[3 * r + c] +=
+            h[3 * r + k] * B[3 * k + c] - B[3 * r + k] * h[3 * k + c];
+        gB[3 * r + c] +=
+            A[3 * r + k] * h[3 * k + c] - h[3 * r + k] * A[3 * k + c];
+      }
+    }
+  matq_pull(gA, ga);
+  matq_pull(gB, gb);
+}
+template <class S> __device__ void qp_vec(const S *q, S *o) {
+  for (int r = 0; r < 3; ++r)
+    o[r] = S(0);
+  for (int c = 0; c < 3; ++c) {
+    S z[5], m[9];
+    for (int k = 0; k < 5; ++k)
+      z[k] = q[3 * k + c];
+    qmat(z, m);
+    for (int r = 0; r < 3; ++r)
+      o[r] += m[3 * r + c];
+  }
+}
+template <class S> __device__ void qp_pull(const S *p, S *g) {
+  for (int c = 0; c < 3; ++c) {
+    S m[9], q[5] = {S(0), S(0), S(0), S(0), S(0)};
+    for (int k = 0; k < 9; ++k)
+      m[k] = S(0);
+    for (int r = 0; r < 3; ++r)
+      m[3 * r + c] = p[r];
+    matq_pull(m, q);
+    for (int k = 0; k < 5; ++k)
+      g[3 * k + c] += q[k];
+  }
+}
+__device__ int64_t pi(int64_t l, int64_t r, int64_t C) {
+  return l * C - l * (l - 1) / 2 + (r - l);
+}
+template <bool Tan, class S, class T>
+__device__ void put(T *out, int64_t k, S x) {
+  atomicAdd(out + k, Tan ? der(x) : val(x));
+}
 
-template<bool Tan,class S,class T>__device__ void item(const T*go,const T*b,const T*s,const T*mix,const T*hb,const T*hs,const T*hm,int64_t atom,int64_t C,int64_t W,int64_t item,T*out,T*gb,T*gs,T*gm){int64_t PW=C*(C+1)/2,OW=13*C+PW;const T*bp=b+atom*W;const T*sp=s+3*atom;const T*hbp=hb?hb+atom*W:nullptr;const T*hsp=hs?hs+3*atom:nullptr;S spin[3];for(int d=0;d<3;++d)spin[d]=sd<S>(sp[d],hsp?hsp+d:nullptr);S y=S(0);
-  if(item<7*C){int f=item/C,c=item%C,base=c*Sx;S a[15],z[15];int n=3,off=M;if(f==0){S ql[5];stf(spin,spin,ql);for(int k=0;k<5;++k)a[k]=sd<S>(bp[base+Q+k],hbp?hbp+base+Q+k:nullptr);y=dot(a,ql,5);}else{if(f==1){off=M;n=3;}if(f==2){off=L;n=1;}if(f==3){off=X;n=3;}if(f==4){off=T5;n=5;}if(f==5){off=QP;n=15;}if(f==6){for(int d=0;d<3;++d){a[d]=sd<S>(bp[base+M+d],hbp?hbp+base+M+d:nullptr);z[d]=sd<S>(bp[base+DM+d],hbp?hbp+base+DM+d:nullptr);}y=dot(a,z,3);}else{for(int k=0;k<n;++k)a[k]=sd<S>(bp[base+off+k],hbp?hbp+base+off+k:nullptr);y=dot(a,a,n);}}
-    if(out)put<Tan>(out,atom*OW+item,y);if(!go)return;S g=S(go[atom*OW+item]);if(f==0){S ql[5],gql[5];stf(spin,spin,ql);for(int k=0;k<5;++k){gql[k]=g*a[k];put<Tan>(gb,atom*W+base+Q+k,g*ql[k]);}S gl[3]={S(0),S(0),S(0)},gr[3]={S(0),S(0),S(0)};stf_pull(spin,spin,gql,gl,gr);for(int d=0;d<3;++d)put<Tan>(gs,3*atom+d,gl[d]+gr[d]);}else if(f==6){for(int d=0;d<3;++d){put<Tan>(gb,atom*W+base+M+d,g*z[d]);put<Tan>(gb,atom*W+base+DM+d,g*a[d]);}}else for(int k=0;k<n;++k)put<Tan>(gb,atom*W+base+off+k,S(2)*g*a[k]);return;}
-  if(item<7*C+PW){int64_t p=item-7*C,l=0,x=p;while(x>=C-l){x-=C-l;++l;}int64_t r=l+x;S ml[3],mr[3];for(int d=0;d<3;++d){ml[d]=sd<S>(bp[l*Sx+M+d],hbp?hbp+l*Sx+M+d:nullptr);mr[d]=sd<S>(bp[r*Sx+M+d],hbp?hbp+r*Sx+M+d:nullptr);}S fl=dot(spin,ml,3),fr=dot(spin,mr,3),same=sd<S>(bp[Sx*C+p],hbp?hbp+Sx*C+p:nullptr);y=fl*fr-same;if(out)put<Tan>(out,atom*OW+item,y);if(!go)return;S g=S(go[atom*OW+item]);for(int d=0;d<3;++d){put<Tan>(gs,3*atom+d,g*(fr*ml[d]+fl*mr[d]));put<Tan>(gb,atom*W+l*Sx+M+d,g*fr*spin[d]);put<Tan>(gb,atom*W+r*Sx+M+d,g*fl*spin[d]);}put<Tan>(gb,atom*W+Sx*C+p,-g);return;}
-  int f=(item-7*C-PW)/C,r=(item-7*C-PW)%C;S p0[3]={S(0),S(0),S(0)},p1[3]={S(0),S(0),S(0)},om0[3]={S(0),S(0),S(0)},dom0[3]={S(0),S(0),S(0)},m1[3]={S(0),S(0),S(0)},x2[3]={S(0),S(0),S(0)},qs1[3]={S(0),S(0),S(0)},q0[5]={S(0),S(0),S(0),S(0),S(0)},q1[5]={S(0),S(0),S(0),S(0),S(0)};int64_t plane=C*C;
-  for(int64_t c=0;c<C;++c){S mx[4];for(int leg=0;leg<4;++leg)mx[leg]=sd<S>(mix[leg*plane+r*C+c],hm?hm+leg*plane+r*C+c:nullptr);S mv[3],pv[3],xv[3],dv[3],ov[3],dov[3],qsv[3],qv[5],qp[15];for(int d=0;d<3;++d){mv[d]=sd<S>(bp[c*Sx+M+d],hbp?hbp+c*Sx+M+d:nullptr);pv[d]=sd<S>(bp[c*Sx+P+d],hbp?hbp+c*Sx+P+d:nullptr);xv[d]=sd<S>(bp[c*Sx+X+d],hbp?hbp+c*Sx+X+d:nullptr);dv[d]=sd<S>(bp[c*Sx+DM+d],hbp?hbp+c*Sx+DM+d:nullptr);}for(int k=0;k<5;++k){qv[k]=sd<S>(bp[c*Sx+Q+k],hbp?hbp+c*Sx+Q+k:nullptr);for(int d=0;d<3;++d)qp[3*k+d]=sd<S>(bp[c*Sx+QP+3*k+d],hbp?hbp+c*Sx+QP+3*k+d:nullptr);}cross(spin,mv,ov);cross(spin,dv,dov);qp_vec(qp,qsv);for(int d=0;d<3;++d){p0[d]+=mx[0]*pv[d];p1[d]+=mx[1]*pv[d];om0[d]+=mx[0]*ov[d];dom0[d]+=mx[0]*dov[d];m1[d]+=mx[1]*mv[d];x2[d]+=mx[2]*xv[d];qs1[d]+=mx[1]*qsv[d];}for(int k=0;k<5;++k){q0[k]+=mx[0]*qv[k];q1[k]+=mx[1]*qv[k];}}
-  S axis[3];comm(q0,q1,axis);if(f==0)y=triple(p0,p1,om0);if(f==1)y=dot(axis,om0,3);if(f==2)y=triple(p0,p1,dom0);if(f==3)y=triple(p0,m1,x2);if(f==4)y=dot(axis,dom0,3);if(f==5)y=triple(p0,qs1,x2);if(out)put<Tan>(out,atom*OW+item,y);if(!go)return;S g=S(go[atom*OW+item]);S gp0[3]={S(0),S(0),S(0)},gp1[3]={S(0),S(0),S(0)},gom[3]={S(0),S(0),S(0)},gdom[3]={S(0),S(0),S(0)},gm1[3]={S(0),S(0),S(0)},gx2[3]={S(0),S(0),S(0)},gqs1[3]={S(0),S(0),S(0)},gq0[5]={S(0),S(0),S(0),S(0),S(0)},gq1[5]={S(0),S(0),S(0),S(0),S(0)};if(f==0)triple_pull(p0,p1,om0,g,gp0,gp1,gom);if(f==2)triple_pull(p0,p1,dom0,g,gp0,gp1,gdom);if(f==3)triple_pull(p0,m1,x2,g,gp0,gm1,gx2);if(f==5)triple_pull(p0,qs1,x2,g,gp0,gqs1,gx2);if(f==1||f==4){S ga[3];for(int d=0;d<3;++d){ga[d]=g*(f==1?om0[d]:dom0[d]);if(f==1)gom[d]+=g*axis[d];else gdom[d]+=g*axis[d];}comm_pull(q0,q1,ga,gq0,gq1);}
-  for(int64_t c=0;c<C;++c){S mx[4];for(int leg=0;leg<4;++leg)mx[leg]=sd<S>(mix[leg*plane+r*C+c],hm?hm+leg*plane+r*C+c:nullptr);S mv[3],pv[3],xv[3],dv[3],ov[3],dov[3],qsv[3],qv[5],qp[15];for(int d=0;d<3;++d){mv[d]=sd<S>(bp[c*Sx+M+d],hbp?hbp+c*Sx+M+d:nullptr);pv[d]=sd<S>(bp[c*Sx+P+d],hbp?hbp+c*Sx+P+d:nullptr);xv[d]=sd<S>(bp[c*Sx+X+d],hbp?hbp+c*Sx+X+d:nullptr);dv[d]=sd<S>(bp[c*Sx+DM+d],hbp?hbp+c*Sx+DM+d:nullptr);}for(int k=0;k<5;++k){qv[k]=sd<S>(bp[c*Sx+Q+k],hbp?hbp+c*Sx+Q+k:nullptr);for(int d=0;d<3;++d)qp[3*k+d]=sd<S>(bp[c*Sx+QP+3*k+d],hbp?hbp+c*Sx+QP+3*k+d:nullptr);}cross(spin,mv,ov);cross(spin,dv,dov);qp_vec(qp,qsv);S gmx[4]={S(0),S(0),S(0),S(0)},gmv[3]={S(0),S(0),S(0)},gpv[3]={S(0),S(0),S(0)},gxv[3]={S(0),S(0),S(0)},gdv[3]={S(0),S(0),S(0)},gov[3],gdov[3],gqsv[3],gqv[5],gqp[15];for(int d=0;d<3;++d){gov[d]=mx[0]*gom[d];gdov[d]=mx[0]*gdom[d];gqsv[d]=mx[1]*gqs1[d];gpv[d]=mx[0]*gp0[d]+mx[1]*gp1[d];gmv[d]=mx[1]*gm1[d];gxv[d]=mx[2]*gx2[d];gmx[0]+=gp0[d]*pv[d]+gom[d]*ov[d]+gdom[d]*dov[d];gmx[1]+=gp1[d]*pv[d]+gm1[d]*mv[d]+gqs1[d]*qsv[d];gmx[2]+=gx2[d]*xv[d];}for(int k=0;k<5;++k){gqv[k]=mx[0]*gq0[k]+mx[1]*gq1[k];gmx[0]+=gq0[k]*qv[k];gmx[1]+=gq1[k]*qv[k];}for(int k=0;k<15;++k)gqp[k]=S(0);S gspin0[3]={S(0),S(0),S(0)},gspin1[3]={S(0),S(0),S(0)};cross_pull(spin,mv,gov,gspin0,gmv);cross_pull(spin,dv,gdov,gspin1,gdv);qp_pull(gqsv,gqp);for(int d=0;d<3;++d){put<Tan>(gs,3*atom+d,gspin0[d]+gspin1[d]);put<Tan>(gb,atom*W+c*Sx+M+d,gmv[d]);put<Tan>(gb,atom*W+c*Sx+P+d,gpv[d]);put<Tan>(gb,atom*W+c*Sx+X+d,gxv[d]);put<Tan>(gb,atom*W+c*Sx+DM+d,gdv[d]);}for(int k=0;k<5;++k){put<Tan>(gb,atom*W+c*Sx+Q+k,gqv[k]);for(int d=0;d<3;++d)put<Tan>(gb,atom*W+c*Sx+QP+3*k+d,gqp[3*k+d]);}for(int leg=0;leg<4;++leg)put<Tan>(gm,leg*plane+r*C+c,gmx[leg]);}
+template <bool Tan, class S, class T>
+__device__ void item(const T *go, const T *b, const T *s, const T *mix,
+                     const T *hb, const T *hs, const T *hm, int64_t atom,
+                     int64_t C, int64_t W, int64_t item, T *out, T *gb, T *gs,
+                     T *gm) {
+  int64_t PW = C * (C + 1) / 2, OW = 13 * C + PW;
+  const T *bp = b + atom * W;
+  const T *sp = s + 3 * atom;
+  const T *hbp = hb ? hb + atom * W : nullptr;
+  const T *hsp = hs ? hs + 3 * atom : nullptr;
+  S spin[3];
+  for (int d = 0; d < 3; ++d)
+    spin[d] = sd<S>(sp[d], hsp ? hsp + d : nullptr);
+  S y = S(0);
+  if (item < 7 * C) {
+    int f = item / C, c = item % C, base = c * Sx;
+    S a[15], z[15];
+    int n = 3, off = M;
+    if (f == 0) {
+      S ql[5];
+      stf(spin, spin, ql);
+      for (int k = 0; k < 5; ++k)
+        a[k] = sd<S>(bp[base + Q + k], hbp ? hbp + base + Q + k : nullptr);
+      y = dot(a, ql, 5);
+    } else {
+      if (f == 1) {
+        off = M;
+        n = 3;
+      }
+      if (f == 2) {
+        off = L;
+        n = 1;
+      }
+      if (f == 3) {
+        off = X;
+        n = 3;
+      }
+      if (f == 4) {
+        off = T5;
+        n = 5;
+      }
+      if (f == 5) {
+        off = QP;
+        n = 15;
+      }
+      if (f == 6) {
+        for (int d = 0; d < 3; ++d) {
+          a[d] = sd<S>(bp[base + M + d], hbp ? hbp + base + M + d : nullptr);
+          z[d] = sd<S>(bp[base + DM + d], hbp ? hbp + base + DM + d : nullptr);
+        }
+        y = dot(a, z, 3);
+      } else {
+        for (int k = 0; k < n; ++k)
+          a[k] =
+              sd<S>(bp[base + off + k], hbp ? hbp + base + off + k : nullptr);
+        y = dot(a, a, n);
+      }
+    }
+    if (out)
+      put<Tan>(out, atom * OW + item, y);
+    if (!go)
+      return;
+    S g = S(go[atom * OW + item]);
+    if (f == 0) {
+      S ql[5], gql[5];
+      stf(spin, spin, ql);
+      for (int k = 0; k < 5; ++k) {
+        gql[k] = g * a[k];
+        put<Tan>(gb, atom * W + base + Q + k, g * ql[k]);
+      }
+      S gl[3] = {S(0), S(0), S(0)}, gr[3] = {S(0), S(0), S(0)};
+      stf_pull(spin, spin, gql, gl, gr);
+      for (int d = 0; d < 3; ++d)
+        put<Tan>(gs, 3 * atom + d, gl[d] + gr[d]);
+    } else if (f == 6) {
+      for (int d = 0; d < 3; ++d) {
+        put<Tan>(gb, atom * W + base + M + d, g * z[d]);
+        put<Tan>(gb, atom * W + base + DM + d, g * a[d]);
+      }
+    } else
+      for (int k = 0; k < n; ++k)
+        put<Tan>(gb, atom * W + base + off + k, S(2) * g * a[k]);
+    return;
+  }
+  if (item < 7 * C + PW) {
+    int64_t p = item - 7 * C, l = 0, x = p;
+    while (x >= C - l) {
+      x -= C - l;
+      ++l;
+    }
+    int64_t r = l + x;
+    S ml[3], mr[3];
+    for (int d = 0; d < 3; ++d) {
+      ml[d] = sd<S>(bp[l * Sx + M + d], hbp ? hbp + l * Sx + M + d : nullptr);
+      mr[d] = sd<S>(bp[r * Sx + M + d], hbp ? hbp + r * Sx + M + d : nullptr);
+    }
+    S fl = dot(spin, ml, 3), fr = dot(spin, mr, 3),
+      same = sd<S>(bp[Sx * C + p], hbp ? hbp + Sx * C + p : nullptr);
+    y = fl * fr - same;
+    if (out)
+      put<Tan>(out, atom * OW + item, y);
+    if (!go)
+      return;
+    S g = S(go[atom * OW + item]);
+    for (int d = 0; d < 3; ++d) {
+      put<Tan>(gs, 3 * atom + d, g * (fr * ml[d] + fl * mr[d]));
+      put<Tan>(gb, atom * W + l * Sx + M + d, g * fr * spin[d]);
+      put<Tan>(gb, atom * W + r * Sx + M + d, g * fl * spin[d]);
+    }
+    put<Tan>(gb, atom * W + Sx * C + p, -g);
+    return;
+  }
+  int f = (item - 7 * C - PW) / C, r = (item - 7 * C - PW) % C;
+  S p0[3] = {S(0), S(0), S(0)}, p1[3] = {S(0), S(0), S(0)},
+    om0[3] = {S(0), S(0), S(0)}, dom0[3] = {S(0), S(0), S(0)},
+    m1[3] = {S(0), S(0), S(0)}, x2[3] = {S(0), S(0), S(0)},
+    qs1[3] = {S(0), S(0), S(0)}, q0[5] = {S(0), S(0), S(0), S(0), S(0)},
+    q1[5] = {S(0), S(0), S(0), S(0), S(0)};
+  int64_t plane = C * C;
+  for (int64_t c = 0; c < C; ++c) {
+    S mx[4];
+    for (int leg = 0; leg < 4; ++leg)
+      mx[leg] = sd<S>(mix[leg * plane + r * C + c],
+                      hm ? hm + leg * plane + r * C + c : nullptr);
+    S mv[3], pv[3], xv[3], dv[3], ov[3], dov[3], qsv[3], qv[5], qp[15];
+    for (int d = 0; d < 3; ++d) {
+      mv[d] = sd<S>(bp[c * Sx + M + d], hbp ? hbp + c * Sx + M + d : nullptr);
+      pv[d] = sd<S>(bp[c * Sx + P + d], hbp ? hbp + c * Sx + P + d : nullptr);
+      xv[d] = sd<S>(bp[c * Sx + X + d], hbp ? hbp + c * Sx + X + d : nullptr);
+      dv[d] = sd<S>(bp[c * Sx + DM + d], hbp ? hbp + c * Sx + DM + d : nullptr);
+    }
+    for (int k = 0; k < 5; ++k) {
+      qv[k] = sd<S>(bp[c * Sx + Q + k], hbp ? hbp + c * Sx + Q + k : nullptr);
+      for (int d = 0; d < 3; ++d)
+        qp[3 * k + d] = sd<S>(bp[c * Sx + QP + 3 * k + d],
+                              hbp ? hbp + c * Sx + QP + 3 * k + d : nullptr);
+    }
+    cross(spin, mv, ov);
+    cross(spin, dv, dov);
+    qp_vec(qp, qsv);
+    for (int d = 0; d < 3; ++d) {
+      p0[d] += mx[0] * pv[d];
+      p1[d] += mx[1] * pv[d];
+      om0[d] += mx[0] * ov[d];
+      dom0[d] += mx[0] * dov[d];
+      m1[d] += mx[1] * mv[d];
+      x2[d] += mx[2] * xv[d];
+      qs1[d] += mx[1] * qsv[d];
+    }
+    for (int k = 0; k < 5; ++k) {
+      q0[k] += mx[0] * qv[k];
+      q1[k] += mx[1] * qv[k];
+    }
+  }
+  S axis[3];
+  comm(q0, q1, axis);
+  if (f == 0)
+    y = triple(p0, p1, om0);
+  if (f == 1)
+    y = dot(axis, om0, 3);
+  if (f == 2)
+    y = triple(p0, p1, dom0);
+  if (f == 3)
+    y = triple(p0, m1, x2);
+  if (f == 4)
+    y = dot(axis, dom0, 3);
+  if (f == 5)
+    y = triple(p0, qs1, x2);
+  if (out)
+    put<Tan>(out, atom * OW + item, y);
+  if (!go)
+    return;
+  S g = S(go[atom * OW + item]);
+  S gp0[3] = {S(0), S(0), S(0)}, gp1[3] = {S(0), S(0), S(0)},
+    gom[3] = {S(0), S(0), S(0)}, gdom[3] = {S(0), S(0), S(0)},
+    gm1[3] = {S(0), S(0), S(0)}, gx2[3] = {S(0), S(0), S(0)},
+    gqs1[3] = {S(0), S(0), S(0)}, gq0[5] = {S(0), S(0), S(0), S(0), S(0)},
+    gq1[5] = {S(0), S(0), S(0), S(0), S(0)};
+  if (f == 0)
+    triple_pull(p0, p1, om0, g, gp0, gp1, gom);
+  if (f == 2)
+    triple_pull(p0, p1, dom0, g, gp0, gp1, gdom);
+  if (f == 3)
+    triple_pull(p0, m1, x2, g, gp0, gm1, gx2);
+  if (f == 5)
+    triple_pull(p0, qs1, x2, g, gp0, gqs1, gx2);
+  if (f == 1 || f == 4) {
+    S ga[3];
+    for (int d = 0; d < 3; ++d) {
+      ga[d] = g * (f == 1 ? om0[d] : dom0[d]);
+      if (f == 1)
+        gom[d] += g * axis[d];
+      else
+        gdom[d] += g * axis[d];
+    }
+    comm_pull(q0, q1, ga, gq0, gq1);
+  }
+  for (int64_t c = 0; c < C; ++c) {
+    S mx[4];
+    for (int leg = 0; leg < 4; ++leg)
+      mx[leg] = sd<S>(mix[leg * plane + r * C + c],
+                      hm ? hm + leg * plane + r * C + c : nullptr);
+    S mv[3], pv[3], xv[3], dv[3], ov[3], dov[3], qsv[3], qv[5], qp[15];
+    for (int d = 0; d < 3; ++d) {
+      mv[d] = sd<S>(bp[c * Sx + M + d], hbp ? hbp + c * Sx + M + d : nullptr);
+      pv[d] = sd<S>(bp[c * Sx + P + d], hbp ? hbp + c * Sx + P + d : nullptr);
+      xv[d] = sd<S>(bp[c * Sx + X + d], hbp ? hbp + c * Sx + X + d : nullptr);
+      dv[d] = sd<S>(bp[c * Sx + DM + d], hbp ? hbp + c * Sx + DM + d : nullptr);
+    }
+    for (int k = 0; k < 5; ++k) {
+      qv[k] = sd<S>(bp[c * Sx + Q + k], hbp ? hbp + c * Sx + Q + k : nullptr);
+      for (int d = 0; d < 3; ++d)
+        qp[3 * k + d] = sd<S>(bp[c * Sx + QP + 3 * k + d],
+                              hbp ? hbp + c * Sx + QP + 3 * k + d : nullptr);
+    }
+    cross(spin, mv, ov);
+    cross(spin, dv, dov);
+    qp_vec(qp, qsv);
+    S gmx[4] = {S(0), S(0), S(0), S(0)}, gmv[3] = {S(0), S(0), S(0)},
+      gpv[3] = {S(0), S(0), S(0)}, gxv[3] = {S(0), S(0), S(0)},
+      gdv[3] = {S(0), S(0), S(0)}, gov[3], gdov[3], gqsv[3], gqv[5], gqp[15];
+    for (int d = 0; d < 3; ++d) {
+      gov[d] = mx[0] * gom[d];
+      gdov[d] = mx[0] * gdom[d];
+      gqsv[d] = mx[1] * gqs1[d];
+      gpv[d] = mx[0] * gp0[d] + mx[1] * gp1[d];
+      gmv[d] = mx[1] * gm1[d];
+      gxv[d] = mx[2] * gx2[d];
+      gmx[0] += gp0[d] * pv[d] + gom[d] * ov[d] + gdom[d] * dov[d];
+      gmx[1] += gp1[d] * pv[d] + gm1[d] * mv[d] + gqs1[d] * qsv[d];
+      gmx[2] += gx2[d] * xv[d];
+    }
+    for (int k = 0; k < 5; ++k) {
+      gqv[k] = mx[0] * gq0[k] + mx[1] * gq1[k];
+      gmx[0] += gq0[k] * qv[k];
+      gmx[1] += gq1[k] * qv[k];
+    }
+    for (int k = 0; k < 15; ++k)
+      gqp[k] = S(0);
+    S gspin0[3] = {S(0), S(0), S(0)}, gspin1[3] = {S(0), S(0), S(0)};
+    cross_pull(spin, mv, gov, gspin0, gmv);
+    cross_pull(spin, dv, gdov, gspin1, gdv);
+    qp_pull(gqsv, gqp);
+    for (int d = 0; d < 3; ++d) {
+      put<Tan>(gs, 3 * atom + d, gspin0[d] + gspin1[d]);
+      put<Tan>(gb, atom * W + c * Sx + M + d, gmv[d]);
+      put<Tan>(gb, atom * W + c * Sx + P + d, gpv[d]);
+      put<Tan>(gb, atom * W + c * Sx + X + d, gxv[d]);
+      put<Tan>(gb, atom * W + c * Sx + DM + d, gdv[d]);
+    }
+    for (int k = 0; k < 5; ++k) {
+      put<Tan>(gb, atom * W + c * Sx + Q + k, gqv[k]);
+      for (int d = 0; d < 3; ++d)
+        put<Tan>(gb, atom * W + c * Sx + QP + 3 * k + d, gqp[3 * k + d]);
+    }
+    for (int leg = 0; leg < 4; ++leg)
+      put<Tan>(gm, leg * plane + r * C + c, gmx[leg]);
+  }
 }
-template<class T>__global__ void fk(const T*b,const T*s,const T*m,int64_t A,int64_t C,int64_t W,int64_t OW,T*o){int64_t z=blockIdx.x*blockDim.x+threadIdx.x;if(z>=A*OW)return;item<false,T,T>(nullptr,b,s,m,nullptr,nullptr,nullptr,z/OW,C,W,z%OW,o,nullptr,nullptr,nullptr);}template<class T>__global__ void bk(const T*go,const T*b,const T*s,const T*m,int64_t A,int64_t C,int64_t W,int64_t OW,T*gb,T*gs,T*gm){int64_t z=blockIdx.x*blockDim.x+threadIdx.x;if(z>=A*OW)return;item<false,T,T>(go,b,s,m,nullptr,nullptr,nullptr,z/OW,C,W,z%OW,nullptr,gb,gs,gm);}template<class T>__global__ void dk(const T*go,const T*b,const T*s,const T*m,const T*hb,const T*hs,const T*hm,int64_t A,int64_t C,int64_t W,int64_t OW,T*ggo,T*gb,T*gs,T*gm){int64_t z=blockIdx.x*blockDim.x+threadIdx.x;if(z>=A*OW)return;item<true,D<T>,T>(go,b,s,m,hb,hs,hm,z/OW,C,W,z%OW,ggo,gb,gs,gm);}
-void ck(const torch::Tensor&b,const torch::Tensor&s,const torch::Tensor&m){TORCH_CHECK(b.is_cuda()&&s.is_cuda()&&m.is_cuda()&&b.is_contiguous()&&s.is_contiguous()&&m.is_contiguous(),"generic center inputs must be contiguous CUDA");int64_t C=m.size(1);TORCH_CHECK(m.dim()==3&&m.size(0)==4&&m.size(2)==C&&b.size(1)==Sx*C+C*(C+1)/2+3*C,"generic center runtime-C width mismatch");}
+template <class T>
+__global__ void fk(const T *b, const T *s, const T *m, int64_t A, int64_t C,
+                   int64_t W, int64_t OW, T *o) {
+  int64_t z = blockIdx.x * blockDim.x + threadIdx.x;
+  if (z >= A * OW)
+    return;
+  item<false, T, T>(nullptr, b, s, m, nullptr, nullptr, nullptr, z / OW, C, W,
+                    z % OW, o, nullptr, nullptr, nullptr);
 }
-torch::Tensor cf(torch::Tensor b,torch::Tensor s,torch::Tensor m){ck(b,s,m);c10::cuda::CUDAGuard g(b.device());int64_t C=m.size(1),OW=13*C+C*(C+1)/2,n=b.size(0)*OW;auto o=torch::zeros({b.size(0),OW},b.options());int t=128,bl=(n+t-1)/t;AT_DISPATCH_FLOATING_TYPES(b.scalar_type(),"generic_center_forward",[&]{fk<scalar_t><<<bl,t,0,at::cuda::getCurrentCUDAStream()>>>(b.data_ptr<scalar_t>(),s.data_ptr<scalar_t>(),m.data_ptr<scalar_t>(),b.size(0),C,b.size(1),OW,o.data_ptr<scalar_t>());});C10_CUDA_KERNEL_LAUNCH_CHECK();return o;}
-std::vector<torch::Tensor> cb(torch::Tensor go,torch::Tensor b,torch::Tensor s,torch::Tensor m){ck(b,s,m);c10::cuda::CUDAGuard g(b.device());int64_t C=m.size(1),OW=13*C+C*(C+1)/2,n=b.size(0)*OW;auto gb=torch::zeros_like(b),gs=torch::zeros_like(s),gm=torch::zeros_like(m);int t=128,bl=(n+t-1)/t;AT_DISPATCH_FLOATING_TYPES(b.scalar_type(),"generic_center_backward",[&]{bk<scalar_t><<<bl,t,0,at::cuda::getCurrentCUDAStream()>>>(go.data_ptr<scalar_t>(),b.data_ptr<scalar_t>(),s.data_ptr<scalar_t>(),m.data_ptr<scalar_t>(),b.size(0),C,b.size(1),OW,gb.data_ptr<scalar_t>(),gs.data_ptr<scalar_t>(),gm.data_ptr<scalar_t>());});C10_CUDA_KERNEL_LAUNCH_CHECK();return{gb,gs,gm};}
-std::vector<torch::Tensor> cd(torch::Tensor go,torch::Tensor b,torch::Tensor s,torch::Tensor m,torch::Tensor hb,torch::Tensor hs,torch::Tensor hm){ck(b,s,m);c10::cuda::CUDAGuard g(b.device());int64_t C=m.size(1),OW=13*C+C*(C+1)/2,n=b.size(0)*OW;auto ggo=torch::zeros_like(go),gb=torch::zeros_like(b),gs=torch::zeros_like(s),gm=torch::zeros_like(m);int t=128,bl=(n+t-1)/t;AT_DISPATCH_FLOATING_TYPES(b.scalar_type(),"generic_center_double",[&]{dk<scalar_t><<<bl,t,0,at::cuda::getCurrentCUDAStream()>>>(go.data_ptr<scalar_t>(),b.data_ptr<scalar_t>(),s.data_ptr<scalar_t>(),m.data_ptr<scalar_t>(),hb.data_ptr<scalar_t>(),hs.data_ptr<scalar_t>(),hm.data_ptr<scalar_t>(),b.size(0),C,b.size(1),OW,ggo.data_ptr<scalar_t>(),gb.data_ptr<scalar_t>(),gs.data_ptr<scalar_t>(),gm.data_ptr<scalar_t>());});C10_CUDA_KERNEL_LAUNCH_CHECK();return{ggo,gb,gs,gm};}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("forward",&cf);m.def("backward",&cb);m.def("double_backward",&cd);}
+template <class T>
+__global__ void bk(const T *go, const T *b, const T *s, const T *m, int64_t A,
+                   int64_t C, int64_t W, int64_t OW, T *gb, T *gs, T *gm) {
+  int64_t z = blockIdx.x * blockDim.x + threadIdx.x;
+  if (z >= A * OW)
+    return;
+  item<false, T, T>(go, b, s, m, nullptr, nullptr, nullptr, z / OW, C, W,
+                    z % OW, nullptr, gb, gs, gm);
+}
+template <class T>
+__global__ void dk(const T *go, const T *b, const T *s, const T *m, const T *hb,
+                   const T *hs, const T *hm, int64_t A, int64_t C, int64_t W,
+                   int64_t OW, T *ggo, T *gb, T *gs, T *gm) {
+  int64_t z = blockIdx.x * blockDim.x + threadIdx.x;
+  if (z >= A * OW)
+    return;
+  item<true, D<T>, T>(go, b, s, m, hb, hs, hm, z / OW, C, W, z % OW, ggo, gb,
+                      gs, gm);
+}
+void ck(const torch::Tensor &b, const torch::Tensor &s,
+        const torch::Tensor &m) {
+  TORCH_CHECK(b.is_cuda() && s.is_cuda() && m.is_cuda() && b.is_contiguous() &&
+                  s.is_contiguous() && m.is_contiguous(),
+              "generic center inputs must be contiguous CUDA");
+  int64_t C = m.size(1);
+  TORCH_CHECK(m.dim() == 3 && m.size(0) == 4 && m.size(2) == C &&
+                  b.size(1) == Sx * C + C * (C + 1) / 2 + 3 * C,
+              "generic center runtime-C width mismatch");
+}
+} // namespace
+torch::Tensor cf(torch::Tensor b, torch::Tensor s, torch::Tensor m) {
+  ck(b, s, m);
+  c10::cuda::CUDAGuard g(b.device());
+  int64_t C = m.size(1), OW = 13 * C + C * (C + 1) / 2, n = b.size(0) * OW;
+  auto o = torch::zeros({b.size(0), OW}, b.options());
+  int t = 128, bl = (n + t - 1) / t;
+  AT_DISPATCH_FLOATING_TYPES(b.scalar_type(), "generic_center_forward", [&] {
+    fk<scalar_t><<<bl, t, 0, at::cuda::getCurrentCUDAStream()>>>(
+        b.data_ptr<scalar_t>(), s.data_ptr<scalar_t>(), m.data_ptr<scalar_t>(),
+        b.size(0), C, b.size(1), OW, o.data_ptr<scalar_t>());
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return o;
+}
+std::vector<torch::Tensor> cb(torch::Tensor go, torch::Tensor b,
+                              torch::Tensor s, torch::Tensor m) {
+  ck(b, s, m);
+  c10::cuda::CUDAGuard g(b.device());
+  int64_t C = m.size(1), OW = 13 * C + C * (C + 1) / 2, n = b.size(0) * OW;
+  auto gb = torch::zeros_like(b), gs = torch::zeros_like(s),
+       gm = torch::zeros_like(m);
+  int t = 128, bl = (n + t - 1) / t;
+  AT_DISPATCH_FLOATING_TYPES(b.scalar_type(), "generic_center_backward", [&] {
+    bk<scalar_t><<<bl, t, 0, at::cuda::getCurrentCUDAStream()>>>(
+        go.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), s.data_ptr<scalar_t>(),
+        m.data_ptr<scalar_t>(), b.size(0), C, b.size(1), OW,
+        gb.data_ptr<scalar_t>(), gs.data_ptr<scalar_t>(),
+        gm.data_ptr<scalar_t>());
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {gb, gs, gm};
+}
+std::vector<torch::Tensor> cd(torch::Tensor go, torch::Tensor b,
+                              torch::Tensor s, torch::Tensor m,
+                              torch::Tensor hb, torch::Tensor hs,
+                              torch::Tensor hm) {
+  ck(b, s, m);
+  c10::cuda::CUDAGuard g(b.device());
+  int64_t C = m.size(1), OW = 13 * C + C * (C + 1) / 2, n = b.size(0) * OW;
+  auto ggo = torch::zeros_like(go), gb = torch::zeros_like(b),
+       gs = torch::zeros_like(s), gm = torch::zeros_like(m);
+  int t = 128, bl = (n + t - 1) / t;
+  AT_DISPATCH_FLOATING_TYPES(b.scalar_type(), "generic_center_double", [&] {
+    dk<scalar_t><<<bl, t, 0, at::cuda::getCurrentCUDAStream()>>>(
+        go.data_ptr<scalar_t>(), b.data_ptr<scalar_t>(), s.data_ptr<scalar_t>(),
+        m.data_ptr<scalar_t>(), hb.data_ptr<scalar_t>(),
+        hs.data_ptr<scalar_t>(), hm.data_ptr<scalar_t>(), b.size(0), C,
+        b.size(1), OW, ggo.data_ptr<scalar_t>(), gb.data_ptr<scalar_t>(),
+        gs.data_ptr<scalar_t>(), gm.data_ptr<scalar_t>());
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {ggo, gb, gs, gm};
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("forward", &cf);
+  m.def("backward", &cb);
+  m.def("double_backward", &cd);
+}
