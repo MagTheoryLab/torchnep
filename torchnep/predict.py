@@ -14,12 +14,15 @@
 """
 Full-dataset prediction for NEP models.
 
-Pipeline:
-  1. read_xyz
-  2. preprocess_structures(...)  — multi-process neighbor lists (CPU)
-  3. concatenate all structures into flat tensors uploaded to the GPU once
-  4. batched compute_batch loop (basis recomputed per batch, no host transfer)
-  5. vectorised numpy.savetxt for outputs (per-atom virial matches GPUMD)
+Pipeline (streamed, 1.0.3a2):
+  1. index_xyz — byte offsets + atom counts, one I/O pass, no parsing
+  2. per chunk of ~chunk_atoms atoms: read_xyz_at -> preprocess_structures
+     (multi-process neighbor lists, CPU) -> flat host arrays
+  3. batched compute_batch loop over the chunk (basis recomputed per batch,
+     only the batch slice goes to the device; auto batch size + OOM retry)
+  4. numpy.savetxt appends the chunk's rows (per-atom virial matches GPUMD)
+Host memory is bounded by the chunk, device memory by the batch: any dataset
+finishes on any machine, only the wall time differs.
 """
 
 import os
@@ -28,7 +31,6 @@ import torch
 import numpy as np
 
 from .nep import NEPCalculator
-from .data import read_xyz
 from . import ops
 
 
@@ -84,98 +86,70 @@ def _virial9_to_6(v9):
     return out
 
 
-def predict_dataset(
-    model_file: str,
-    xyz_file: str,
-    output_dir: str = ".",
-    dtype: str = "float64",
-    device: str = None,
-    batch_size: int = 1000,
-    verbose: bool = True,
-    backend: str = "auto",
-    energy_key: str = "energy",
-    output_descriptor: int = 0,
-):
-    """Run batched prediction on a full dataset and save GPUMD-format outputs.
+class _Progress:
+    """Frames-done progress line for predict_dataset: tqdm when installed,
+    otherwise a dependency-free single-line bar. Silent when verbose=False."""
 
-    Outputs (per-atom for energy and virial; per-atom raw for forces):
-      - energy_train.out:  e_pred  e_target              (eV/atom, per frame)
-      - force_train.out:   fx fy fz  fx_t fy_t fz_t      (eV/A, per atom)
-      - virial_train.out:  xx yy zz xy yz zx (pred, ref) (eV/atom, per frame)
-      - descriptor.out (only when ``output_descriptor != 0``):
-          mode 1 — per-frame averaged scaled descriptor, one row per frame
-          mode 2 — per-atom scaled descriptor, one row per atom
-        Matches GPUMD's ``output_descriptor`` / ``descriptor.out`` schema.
+    def __init__(self, total, enabled):
+        self.total, self.enabled, self.n, self.t0 = total, enabled, 0, time.time()
+        self.bar = None
+        if enabled:
+            try:
+                from tqdm import tqdm
+                self.bar = tqdm(total=total, unit="frame", unit_scale=True,
+                                desc="  predict", dynamic_ncols=True, leave=True)
+            except Exception:
+                self.bar = None
+                self._draw()
 
-    The format mirrors GPUMD's *_train.out files, so the two can be diffed
-    column by column.
-
-    Parameters
-    ----------
-    output_descriptor : int
-        0 — disabled (default).
-        1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
-        2 — write per-atom ``q * q_scaler`` to descriptor.out.
-
-    ``backend`` in {"auto", "loop", "bmm"} — see
-    ``torchnep.ops.resolve_backend``.
-    """
-    if device is None:
-        # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = "xpu"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
+    def update(self, k):
+        if not self.enabled:
+            return
+        self.n += k
+        if self.bar is not None:
+            self.bar.update(k)
         else:
-            device = "cpu"
+            self._draw()
 
-    dt = torch.float64 if dtype == "float64" else torch.float32
-    np_dtype = np.float64 if dtype == "float64" else np.float32
+    def _draw(self):
+        frac = self.n / max(1, self.total); el = time.time() - self.t0
+        eta = el / frac - el if frac > 0 else 0.0
+        width = 30; done = int(width * frac)
+        print(f"\r  predict [{'#' * done}{'-' * (width - done)}] {self.n}/{self.total} frames "
+              f"{100 * frac:5.1f}%  {el:6.1f}s  ETA {eta:6.1f}s", end="", flush=True)
 
-    def _log(msg):
-        if verbose:
-            print(msg, flush=True)
+    def close(self):
+        if not self.enabled:
+            return
+        if self.bar is not None:
+            self.bar.close()
+        else:
+            print(flush=True)
 
-    t_total = time.time()
-    calc = NEPCalculator(model_file, dtype=dt, device=device)
-    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
-    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
-    l_max_3b = calc.l_max_3b
-    num_lm = calc.num_lm
+    def write(self, msg):
+        if not self.enabled:
+            return
+        if self.bar is not None:
+            self.bar.write(msg)
+        else:
+            print("\r" + msg + " " * 20, flush=True); self._draw()
 
-    # Resolve "auto" now that num_types is known (>=8 -> "bmm", else "loop").
-    backend = ops.resolve_backend(backend, num_types=calc.num_types)
-    _log(f"  backend: {backend}")
 
-    # 1) Read xyz
-    t0 = time.time()
-    frames = read_xyz(xyz_file, energy_key=energy_key)
-    if calc.spin_mode and any("spins" not in frame for frame in frames):
-        raise ValueError(
-            "spin model requires a spin/moment vector for every atom")
-    n_struct = len(frames)
-    _log(f"  read_xyz:    {time.time() - t0:5.1f}s   ({n_struct} frames, "
-         f"energy label: {energy_key})")
+def _chunk_bounds(natoms, chunk_atoms, max_frames):
+    """Split frames [0, n) into consecutive chunks holding ~``chunk_atoms`` atoms
+    (at most ``max_frames`` frames, always >= 1 frame). Returns (lo, hi) pairs."""
+    bounds, lo, acc = [], 0, 0
+    for i, n in enumerate(natoms):
+        acc += int(n)
+        if acc >= chunk_atoms or (i + 1 - lo) >= max_frames:
+            bounds.append((lo, i + 1)); lo, acc = i + 1, 0
+    if lo < len(natoms):
+        bounds.append((lo, len(natoms)))
+    return bounds
 
-    # 2) Multi-process neighbor-list construction
-    from .train import preprocess_structures  # local import: avoid cycle
 
-    t0 = time.time()
-    pp_config = {
-        "cutoff_radial": rc_rad,
-        "cutoff_angular": rc_ang,
-        "type_names": calc.type_names,
-        "spin_mode": calc.spin_mode,
-        "spin_cutoff": calc.spin_cutoff,
-    }
-    structures = preprocess_structures(frames, pp_config, np_dtype)
-    del frames
-    _log(f"  neighbors:   {time.time() - t0:5.1f}s")
-
-    # 3) Concatenate everything once and move raw data to the GPU.
-    t0 = time.time()
+def _chunk_arrays(structures, np_dtype):
+    """Concatenate one chunk of preprocessed structures into flat host arrays."""
     natoms_arr = np.asarray([s["natoms"] for s in structures], dtype=np.int64)
     volumes_arr = np.asarray([s.get("volume", 0.0) for s in structures],
                              dtype=np.float64)
@@ -183,301 +157,635 @@ def predict_dataset(
                           dtype=np.int64)
     nang_arr = np.asarray([len(s["pair_i_ang"]) for s in structures],
                           dtype=np.int64)
-    nspin_arr = (
-        np.asarray([len(s["pair_i_spin"]) for s in structures],
-                   dtype=np.int64)
-        if calc.spin_mode else None
-    )
     nat_cum = np.concatenate([[0], np.cumsum(natoms_arr)])
-    nrad_cum = np.concatenate([[0], np.cumsum(nrad_arr)])
-    nang_cum = np.concatenate([[0], np.cumsum(nang_arr)])
-    nspin_cum = (
-        np.concatenate([[0], np.cumsum(nspin_arr)])
-        if calc.spin_mode else None
+    c = dict(
+        natoms=natoms_arr, volumes=volumes_arr, nrad=nrad_arr, nang=nang_arr,
+        nat_cum=nat_cum,
+        nrad_cum=np.concatenate([[0], np.cumsum(nrad_arr)]),
+        nang_cum=np.concatenate([[0], np.cumsum(nang_arr)]),
+        # Pair indices are global within the chunk (atom positions in the
+        # concatenation); a batch slice only subtracts its first-atom offset.
+        at=np.concatenate([s["atom_types"] for s in structures]),
+        pi_r=np.concatenate([s["pair_i_rad"] + nat_cum[i] for i, s in enumerate(structures)]),
+        pj_r=np.concatenate([s["pair_j_rad"] + nat_cum[i] for i, s in enumerate(structures)]),
+        rij_r=np.concatenate([s["rij_rad"] for s in structures]),
+        pi_a=np.concatenate([s["pair_i_ang"] + nat_cum[i] for i, s in enumerate(structures)]),
+        pj_a=np.concatenate([s["pair_j_ang"] + nat_cum[i] for i, s in enumerate(structures)]),
+        rij_a=np.concatenate([s["rij_ang"] for s in structures]),
     )
-    N_atoms_total = int(nat_cum[-1])
-
-    # Pair indices are global (atom positions in the concatenation), so a
-    # per-batch slice only needs to subtract the batch's first-atom offset.
-    all_at = np.concatenate([s["atom_types"] for s in structures])
-    all_pi_r = np.concatenate(
-        [s["pair_i_rad"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_pj_r = np.concatenate(
-        [s["pair_j_rad"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_rij_r = np.concatenate([s["rij_rad"] for s in structures])
-    all_pi_a = np.concatenate(
-        [s["pair_i_ang"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_pj_a = np.concatenate(
-        [s["pair_j_ang"] + nat_cum[i] for i, s in enumerate(structures)])
-    all_rij_a = np.concatenate([s["rij_ang"] for s in structures])
-    if calc.spin_mode:
-        all_pi_s = np.concatenate(
-            [s["pair_i_spin"] + nat_cum[i]
-             for i, s in enumerate(structures)])
-        all_pj_s = np.concatenate(
-            [s["pair_j_spin"] + nat_cum[i]
-             for i, s in enumerate(structures)])
-        all_rij_s = np.concatenate([s["rij_spin"] for s in structures])
-        all_spins = np.concatenate([s["spins"] for s in structures])
-
-    energy_ref = np.array(
+    n_struct, N_atoms = len(structures), int(nat_cum[-1])
+    c["energy_ref"] = np.array(
         [s["energy"] if s.get("energy") is not None else np.nan
          for s in structures], dtype=np.float64)
-
-    has_forces_global = any(s.get("forces") is not None for s in structures)
-    forces_ref = None
-    if has_forces_global:
-        forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-        for i, s in enumerate(structures):
-            f = s.get("forces")
-            if f is not None:
-                forces_ref[nat_cum[i]:nat_cum[i + 1]] = \
-                    np.asarray(f).reshape(-1, 3)
-
-    has_mforces_global = any(
-        s.get("mforces") is not None for s in structures)
-    mforces_ref = None
-    tau_ref = None
-    if calc.spin_mode:
-        mforces_ref = np.full(
-            (N_atoms_total, 3), np.nan, dtype=np.float64)
-        tau_ref = np.full(
-            (N_atoms_total, 3), np.nan, dtype=np.float64)
-        for i, s in enumerate(structures):
-            magnetic_force = s.get("mforces")
-            if magnetic_force is not None:
-                a_lo, a_hi = nat_cum[i], nat_cum[i + 1]
-                mforces_ref[a_lo:a_hi] = np.asarray(
-                    magnetic_force).reshape(-1, 3)
-                tau_ref[a_lo:a_hi] = np.asarray(s["tau"]).reshape(-1, 3)
-
-    has_virial_global = any(s.get("virial") is not None for s in structures)
+    forces_ref = np.full((N_atoms, 3), np.nan, dtype=np.float64)
+    for i, s in enumerate(structures):
+        f = s.get("forces")
+        if f is not None:
+            forces_ref[nat_cum[i]:nat_cum[i + 1]] = np.asarray(f).reshape(-1, 3)
+    c["forces_ref"] = forces_ref
+    # Per-atom reference virial, GPUMD 6-vector (xx yy zz xy yz zx). The
+    # off-diagonal pick matches _virial9_to_6 so both columns share one
+    # definition; frames without a virial carry the -1e6 sentinel.
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
-    if has_virial_global:
-        # Per-atom virial, to match GPUMD's *_train.out columns. Off-diagonal
-        # pairs are picked the same way as the prediction, so the two columns
-        # are computed on the exact same definition.
+    for i, s in enumerate(structures):
+        v = s.get("virial")
+        if v is None:
+            continue
+        v = np.asarray(v).flatten()
+        inv_n = 1.0 / float(s["natoms"])
+        if v.size == 9:
+            virial_ref[i] = [v[0] * inv_n, v[4] * inv_n, v[8] * inv_n,
+                             v[1] * inv_n, v[5] * inv_n, v[6] * inv_n]
+        elif v.size >= 6:
+            virial_ref[i] = v[:6] * inv_n
+    c["virial_ref"] = virial_ref
+    if structures and "spins" in structures[0]:
+        nspin = np.asarray(
+            [len(s["pair_i_spin"]) for s in structures], dtype=np.int64)
+        c["nspin"] = nspin
+        c["nspin_cum"] = np.concatenate([[0], np.cumsum(nspin)])
+        c["pi_s"] = np.concatenate([
+            s["pair_i_spin"] + nat_cum[i]
+            for i, s in enumerate(structures)])
+        c["pj_s"] = np.concatenate([
+            s["pair_j_spin"] + nat_cum[i]
+            for i, s in enumerate(structures)])
+        c["rij_s"] = np.concatenate([s["rij_spin"] for s in structures])
+        c["spins"] = np.concatenate([s["spins"] for s in structures])
+        mforce_ref = np.full((N_atoms, 3), np.nan, dtype=np.float64)
+        tau_ref = np.full((N_atoms, 3), np.nan, dtype=np.float64)
         for i, s in enumerate(structures):
-            v = s.get("virial")
-            if v is None:
-                continue
-            v = np.asarray(v).flatten()
-            inv_n = 1.0 / float(s["natoms"])
-            if v.size == 9:
-                # Single-triangular pick to match GPUMD (see _virial9_to_6).
-                # Input XYZ virial is symmetric (DFT), so xy=yx etc., making
-                # this choice numerically equal to averaging.
-                virial_ref[i] = [
-                    v[0] * inv_n,   # xx
-                    v[4] * inv_n,   # yy
-                    v[8] * inv_n,   # zz
-                    v[1] * inv_n,   # xy
-                    v[5] * inv_n,   # yz
-                    v[6] * inv_n,   # zx
-                ]
-            elif v.size >= 6:
-                virial_ref[i] = v[:6] * inv_n
+            lo, hi = nat_cum[i], nat_cum[i + 1]
+            if s.get("mforces") is not None:
+                mforce_ref[lo:hi] = np.asarray(s["mforces"]).reshape(-1, 3)
+            if s.get("tau") is not None:
+                tau_ref[lo:hi] = np.asarray(s["tau"]).reshape(-1, 3)
+        c["mforces_ref"] = mforce_ref
+        c["tau_ref"] = tau_ref
+    return c
 
-    del structures  # free CPU memory
 
-    at_gpu    = torch.from_numpy(all_at).to(device=device)
-    pi_r_gpu  = torch.from_numpy(all_pi_r).to(device=device)
-    pj_r_gpu  = torch.from_numpy(all_pj_r).to(device=device)
-    rij_r_gpu = torch.from_numpy(all_rij_r).to(device=device, dtype=dt)
-    pi_a_gpu  = torch.from_numpy(all_pi_a).to(device=device)
-    pj_a_gpu  = torch.from_numpy(all_pj_a).to(device=device)
-    rij_a_gpu = torch.from_numpy(all_rij_a).to(device=device, dtype=dt)
-    if calc.spin_mode:
-        pi_s_gpu = torch.from_numpy(all_pi_s).to(device=device)
-        pj_s_gpu = torch.from_numpy(all_pj_s).to(device=device)
-        rij_s_gpu = torch.from_numpy(all_rij_s).to(device=device, dtype=dt)
-        spins_gpu = torch.from_numpy(all_spins).to(device=device, dtype=dt)
+def _auto_batch_size(calc, dt, chunk, n_struct, log):
+    """Bound the per-batch device footprint by a fraction of the free GPU
+    memory, from the chunk's average per-frame pair counts and a conservative
+    bytes-per-pair model of the batch tensors plus the kernels' intermediates
+    (the safety factor absorbs backend differences). CPU/other devices: 1000."""
+    try:
+        free_b, _ = torch.cuda.mem_get_info()
+    except Exception:
+        return 1000
+    esize = 8 if dt == torch.float64 else 4
+    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
+    num_lm, nmax_a = calc.num_lm, calc.n_max_angular
+    avg_nrad = max(1.0, float(chunk["nrad"].mean()))
+    avg_nang = max(1.0, float(chunk["nang"].mean()))
+    avg_nspin = (max(1.0, float(chunk["nspin"].mean()))
+                 if "nspin" in chunk else 0.0)
+    avg_nat = max(1.0, float(chunk["natoms"].mean()))
+    # dominant term: the analytical-force angular intermediates hold
+    # ~(n_max_a+1) x num_lm floats per angular pair, a few times over.
+    per_frame = (avg_nrad * (esize * (2 * (basis_r + 1) + 8) + 16)
+                 + avg_nang * (esize * (3 * (nmax_a + 1) * num_lm
+                                        + 2 * (basis_a + 1) + 2 * num_lm
+                                        + 12) + 16)
+                 + avg_nspin * (esize * 24 + 16)
+                 + avg_nat * esize * 4 * calc.dim)
+    bs = int(0.25 * free_b / (3.0 * per_frame))
+    # Throughput is flat beyond a few thousand frames per batch (measured on
+    # V100/MI250X), so cap the auto choice — larger batches only inflate the
+    # memory peak.
+    bs = max(16, min(bs, n_struct, 16384))
+    log(f"  batch_size:  auto -> {bs} (free {free_b/2**30:.1f} GiB, "
+        f"~{per_frame/1024:.0f} KiB/frame est.)")
+    return bs
+
+
+def _predict_chunk(calc, chunk, batch_size, device, dt, backend,
+                   output_descriptor, log, progress=None):
+    """Batched compute over one chunk.
+
+    Returns E/F/V/MF/Tau/descriptor predictions and the possibly reduced
+    batch size after an OOM retry.
+    """
+    n_struct = len(chunk["natoms"]); N_atoms = int(chunk["nat_cum"][-1])
+    nat_cum, nrad_cum, nang_cum = chunk["nat_cum"], chunk["nrad_cum"], chunk["nang_cum"]
+    natoms_arr = chunk["natoms"]
+    rc_rad, rc_ang = calc.rc_radial, calc.rc_angular
+    basis_r, basis_a = calc.basis_size_radial, calc.basis_size_angular
+    # Host-resident staging: only each batch's slice is shipped to the device
+    # inside the loop, so GPU memory scales with batch_size, not chunk size.
+    at_cpu = torch.from_numpy(chunk["at"])
+    pi_r_cpu, pj_r_cpu = torch.from_numpy(chunk["pi_r"]), torch.from_numpy(chunk["pj_r"])
+    rij_r_cpu = torch.from_numpy(chunk["rij_r"])
+    pi_a_cpu, pj_a_cpu = torch.from_numpy(chunk["pi_a"]), torch.from_numpy(chunk["pj_a"])
+    rij_a_cpu = torch.from_numpy(chunk["rij_a"])
+    has_spin = "spins" in chunk
+    if has_spin:
+        nspin_cum = chunk["nspin_cum"]
+        pi_s_cpu = torch.from_numpy(chunk["pi_s"])
+        pj_s_cpu = torch.from_numpy(chunk["pj_s"])
+        rij_s_cpu = torch.from_numpy(chunk["rij_s"])
+        spins_cpu = torch.from_numpy(chunk["spins"])
     natoms_gpu = torch.from_numpy(natoms_arr).to(device=device)
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    _log(f"  upload:      {time.time() - t0:5.1f}s")
-    del (all_at, all_pi_r, all_pj_r, all_rij_r,
-         all_pi_a, all_pj_a, all_rij_a)
-    if calc.spin_mode:
-        del all_pi_s, all_pj_s, all_rij_s, all_spins
 
-    # 4) Batched compute loop ------------------------------------------------
-    e_pred_arr = np.empty(n_struct, dtype=np.float64)
-    # Predictions are independent of whether the input carries reference
-    # labels.  In particular, an unlabeled inference XYZ must still produce
-    # the model force rather than a zero-filled placeholder.
-    f_pred_arr = np.empty((N_atoms_total, 3), dtype=np.float64)
-    v_pred_arr = np.empty((n_struct, 6), dtype=np.float64)
-    m_pred_arr = (
-        np.empty((N_atoms_total, 3), dtype=np.float64)
-        if calc.spin_mode else None)
-    t_pred_arr = (
-        np.empty((N_atoms_total, 3), dtype=np.float64)
-        if calc.spin_mode else None)
-
-    # Descriptor buffer (only allocated when requested).
-    #   mode 1 -> (n_struct, dim)         per-frame averaged scaled descriptor
-    #   mode 2 -> (N_atoms_total, dim)    per-atom scaled descriptor
-    d_pred_arr = None
+    e_pred = np.empty(n_struct, dtype=np.float64)
+    f_pred = np.empty((N_atoms, 3), dtype=np.float64)
+    v_pred = np.empty((n_struct, 6), dtype=np.float64)
+    m_pred = (np.empty((N_atoms, 3), dtype=np.float64)
+              if has_spin else None)
+    tau_pred = (np.empty((N_atoms, 3), dtype=np.float64)
+                if has_spin else None)
+    d_pred = None
     if output_descriptor == 1:
-        d_pred_arr = np.empty((n_struct, calc.dim), dtype=np.float64)
+        d_pred = np.empty((n_struct, calc.dim), dtype=np.float64)
     elif output_descriptor == 2:
-        d_pred_arr = np.empty((N_atoms_total, calc.dim), dtype=np.float64)
+        d_pred = np.empty((N_atoms, calc.dim), dtype=np.float64)
 
-    t0 = time.time()
     with torch.no_grad():
-        for start in range(0, n_struct, batch_size):
+        start = 0
+        while start < n_struct:
             end = min(start + batch_size, n_struct)
             B = end - start
-            a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
-            r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
-            g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
-            N = a_hi - a_lo
+            try:
+                a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
+                r_lo, r_hi = int(nrad_cum[start]), int(nrad_cum[end])
+                g_lo, g_hi = int(nang_cum[start]), int(nang_cum[end])
+                N = a_hi - a_lo
+                atom_types = at_cpu[a_lo:a_hi].to(device)
+                pi_r = pi_r_cpu[r_lo:r_hi].to(device) - a_lo
+                pj_r = pj_r_cpu[r_lo:r_hi].to(device) - a_lo
+                rij_r = rij_r_cpu[r_lo:r_hi].to(device=device, dtype=dt)
+                pi_a = pi_a_cpu[g_lo:g_hi].to(device) - a_lo
+                pj_a = pj_a_cpu[g_lo:g_hi].to(device) - a_lo
+                rij_a = rij_a_cpu[g_lo:g_hi].to(device=device, dtype=dt)
+                struct_idx = torch.repeat_interleave(
+                    torch.arange(B, device=device, dtype=torch.long),
+                    natoms_gpu[start:end])
 
-            atom_types = at_gpu[a_lo:a_hi]
-            pi_r = pi_r_gpu[r_lo:r_hi] - a_lo
-            pj_r = pj_r_gpu[r_lo:r_hi] - a_lo
-            rij_r = rij_r_gpu[r_lo:r_hi]
-            pi_a = pi_a_gpu[g_lo:g_hi] - a_lo
-            pj_a = pj_a_gpu[g_lo:g_hi] - a_lo
-            rij_a = rij_a_gpu[g_lo:g_hi]
-            struct_idx = torch.repeat_interleave(
-                torch.arange(B, device=device, dtype=torch.long),
-                natoms_gpu[start:end])
-
-            dr = torch.norm(rij_r, dim=-1)
-            fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
-            d12inv_r = 1.0 / dr.clamp(min=1e-10)
-
-            if rij_a.shape[0] > 0:
-                da = torch.norm(rij_a, dim=-1)
-                fk_a, fkp_a = ops.chebyshev_basis_and_deriv(
-                    da, rc_ang, basis_a)
-                d12inv_a = 1.0 / da.clamp(min=1e-10)
-                blm = ops.angular_basis(
-                    rij_a[:, 0] * d12inv_a,
-                    rij_a[:, 1] * d12inv_a,
-                    rij_a[:, 2] * d12inv_a,
-                    l_max_3b)
-            else:
-                fk_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
-                fkp_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
-                d12inv_a = torch.zeros(0, dtype=dt, device=device)
-                blm = torch.zeros(0, num_lm, dtype=dt, device=device)
-
-            batch = {
-                "N": N, "num_structures": B,
-                "atom_types": atom_types, "struct_idx": struct_idx,
-                "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
-                "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
-                "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
-                "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
-                "blm": blm,
-            }
-            if calc.spin_mode:
-                s_lo = int(nspin_cum[start])
-                s_hi = int(nspin_cum[end])
-                batch.update({
-                    "pair_i_spin": pi_s_gpu[s_lo:s_hi] - a_lo,
-                    "pair_j_spin": pj_s_gpu[s_lo:s_hi] - a_lo,
-                    "rij_spin": rij_s_gpu[s_lo:s_hi],
-                    "spins": spins_gpu[a_lo:a_hi],
-                })
-            result = calc.compute_batch(batch, backend=backend)
-
-            Etot = result["Etot"]
-            v_per_frame = torch.zeros(B, 9, dtype=dt, device=device)
-            v_per_frame.scatter_add_(
-                0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
-
-            # Single H2D copy per batch for the per-frame outputs
-            Etot_np = Etot.cpu().numpy()
-            v_np = v_per_frame.cpu().numpy()
-            nat_slice = natoms_arr[start:end].astype(np.float64)
-            e_pred_arr[start:end] = Etot_np / nat_slice
-            v_pred = _virial9_to_6(v_np) / nat_slice[:, None]
-            v_pred_arr[start:end] = v_pred
-
-            f_pred_arr[a_lo:a_hi] = result["forces"].cpu().numpy()
-            if m_pred_arr is not None:
-                m_pred_arr[a_lo:a_hi] = result["mforces"].cpu().numpy()
-                t_pred_arr[a_lo:a_hi] = result["tau"].cpu().numpy()
-
-            if output_descriptor:
-                # ``compute_batch`` already returns ``q * q_scaler``.
-                desc_np = result["descriptor"].cpu().numpy()
-                if output_descriptor == 2:
-                    d_pred_arr[a_lo:a_hi] = desc_np
+                dr = torch.norm(rij_r, dim=-1)
+                fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, rc_rad, basis_r)
+                d12inv_r = 1.0 / dr.clamp(min=1e-10)
+                if rij_a.shape[0] > 0:
+                    da = torch.norm(rij_a, dim=-1)
+                    fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, rc_ang, basis_a)
+                    d12inv_a = 1.0 / da.clamp(min=1e-10)
+                    blm = ops.angular_basis(rij_a[:, 0] * d12inv_a,
+                                            rij_a[:, 1] * d12inv_a,
+                                            rij_a[:, 2] * d12inv_a,
+                                            calc.l_max_3b)
                 else:
-                    # Per-frame mean: scatter-sum onto frame index then /Na.
-                    sums = np.zeros((B, calc.dim), dtype=np.float64)
-                    si_np = struct_idx.cpu().numpy()
-                    np.add.at(sums, si_np, desc_np)
-                    d_pred_arr[start:end] = sums / natoms_arr[start:end][:, None]
+                    fk_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
+                    fkp_a = torch.zeros(0, basis_a + 1, dtype=dt, device=device)
+                    d12inv_a = torch.zeros(0, dtype=dt, device=device)
+                    blm = torch.zeros(0, calc.num_lm, dtype=dt, device=device)
 
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    _log(f"  compute:     {time.time() - t0:5.1f}s")
+                batch = {
+                    "N": N, "num_structures": B,
+                    "atom_types": atom_types, "struct_idx": struct_idx,
+                    "pair_i_rad": pi_r, "pair_j_rad": pj_r, "rij_rad": rij_r,
+                    "fk_rad": fk_r, "fkp_rad": fkp_r, "d12inv_rad": d12inv_r,
+                    "pair_i_ang": pi_a, "pair_j_ang": pj_a, "rij_ang": rij_a,
+                    "fk_ang": fk_a, "fkp_ang": fkp_a, "d12inv_ang": d12inv_a,
+                    "blm": blm,
+                }
+                if has_spin:
+                    s_lo, s_hi = int(nspin_cum[start]), int(nspin_cum[end])
+                    batch.update({
+                        "pair_i_spin": pi_s_cpu[s_lo:s_hi].to(device) - a_lo,
+                        "pair_j_spin": pj_s_cpu[s_lo:s_hi].to(device) - a_lo,
+                        "rij_spin": rij_s_cpu[s_lo:s_hi].to(
+                            device=device, dtype=dt),
+                        "spins": spins_cpu[a_lo:a_hi].to(
+                            device=device, dtype=dt),
+                    })
+                result = calc.compute_batch(batch, backend=backend)
 
-    # 5) Vectorised text output --------------------------------------------
-    t0 = time.time()
+                v_per_frame = torch.zeros(B, 9, dtype=dt, device=device)
+                v_per_frame.scatter_add_(
+                    0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
+                nat_slice = natoms_arr[start:end].astype(np.float64)
+                e_pred[start:end] = result["Etot"].cpu().numpy() / nat_slice
+                v_pred[start:end] = _virial9_to_6(v_per_frame.cpu().numpy()) / nat_slice[:, None]
+                f_pred[a_lo:a_hi] = result["forces"].cpu().numpy()
+                if has_spin:
+                    m_pred[a_lo:a_hi] = result["mforces"].cpu().numpy()
+                    tau_pred[a_lo:a_hi] = result["tau"].cpu().numpy()
+                if output_descriptor:
+                    # ``compute_batch`` already returns ``q * q_scaler``.
+                    desc_np = result["descriptor"].cpu().numpy()
+                    if output_descriptor == 2:
+                        d_pred[a_lo:a_hi] = desc_np
+                    else:
+                        sums = np.zeros((B, calc.dim), dtype=np.float64)
+                        np.add.at(sums, struct_idx.cpu().numpy(), desc_np)
+                        d_pred[start:end] = sums / nat_slice[:, None]
+            except torch.OutOfMemoryError:
+                # Adaptive backoff: free the pool, halve the batch and redo
+                # this batch — robust across models/hardware where any static
+                # memory estimate can be off.
+                if batch_size <= 16:
+                    raise
+                torch.cuda.empty_cache()
+                batch_size = max(16, batch_size // 2)
+                (progress.write if progress is not None else log)(
+                    f"  OOM at batch of {B} frames -> retrying with batch_size={batch_size}")
+                continue
+            if progress is not None:
+                progress.update(B)
+            start = end
+    return e_pred, f_pred, v_pred, m_pred, tau_pred, d_pred, batch_size
+
+
+def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
+                    device, backend, batch_size, chunk_atoms, energy_key,
+                    output_descriptor, progress, log):
+    """Streamed core shared by predict_dataset and predict_dataset_sharded:
+    predict the frames at ``offsets`` (byte offsets from index_xyz, with their
+    ``natoms``) chunk by chunk and append the rows to the ``*_train.out`` files
+    in ``output_dir``. Returns (metric sums, timings, batch_size)."""
+    from .train import preprocess_structures, make_preproc_pool
+    from .data import read_xyz_at
+    n_struct = len(offsets)
+    bounds = _chunk_bounds(natoms, chunk_atoms, max_frames=50_000)
+    pp_config = {"cutoff_radial": calc.rc_radial,
+                 "cutoff_angular": calc.rc_angular,
+                 "type_names": calc.type_names,
+                 "spin_mode": calc.spin_mode,
+                 "spin_cutoff": calc.spin_cutoff}
     os.makedirs(output_dir, exist_ok=True)
+    fh = {name: open(os.path.join(output_dir, name), "w")
+          for name in ("energy_train.out", "force_train.out",
+                       "virial_train.out", "stress_train.out")}
+    if output_descriptor:
+        fh["descriptor.out"] = open(os.path.join(output_dir, "descriptor.out"), "w")
+    if calc.spin_mode:
+        fh["mforce_train.out"] = open(
+            os.path.join(output_dir, "mforce_train.out"), "w")
+        fh["tau_train.out"] = open(
+            os.path.join(output_dir, "tau_train.out"), "w")
+    acc = {"e": [0.0, 0.0, 0], "f": [0.0, 0.0, 0], "v": [0.0, 0.0, 0]}
+    if calc.spin_mode:
+        acc.update({"m": [0.0, 0.0, 0], "t": [0.0, 0.0, 0]})
 
-    e_ref_pa = energy_ref / natoms_arr.astype(np.float64)
-    np.savetxt(os.path.join(output_dir, "energy_train.out"),
-               np.column_stack([e_pred_arr, e_ref_pa]), fmt="%.10g")
+    def _accum(key, d):
+        d = d[np.isfinite(d)]
+        if d.size:
+            acc[key][0] += float(np.sum(d * d)); acc[key][1] += float(np.sum(np.abs(d)))
+            acc[key][2] += int(d.size)
 
-    if forces_ref is None:
-        forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-    np.savetxt(os.path.join(output_dir, "force_train.out"),
-               np.column_stack([f_pred_arr, forces_ref]), fmt="%.10g")
-    if m_pred_arr is not None:
-        np.savetxt(
-            os.path.join(output_dir, "mforce_train.out"),
-            np.column_stack([m_pred_arr, mforces_ref]),
-            fmt="%.10g",
-        )
-        np.savetxt(
-            os.path.join(output_dir, "tau_train.out"),
-            np.column_stack([t_pred_arr, tau_ref]),
-            fmt="%.10g",
-        )
+    tm = {"read": 0.0, "neighbors": 0.0, "compute": 0.0, "write": 0.0}
+    # one neighbor-list worker pool for all chunks (fork; workers never touch CUDA)
+    pool = make_preproc_pool() if n_struct >= 64 else None
+    for lo, hi in bounds:
+        t0 = time.time()
+        frames = read_xyz_at(xyz_file, offsets[lo:hi], energy_key=energy_key)
+        tm["read"] += time.time() - t0
+        t0 = time.time()
+        structures = preprocess_structures(frames, pp_config, np_dtype, pool=pool)
+        del frames
+        chunk = _chunk_arrays(structures, np_dtype)
+        del structures
+        tm["neighbors"] += time.time() - t0
+        if batch_size is None:
+            batch_size = _auto_batch_size(calc, dt, chunk, n_struct, progress.write) \
+                if torch.device(device).type == "cuda" else 1000
+        t0 = time.time()
+        (e_pred, f_pred, v_pred, m_pred, tau_pred,
+         d_pred, batch_size) = _predict_chunk(
+            calc, chunk, batch_size, device, dt, backend, output_descriptor, log, progress)
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize()
+        tm["compute"] += time.time() - t0
+        if "first_chunk" not in tm:
+            tm["first_chunk"] = time.time() - t0     # includes kernel warm-up of this process
+        t0 = time.time()
+        nat = chunk["natoms"].astype(np.float64)
+        e_ref_pa = chunk["energy_ref"] / nat
+        np.savetxt(fh["energy_train.out"], np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
+        np.savetxt(fh["force_train.out"], np.column_stack([f_pred, chunk["forces_ref"]]), fmt="%.10g")
+        np.savetxt(fh["virial_train.out"], np.column_stack([v_pred, chunk["virial_ref"]]), fmt="%.10g")
+        # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
+        # convention so stress and virial carry the same sign (see
+        # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
+        nat_col, vol_col = nat[:, None], chunk["volumes"][:, None]
+        np.savetxt(fh["stress_train.out"], np.column_stack([
+            _stress_from_virial(v_pred, nat_col, vol_col, keep_missing=False),
+            _stress_from_virial(chunk["virial_ref"], nat_col, vol_col, keep_missing=True)]),
+            fmt="%.10g")
+        if d_pred is not None:
+            np.savetxt(fh["descriptor.out"], d_pred, fmt="%.10g")
+        if calc.spin_mode:
+            np.savetxt(fh["mforce_train.out"],
+                       np.column_stack([m_pred, chunk["mforces_ref"]]),
+                       fmt="%.10g")
+            np.savetxt(fh["tau_train.out"],
+                       np.column_stack([tau_pred, chunk["tau_ref"]]),
+                       fmt="%.10g")
+        _accum("e", e_pred - e_ref_pa)
+        _accum("f", (f_pred - chunk["forces_ref"]).ravel())
+        vmask = chunk["virial_ref"][:, 0] > _MISSING_VIRIAL / 2
+        _accum("v", (v_pred[vmask] - chunk["virial_ref"][vmask]).ravel())
+        if calc.spin_mode:
+            _accum("m", (m_pred - chunk["mforces_ref"]).ravel())
+            _accum("t", (tau_pred - chunk["tau_ref"]).ravel())
+        tm["write"] += time.time() - t0
+        del chunk, e_pred, f_pred, v_pred, m_pred, tau_pred, d_pred
+    for h in fh.values():
+        h.close()
+    if pool is not None:
+        pool.close(); pool.join()
+    return acc, tm, batch_size
 
-    np.savetxt(os.path.join(output_dir, "virial_train.out"),
-               np.column_stack([v_pred_arr, virial_ref]), fmt="%.10g")
 
-    # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
-    # convention so stress and virial carry the same sign (see
-    # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
-    nat_col = natoms_arr.astype(np.float64)[:, None]
-    vol_col = volumes_arr[:, None]
-    stress_pred = _stress_from_virial(v_pred_arr, nat_col, vol_col,
-                                      keep_missing=False)
-    stress_ref = _stress_from_virial(virial_ref, nat_col, vol_col,
-                                     keep_missing=True)
-    np.savetxt(os.path.join(output_dir, "stress_train.out"),
-               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
+def _metrics_table(acc, log):
+    rows = []
+    fields = [("e", "Energy (eV/atom)", "frames", 1),
+              ("f", "Force  (eV/A)", "atoms", 3),
+              ("v", "Virial (eV/atom)", "frames", 6),
+              ("m", "MForce (eV/muB)", "atoms", 3),
+              ("t", "Tau    (eV)", "atoms", 3)]
+    for key, label, per, width in fields:
+        if key not in acc:
+            continue
+        sq, ab, n = acc[key]
+        if n:
+            cov = n // width
+            rows.append((label, np.sqrt(sq / n), ab / n, f"{cov} {per}"))
+    if rows:
+        log("  " + "-" * 58)
+        log(f"  {'':18s} {'RMSE':>12s} {'MAE':>12s}")
+        for label, rmse, mae, cov in rows:
+            log(f"  {label:18s} {rmse:12.6f} {mae:12.6f}   ({cov})")
+        log("  " + "-" * 58)
 
-    if d_pred_arr is not None:
-        np.savetxt(os.path.join(output_dir, "descriptor.out"),
-                   d_pred_arr, fmt="%.10g")
-    _log(f"  write:       {time.time() - t0:5.1f}s")
 
+def _pick_device(device):
+    if device is not None:
+        return device
+    # cuda probe also catches ROCm (PyTorch-HIP uses the cuda namespace).
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def predict_dataset(
+    model_file: str,
+    xyz_file: str,
+    output_dir: str = ".",
+    dtype: str = "float32",
+    device: str = None,
+    batch_size: int = None,
+    verbose: bool = True,
+    energy_key: str = "energy",
+    output_descriptor: int = 0,
+    chunk_atoms: int = None,
+):
+    """Run streamed, batched prediction on a full dataset and save GPUMD-format
+    outputs.
+
+    The file is first indexed (byte offsets + atom counts, one I/O pass, no
+    parsing), then processed in consecutive **chunks** of roughly
+    ``chunk_atoms`` atoms: each chunk is read, neighbor-listed (multi-process),
+    predicted in device-sized batches and appended to the output files before
+    the next chunk is touched. Host memory is therefore bounded by the chunk
+    size and device memory by the batch size — any dataset finishes on any
+    machine, only the wall time differs. Outputs are identical to the former
+    whole-dataset path.
+
+    Outputs (per-atom for energy and virial; per-atom raw for forces):
+      - energy_train.out:  e_pred  e_target              (eV/atom, per frame)
+      - force_train.out:   fx fy fz  fx_t fy_t fz_t      (eV/A, per atom)
+      - virial_train.out:  xx yy zz xy yz zx (pred, ref) (eV/atom, per frame)
+      - stress_train.out:  same layout in GPa (GPUMD sign convention)
+      - descriptor.out (only when ``output_descriptor != 0``):
+          mode 1 — per-frame averaged scaled descriptor, one row per frame
+          mode 2 — per-atom scaled descriptor, one row per atom
+        Matches GPUMD's ``output_descriptor`` / ``descriptor.out`` schema.
+
+    The format mirrors GPUMD's *_train.out files, so the two can be diffed
+    column by column. When reference labels are present, a summary of the
+    energy/force/virial RMSE and MAE is printed at the end.
+
+    Parameters
+    ----------
+    batch_size : int or None
+        Frames per compute batch. ``None`` (default) sizes the batch
+        automatically from the device's free memory and the first chunk's
+        average pair counts (CUDA/ROCm; other devices fall back to 1000),
+        with an OOM-halving retry.
+    chunk_atoms : int or None
+        Atoms per streamed chunk (host-memory bound; ~1 GB per 200k atoms of
+        dense metal at cutoff 6/5). ``None`` -> ``TORCHNEP_PREDICT_CHUNK_ATOMS``
+        env var, else 200000.
+    output_descriptor : int
+        0 — disabled (default).
+        1 — write per-frame averaged ``q * q_scaler`` to descriptor.out.
+        2 — write per-atom ``q * q_scaler`` to descriptor.out.
+
+    The contraction backend is chosen automatically (see
+    ``torchnep.ops.resolve_backend``).
+    """
+    from .train import _default_alloc_conf
+    from .data import index_xyz
+    _default_alloc_conf()
+    device = _pick_device(device)
+    dt = torch.float64 if dtype == "float64" else torch.float32
+    np_dtype = np.float64 if dtype == "float64" else np.float32
+    if chunk_atoms is None:
+        chunk_atoms = int(os.environ.get("TORCHNEP_PREDICT_CHUNK_ATOMS", 200_000))
+    chunk_atoms = max(1, int(chunk_atoms))
+
+    def _log(msg):
+        if verbose:
+            print(msg, flush=True)
+
+    t_total = time.time()
+    calc = NEPCalculator(model_file, dtype=dt, device=device)
+    backend = ops.resolve_backend("auto", num_types=calc.num_types,
+                                  device_type=torch.device(device).type)
+    # 1) Index the file (offsets + atom counts only; no parsing, O(n_frames) memory)
+    t0 = time.time()
+    offsets, natoms_all = index_xyz(xyz_file)
+    n_struct = len(offsets)
+    n_chunks = len(_chunk_bounds(natoms_all, chunk_atoms, max_frames=50_000))
+    _log(f"  index_xyz:   {time.time() - t0:5.1f}s   ({n_struct} frames, "
+         f"{int(natoms_all.sum())} atoms, {n_chunks} chunk(s) of "
+         f"~{chunk_atoms} atoms, energy label: {energy_key})")
+    # 2-5) streamed chunks -> rows appended to the output files
+    progress = _Progress(n_struct, verbose)
+    acc, tm, _ = _predict_frames(calc, xyz_file, offsets, natoms_all, output_dir, dt, np_dtype,
+                                 device, backend, batch_size, chunk_atoms, energy_key,
+                                 output_descriptor, progress, _log)
+    progress.close()
+    for k in ("read", "neighbors", "compute", "write"):
+        _log(f"  {k + ':':12s} {tm[k]:5.1f}s" + (f"   (first chunk incl. warm-up {tm['first_chunk']:.1f}s)" if k == "compute" and "first_chunk" in tm else ""))
     _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_train.out")
+    if verbose:
+        _metrics_table(acc, _log)
+
+
+def predict_dataset_sharded(
+    model_file: str,
+    xyz_file: str,
+    output_dir: str = ".",
+    dtype: str = "float32",
+    batch_size: int = None,
+    verbose: bool = True,
+    energy_key: str = "energy",
+    output_descriptor: int = 0,
+    chunk_atoms: int = None,
+):
+    """Multi-rank (multi-GPU / multi-node) version of :func:`predict_dataset`.
+
+    Launch one process per GPU with ``torchrun`` or ``srun`` (the launcher
+    sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT). Rank 0
+    indexes the file once and broadcasts the frame index; the frames are then
+    split into WORLD_SIZE **contiguous** ranges balanced by atom count, every
+    rank streams its own range exactly like ``predict_dataset`` (same chunking,
+    auto batch size and OOM retry, bounded memory) into a per-rank part
+    directory, and rank 0 finally concatenates the parts in rank order into
+    the usual ``*_train.out`` files and prints the global E/F/V RMSE/MAE
+    table. The output is identical to a single-process ``predict_dataset``.
+    Rank 0 shows the progress of its own share; the other ranks are silent.
+    With WORLD_SIZE == 1 (or no launcher) this is plain ``predict_dataset``.
+    """
+    import torch.distributed as dist
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size <= 1:
+        return predict_dataset(model_file, xyz_file, output_dir=output_dir, dtype=dtype,
+                               batch_size=batch_size, verbose=verbose, energy_key=energy_key,
+                               output_descriptor=output_descriptor, chunk_atoms=chunk_atoms)
+    from .train import _default_alloc_conf
+    from .train_sharded import _register_pg_atexit
+    from .data import index_xyz
+    _default_alloc_conf()
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    # ---- distributed init (same rules as train_nep_sharded) ----
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    cuda_available = torch.cuda.is_available()
+    n_gpus = torch.cuda.device_count() if cuda_available else 0
+    if cuda_available:
+        gpu_id = local_rank % max(1, n_gpus)
+        torch.cuda.set_device(gpu_id)
+        device = f"cuda:{gpu_id}"
+    else:
+        device = "cpu"
+    if not dist.is_initialized():
+        local_world_env = int(os.environ.get("LOCAL_WORLD_SIZE",
+                              os.environ.get("SLURM_NTASKS_PER_NODE", world_size)))
+        pg_backend = "nccl" if cuda_available and local_world_env <= n_gpus else "gloo"
+        dist.init_process_group(backend=pg_backend,
+                                device_id=torch.device(device) if cuda_available else None)
+        _register_pg_atexit()
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    is_main = rank == 0
+    bcast_dev = torch.device(device) if dist.get_backend() == "nccl" else torch.device("cpu")
+
+    def _log(msg):
+        if verbose and is_main:
+            print(msg, flush=True)
+
+    dt = torch.float64 if dtype == "float64" else torch.float32
+    np_dtype = np.float64 if dtype == "float64" else np.float32
+    if chunk_atoms is None:
+        chunk_atoms = int(os.environ.get("TORCHNEP_PREDICT_CHUNK_ATOMS", 200_000))
+    chunk_atoms = max(1, int(chunk_atoms))
+    t_total = time.time()
+
+    # ---- rank 0 indexes, everyone gets (offsets, natoms) ----
+    t0 = time.time()
+    if is_main:
+        offs_np, nat_np = index_xyz(xyz_file)
+        n_all_t = torch.tensor([len(offs_np)], dtype=torch.long, device=bcast_dev)
+    else:
+        n_all_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+    dist.broadcast(n_all_t, 0)
+    n_all = int(n_all_t.item())
+    idx_t = torch.empty(2, n_all, dtype=torch.long, device=bcast_dev)
+    if is_main:
+        idx_t[0].copy_(torch.from_numpy(offs_np).to(bcast_dev))
+        idx_t[1].copy_(torch.from_numpy(nat_np).to(bcast_dev))
+    dist.broadcast(idx_t, 0)
+    offsets, natoms_all = idx_t[0].cpu().numpy(), idx_t[1].cpu().numpy()
+    del idx_t
+    # contiguous ranges balanced by atoms (each rank reads one sequential byte range)
+    cum = np.concatenate([[0], np.cumsum(natoms_all)])
+    edges = np.searchsorted(cum, cum[-1] * np.arange(world_size + 1) / world_size)
+    edges[0], edges[-1] = 0, n_all
+    lo, hi = int(edges[rank]), int(edges[rank + 1])
+    _log(f"  index_xyz:   {time.time() - t0:5.1f}s   ({n_all} frames, {int(cum[-1])} atoms; "
+         f"{world_size} ranks, ~{int(cum[-1]) // world_size} atoms each, "
+         f"chunks of ~{chunk_atoms} atoms, energy label: {energy_key})")
+
+    calc = NEPCalculator(model_file, dtype=dt, device=device)
+    backend = ops.resolve_backend("auto", num_types=calc.num_types,
+                                  device_type=torch.device(device).type)
+    t_setup = time.time() - t_total          # dist init + index broadcast + model load
+    part_dir = os.path.join(output_dir, ".parts", f"rank{rank:04d}")
+    progress = _Progress(hi - lo, verbose and is_main)
+    acc, tm, _ = _predict_frames(calc, xyz_file, offsets[lo:hi], natoms_all[lo:hi], part_dir,
+                                 dt, np_dtype, device, backend, batch_size, chunk_atoms,
+                                 energy_key, output_descriptor, progress, _log)
+    progress.close()
+    t_pred = time.time() - t_total
+    if verbose or os.environ.get("TORCHNEP_PREDICT_RANK_TIMING") == "1":
+        print(f"  [rank {rank}/{world_size}] frames {lo}-{hi - 1} ({int(cum[hi] - cum[lo])} atoms): "
+              f"setup {t_setup:.1f}s read {tm['read']:.1f}s neighbors {tm['neighbors']:.1f}s "
+              f"compute {tm['compute']:.1f}s (first chunk {tm.get('first_chunk', 0.0):.1f}s) "
+              f"write {tm['write']:.1f}s total {t_pred:.1f}s", flush=True)
+
+    # ---- global metrics (sum of squares / abs / counts) ----
+    metric_keys = ("e", "f", "v", "m", "t") if calc.spin_mode else ("e", "f", "v")
+    vec = torch.tensor([v for k in metric_keys for v in acc[k]], dtype=torch.float64,
+                       device=bcast_dev)
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    g = vec.cpu().numpy()
+    acc_g = {k: [float(g[3 * i]), float(g[3 * i + 1]), int(g[3 * i + 2])]
+             for i, k in enumerate(metric_keys)}
+    dist.barrier()
+    # ---- rank 0 concatenates the parts in rank order ----
+    if is_main:
+        import shutil
+        t0 = time.time()
+        names = ["energy_train.out", "force_train.out", "virial_train.out", "stress_train.out"]
+        if calc.spin_mode:
+            names.extend(["mforce_train.out", "tau_train.out"])
+        if output_descriptor:
+            names.append("descriptor.out")
+        for name in names:
+            with open(os.path.join(output_dir, name), "w") as dst:
+                for r in range(world_size):
+                    src = os.path.join(output_dir, ".parts", f"rank{r:04d}", name)
+                    if os.path.exists(src):
+                        with open(src) as s:
+                            shutil.copyfileobj(s, dst, 1 << 22)
+        shutil.rmtree(os.path.join(output_dir, ".parts"), ignore_errors=True)
+        _log(f"  rank 0 share: read {tm['read']:.1f}s neighbors {tm['neighbors']:.1f}s "
+             f"compute {tm['compute']:.1f}s write {tm['write']:.1f}s; "
+             f"all ranks done in {t_pred:.1f}s; merge {time.time() - t0:.1f}s")
+        _log(f"  TOTAL:       {time.time() - t_total:5.1f}s   "
+             f"-> {output_dir}/(energy|force|virial|stress)_train.out")
+        if verbose:
+            _metrics_table(acc_g, _log)
+    dist.barrier()
 
 
 # ---------------------------------------------------------------------------
-# End-of-training prediction that reuses the in-memory model + GPUDataStore
+# End-of-training prediction that reuses the in-memory model + data store
 # (no xyz re-read, no neighbor-list rebuild, no second GPU upload).
 # ---------------------------------------------------------------------------
 
 def predict_from_store(model, data_store, output_dir: str,
                        batch_size: int = 1000,
-                       backend: str = "auto",
+                       backend: str = None,
                        verbose: bool = True,
                        suffix: str = "train"):
-    """Run prediction using an already-loaded NEPModel + GPUDataStore.
+    """Run prediction using an already-loaded NEPModel + StreamDataStore.
 
     Designed for the end of training: reuses the preprocessed data_store so
     there is no xyz re-read / neighbor-list rebuild / GPU upload. The
@@ -488,8 +796,6 @@ def predict_from_store(model, data_store, output_dir: str,
       energy_train.out  — per-frame (pred, ref) in eV/atom
       force_train.out   — per-atom (fx,fy,fz pred, ref) in eV/A
       virial_train.out  — per-frame (xx,yy,zz,xy,yz,zx pred, ref) in eV/atom
-      mforce_train.out  — spin models: per-atom magnetic force (pred, ref)
-      tau_train.out     — spin models: per-atom spin x mforce (pred, ref)
 
     ``suffix`` picks the file-name tail: "train" (default) for the training
     set, "test" for the validation set (GPUMD's *_test.out naming).
@@ -501,7 +807,9 @@ def predict_from_store(model, data_store, output_dir: str,
     dev   = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     n_struct = data_store.n
-    backend = ops.resolve_backend(backend, num_types=model.num_types)
+    if backend is None:
+        backend = ops.resolve_backend("auto", num_types=model.num_types,
+                                      device_type=dev.type)
 
     nat_arr = np.asarray(data_store.natoms, dtype=np.int64)
     nat_cum = np.concatenate([[0], np.cumsum(nat_arr)])
@@ -509,13 +817,12 @@ def predict_from_store(model, data_store, output_dir: str,
 
     e_pred = np.empty(n_struct, dtype=np.float64)
     f_pred = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-    m_pred = (
-        np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-        if model.spin_descriptor is not None else None)
-    t_pred = (
-        np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
-        if model.spin_descriptor is not None else None)
     v_pred = np.empty((n_struct, 6), dtype=np.float64)
+    has_spin = model.spin_descriptor is not None
+    m_pred = (np.empty((N_atoms_total, 3), dtype=np.float64)
+              if has_spin else None)
+    tau_pred = (np.empty((N_atoms_total, 3), dtype=np.float64)
+                if has_spin else None)
 
     was_training = model.training
     model.eval()
@@ -526,43 +833,11 @@ def predict_from_store(model, data_store, output_dir: str,
             idx = list(range(start, end))
             B = end - start
             batch = data_store.collate(idx)
-            batch["need_mforce"] = model.spin_descriptor is not None
-            batch["need_tau"] = model.spin_descriptor is not None
-            if model.spin_mode == 2:
-                with torch.enable_grad():
-                    r = model.compute_properties(
-                        batch["rij_rad"],
-                        batch["rij_ang"],
-                        batch["pair_i_rad"],
-                        batch["pair_j_rad"],
-                        batch["pair_i_ang"],
-                        batch["pair_j_ang"],
-                        batch["atom_types"],
-                        batch["N"],
-                        batch["struct_idx"],
-                        batch["num_structures"],
-                        need_forces=True,
-                        need_virial=True,
-                        backend=backend,
-                        spins=batch["spins"],
-                        need_mforce=True,
-                        need_tau=True,
-                        rij_spin=batch.get("rij_spin"),
-                        pi_spin=batch.get("pair_i_spin"),
-                        pj_spin=batch.get("pair_j_spin"),
-                        create_graph=False,
-                    )
-                r = {
-                    key: value.detach()
-                    for key, value in r.items()
-                }
-            else:
-                r = model.compute_properties_cached(
-                    batch,
-                    need_forces=True,
-                    need_virial=True,
-                    backend=backend,
-                )
+            if has_spin:
+                batch["need_mforce"] = True
+                batch["need_tau"] = True
+            r = model.compute_properties_cached(
+                batch, need_forces=True, need_virial=True, backend=backend)
 
             nat_slice = nat_arr[start:end].astype(np.float64)
             e_pred[start:end] = r["Etot"].cpu().numpy() / nat_slice
@@ -576,9 +851,9 @@ def predict_from_store(model, data_store, output_dir: str,
 
             a_lo = int(nat_cum[start]); a_hi = int(nat_cum[end])
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
-            if m_pred is not None:
+            if has_spin:
                 m_pred[a_lo:a_hi] = r["mforces"].cpu().numpy()
-                t_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
+                tau_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
     if was_training:
         model.train()
     if dev.type == "cuda":
@@ -592,10 +867,18 @@ def predict_from_store(model, data_store, output_dir: str,
     e_ref_pa = energy_ref / nat_arr.astype(np.float64)
 
     forces_ref = np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+    mforces_ref = (np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+                   if has_spin else None)
+    tau_ref = (np.full((N_atoms_total, 3), np.nan, dtype=np.float64)
+               if has_spin else None)
     for i in range(n_struct):
+        a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
         if data_store.has_forces_flag[i]:
-            a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
             forces_ref[a_lo:a_hi] = data_store.forces[i].cpu().numpy()
+        if has_spin and data_store.has_mforces_flag[i]:
+            mforces_ref[a_lo:a_hi] = data_store.mforces[i].cpu().numpy()
+        if has_spin and data_store.has_tau_flag[i]:
+            tau_ref[a_lo:a_hi] = data_store.tau[i].cpu().numpy()
 
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
     for i in range(n_struct):
@@ -618,25 +901,13 @@ def predict_from_store(model, data_store, output_dir: str,
                np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
                np.column_stack([f_pred, forces_ref]), fmt="%.10g")
-    if m_pred is not None:
-        mforces_ref = np.full(
-            (N_atoms_total, 3), np.nan, dtype=np.float64)
-        tau_ref = np.full(
-            (N_atoms_total, 3), np.nan, dtype=np.float64)
-        for i in range(n_struct):
-            if data_store.has_mforces_flag[i]:
-                a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
-                mforces_ref[a_lo:a_hi] = (
-                    data_store.mforces[i].cpu().numpy())
-                tau_ref[a_lo:a_hi] = data_store.tau[i].cpu().numpy()
-        np.savetxt(
-            os.path.join(output_dir, f"mforce_{suffix}.out"),
-            np.column_stack([m_pred, mforces_ref]), fmt="%.10g")
-        np.savetxt(
-            os.path.join(output_dir, f"tau_{suffix}.out"),
-            np.column_stack([t_pred, tau_ref]), fmt="%.10g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
                np.column_stack([v_pred, virial_ref]), fmt="%.10g")
+    if has_spin:
+        np.savetxt(os.path.join(output_dir, f"mforce_{suffix}.out"),
+                   np.column_stack([m_pred, mforces_ref]), fmt="%.10g")
+        np.savetxt(os.path.join(output_dir, f"tau_{suffix}.out"),
+                   np.column_stack([tau_pred, tau_ref]), fmt="%.10g")
 
     # Stress (GPa) = +virial_total / V * conversion (GPUMD sign; see
     # predict_dataset / _stress_from_virial). Missing refs keep -1e6 unscaled.
@@ -650,9 +921,8 @@ def predict_from_store(model, data_store, output_dir: str,
     np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
                np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
 
-    extra = "|mforce|tau" if model.spin_descriptor is not None else ""
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress{extra})_{suffix}.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +931,7 @@ def predict_from_store(model, data_store, output_dir: str,
 # No xyz re-read, no temp nep.txt, no second neighbor-list build.
 # ---------------------------------------------------------------------------
 
-def _compute_local_predictions(model, data_store, batch_size, backend):
+def _compute_local_predictions(model, data_store, batch_size):
     """Run prediction on one rank's local data_store -> numpy arrays.
 
     Returns a dict of per-frame / per-atom arrays (pred and ref) plus the
@@ -670,7 +940,8 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
     dev   = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     n_struct = data_store.n
-    backend = ops.resolve_backend(backend, num_types=model.num_types)
+    backend = ops.resolve_backend("auto", num_types=model.num_types,
+                                  device_type=dev.type)
 
     nat_arr = np.asarray(data_store.natoms, dtype=np.int64)
     nat_cum = np.concatenate([[0], np.cumsum(nat_arr)])
@@ -679,12 +950,11 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
     e_pred = np.zeros(n_struct, dtype=np.float64)
     f_pred = np.zeros((N_atoms_local, 3), dtype=np.float64)
     v_pred = np.zeros((n_struct, 6), dtype=np.float64)
-    m_pred = (
-        np.zeros((N_atoms_local, 3), dtype=np.float64)
-        if model.spin_descriptor is not None else None)
-    t_pred = (
-        np.zeros((N_atoms_local, 3), dtype=np.float64)
-        if model.spin_descriptor is not None else None)
+    has_spin = model.spin_descriptor is not None
+    m_pred = (np.zeros((N_atoms_local, 3), dtype=np.float64)
+              if has_spin else None)
+    tau_pred = (np.zeros((N_atoms_local, 3), dtype=np.float64)
+                if has_spin else None)
 
     was_training = model.training
     model.eval()
@@ -693,40 +963,11 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
             end = min(start + batch_size, n_struct)
             B = end - start
             batch = data_store.collate(list(range(start, end)))
-            batch["need_mforce"] = model.spin_descriptor is not None
-            batch["need_tau"] = model.spin_descriptor is not None
-            if model.spin_mode == 2:
-                # The systematic magnetic-polynomial path currently obtains
-                # geometry and spin derivatives from autograd.  End-of-run
-                # prediction is normally under no_grad, so re-enable it only
-                # for this descriptor and detach the completed observables.
-                with torch.enable_grad():
-                    r = model.compute_properties(
-                        batch["rij_rad"],
-                        batch["rij_ang"],
-                        batch["pair_i_rad"],
-                        batch["pair_j_rad"],
-                        batch["pair_i_ang"],
-                        batch["pair_j_ang"],
-                        batch["atom_types"],
-                        batch["N"],
-                        batch["struct_idx"],
-                        batch["num_structures"],
-                        need_forces=True,
-                        need_virial=True,
-                        backend=backend,
-                        spins=batch["spins"],
-                        need_mforce=True,
-                        need_tau=True,
-                        rij_spin=batch.get("rij_spin"),
-                        pi_spin=batch.get("pair_i_spin"),
-                        pj_spin=batch.get("pair_j_spin"),
-                        create_graph=False,
-                    )
-                r = {key: value.detach() for key, value in r.items()}
-            else:
-                r = model.compute_properties_cached(
-                    batch, need_forces=True, need_virial=True, backend=backend)
+            if has_spin:
+                batch["need_mforce"] = True
+                batch["need_tau"] = True
+            r = model.compute_properties_cached(
+                batch, need_forces=True, need_virial=True, backend=backend)
 
             nat_slice = nat_arr[start:end].astype(np.float64)
             e_pred[start:end] = r["Etot"].cpu().numpy() / nat_slice
@@ -739,9 +980,9 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
 
             a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
-            if m_pred is not None:
+            if has_spin:
                 m_pred[a_lo:a_hi] = r["mforces"].cpu().numpy()
-                t_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
+                tau_pred[a_lo:a_hi] = r["tau"].cpu().numpy()
     if was_training:
         model.train()
     if dev.type == "cuda":
@@ -754,18 +995,17 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
     e_ref_pa = energy_ref / nat_arr.astype(np.float64)
 
     forces_ref = np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
-    mforces_ref = (
-        np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
-        if model.spin_descriptor is not None else None)
-    tau_ref = (
-        np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
-        if model.spin_descriptor is not None else None)
+    mforces_ref = (np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
+                   if has_spin else None)
+    tau_ref = (np.full((N_atoms_local, 3), np.nan, dtype=np.float64)
+               if has_spin else None)
     for i in range(n_struct):
         a_lo, a_hi = int(nat_cum[i]), int(nat_cum[i + 1])
         if data_store.has_forces_flag[i]:
             forces_ref[a_lo:a_hi] = data_store.forces[i].cpu().numpy()
-        if mforces_ref is not None and data_store.has_mforces_flag[i]:
+        if has_spin and data_store.has_mforces_flag[i]:
             mforces_ref[a_lo:a_hi] = data_store.mforces[i].cpu().numpy()
+        if has_spin and data_store.has_tau_flag[i]:
             tau_ref[a_lo:a_hi] = data_store.tau[i].cpu().numpy()
 
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
@@ -777,15 +1017,19 @@ def _compute_local_predictions(model, data_store, batch_size, backend):
                              v9[1] / n, v9[5] / n, v9[6] / n]
 
     vol_arr = data_store.volumes.detach().cpu().numpy().astype(np.float64)
-    return {
+    result = {
         "natoms":    nat_arr,
         "volumes":   vol_arr,
         "e_pred":    e_pred,    "e_ref":    e_ref_pa,
         "f_pred":    f_pred,    "f_ref":    forces_ref,
         "v_pred":    v_pred,    "v_ref":    virial_ref,
-        "m_pred":    m_pred,    "m_ref":    mforces_ref,
-        "t_pred":    t_pred,    "t_ref":    tau_ref,
     }
+    if has_spin:
+        result.update({
+            "m_pred": m_pred, "m_ref": mforces_ref,
+            "t_pred": tau_pred, "t_ref": tau_ref,
+        })
+    return result
 
 
 def _write_predictions(output_dir: str, n_total_frames: int,
@@ -823,21 +1067,19 @@ def _write_predictions(output_dir: str, n_total_frames: int,
 def predict_from_store_sharded(model, data_store, local_global_idx,
                                 n_total_frames: int, output_dir: str,
                                 batch_size: int = 1000,
-                                backend: str = "auto",
                                 verbose: bool = True,
                                 suffix: str = "train",
                                 local_real_flags=None):
     """DDP equivalent of ``predict_from_store``: each rank predicts its local
-    data-store shard, arrays are gathered to rank 0, and rank 0 writes the
-    structural files plus magnetic-force/torque files for spin models in
-    input-xyz order ("train" or "test").
+    data-store shard, arrays are gathered to rank 0, rank 0 writes the four
+    ``*_{suffix}.out`` files in input-xyz order ("train" or "test").
 
     No xyz re-read, no neighbor-list rebuild, no temp nep.txt model file.
 
     Parameters
     ----------
     model : NEPModel  (DDP replica — parameters are in sync across ranks).
-    data_store : GPUDataStore  (this rank's local shard).
+    data_store : StreamDataStore  (this rank's local shard).
     local_global_idx : list[int]  original xyz-frame index for each local
         frame (length == ``data_store.n``). Supplied by the random shard
         assignment in ``train_nep_sharded``.
@@ -853,15 +1095,22 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
             print(msg, flush=True)
 
     t_compute = time.time()
-    local = _compute_local_predictions(model, data_store, batch_size, backend)
-    local["global_idx"] = np.asarray(local_global_idx, dtype=np.int64)
-    local["is_real"] = np.asarray(
-        ([True] * len(local_global_idx)
-         if local_real_flags is None else local_real_flags),
-        dtype=bool,
-    )
-    if local["is_real"].shape != local["global_idx"].shape:
-        raise ValueError("local_real_flags must match local_global_idx")
+    local = _compute_local_predictions(model, data_store, batch_size)
+    global_idx = np.asarray(local_global_idx, dtype=np.int64)
+    if local_real_flags is not None:
+        real = np.asarray(local_real_flags, dtype=bool)
+        if real.shape != global_idx.shape:
+            raise ValueError("local_real_flags must match local_global_idx")
+        atom_real = np.repeat(real, local["natoms"])
+        for key in ("natoms", "volumes", "e_pred", "e_ref",
+                    "v_pred", "v_ref"):
+            local[key] = local[key][real]
+        for key in ("f_pred", "f_ref", "m_pred", "m_ref",
+                    "t_pred", "t_ref"):
+            if key in local:
+                local[key] = local[key][atom_real]
+        global_idx = global_idx[real]
+    local["global_idx"] = global_idx
     _log(f"  compute:  {time.time() - t_compute:5.1f}s")
 
     # Gather per-rank arrays onto rank 0. all_gather_object stays on the
@@ -879,10 +1128,11 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     if not is_main:
         return
 
-    # Allocate global arrays and scatter each rank's REAL contribution into
-    # the slots given by its global_idx. Padding copies have their labels
-    # removed for loss fairness; they must be skipped here too, otherwise
-    # their NaN references overwrite the real frame's reference columns.
+    # Allocate global arrays and scatter each rank's contribution into the
+    # slots given by its global_idx. Padding duplicates are filtered before
+    # gather so their deliberately removed reference labels cannot overwrite
+    # the real frame. Every input frame appears in some rank, so the output
+    # has no NaN rows.
     natoms_g = np.zeros(n_total_frames, dtype=np.int64)
     volumes_g = np.zeros(n_total_frames, dtype=np.float64)
     e_pred_g = np.full(n_total_frames, np.nan)
@@ -891,23 +1141,14 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     v_ref_g  = np.full((n_total_frames, 6), _MISSING_VIRIAL)
 
     # First pass: frame-level arrays + natoms (to size the atom-level arrays).
-    seen_real = np.zeros(n_total_frames, dtype=bool)
     for part in gathered:
-        real = part["is_real"]
-        gi = part["global_idx"][real]
-        if seen_real[gi].any():
-            raise ValueError("duplicate real frame in sharded prediction")
-        seen_real[gi] = True
-        natoms_g[gi]  = part["natoms"][real]
-        volumes_g[gi] = part["volumes"][real]
-        e_pred_g[gi]  = part["e_pred"][real]
-        e_ref_g[gi]   = part["e_ref"][real]
-        v_pred_g[gi]  = part["v_pred"][real]
-        v_ref_g[gi]   = part["v_ref"][real]
-    if not seen_real.all():
-        missing = np.flatnonzero(~seen_real)
-        raise ValueError(
-            f"sharded prediction is missing real frames: {missing[:5]}")
+        gi = part["global_idx"]
+        natoms_g[gi]  = part["natoms"]
+        volumes_g[gi] = part["volumes"]
+        e_pred_g[gi]  = part["e_pred"]
+        e_ref_g[gi]   = part["e_ref"]
+        v_pred_g[gi]  = part["v_pred"]
+        v_ref_g[gi]   = part["v_ref"]
 
     # Global per-atom offsets are determined by input-xyz order so they match
     # what predict_dataset / predict_from_store would emit.
@@ -915,15 +1156,11 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
     N_atoms_global = int(nat_cum_g[-1])
     f_pred_g = np.full((N_atoms_global, 3), np.nan)
     f_ref_g  = np.full((N_atoms_global, 3), np.nan)
-    has_spin = gathered[0]["m_pred"] is not None
-    m_pred_g = (
-        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
-    m_ref_g = (
-        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
-    t_pred_g = (
-        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
-    t_ref_g = (
-        np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    has_spin = "m_pred" in gathered[0]
+    m_pred_g = (np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    m_ref_g = (np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    t_pred_g = (np.full((N_atoms_global, 3), np.nan) if has_spin else None)
+    t_ref_g = (np.full((N_atoms_global, 3), np.nan) if has_spin else None)
 
     for part in gathered:
         gi = part["global_idx"]
@@ -931,8 +1168,6 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
         nat_part = part["natoms"]
         part_cum = np.concatenate([[0], np.cumsum(nat_part)])
         for li, gidx in enumerate(gi):
-            if not part["is_real"][li]:
-                continue
             la, lb = int(part_cum[li]),  int(part_cum[li + 1])
             ga, gb = int(nat_cum_g[gidx]), int(nat_cum_g[gidx + 1])
             f_pred_g[ga:gb] = part["f_pred"][la:lb]
@@ -949,9 +1184,7 @@ def predict_from_store_sharded(model, data_store, local_global_idx,
                        e_pred_g, e_ref_g,
                        f_pred_g, f_ref_g,
                        v_pred_g, v_ref_g,
-                       m_pred=m_pred_g, m_ref=m_ref_g,
-                       t_pred=t_pred_g, t_ref=t_ref_g,
+                       m_pred_g, m_ref_g, t_pred_g, t_ref_g,
                        suffix=suffix)
-    extra = "|mforce|tau" if has_spin else ""
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
-         f"-> {output_dir}/(energy|force|virial|stress{extra})_{suffix}.out")
+         f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")

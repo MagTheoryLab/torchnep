@@ -150,6 +150,60 @@ def _split_frames(lines):
     return blocks
 
 
+def index_xyz(filename: str):
+    """Single streaming pass over an extended-XYZ file: frame index only.
+
+    Returns ``(offsets, natoms)`` — two int64 numpy arrays with, for every
+    frame, the byte offset of its ``natoms`` line and its atom count. No
+    frame content is parsed and no line list is kept, so the pass runs at
+    I/O speed with O(n_frames) memory — this is what makes multi-rank
+    sharded loading of very large files (tens of GB) feasible: one rank
+    indexes, the offsets are broadcast, and every rank then seek-reads only
+    its own frames (see :func:`read_xyz_at`).
+    """
+    offsets, natoms = [], []
+    with open(filename, "rb") as f:
+        pos = 0
+        line = f.readline()
+        while line:
+            stripped = line.strip()
+            if not stripped:          # tolerate stray blank lines between frames
+                pos = f.tell()
+                line = f.readline()
+                continue
+            n = int(stripped)
+            offsets.append(pos)
+            natoms.append(n)
+            for _ in range(n + 1):
+                f.readline()
+            pos = f.tell()
+            line = f.readline()
+    return (np.asarray(offsets, dtype=np.int64),
+            np.asarray(natoms, dtype=np.int64))
+
+
+def read_xyz_at(filename: str, offsets, energy_key: str = "energy"):
+    """Parse only the frames starting at the given byte offsets.
+
+    ``offsets`` come from :func:`index_xyz`; they may be in any order — the
+    file is swept in ascending-offset order (sequential-friendly for
+    parallel file systems) and the result list matches the ORDER OF
+    ``offsets`` as passed in. Only the requested frames' bytes are read.
+    """
+    offsets = np.asarray(offsets, dtype=np.int64)
+    order = np.argsort(offsets, kind="stable")
+    out = [None] * len(offsets)
+    with open(filename, "rb") as f:
+        for k in order:
+            f.seek(int(offsets[k]))
+            first = f.readline()
+            n = int(first)
+            block = [first.decode()]
+            block.extend(f.readline().decode() for _ in range(n + 1))
+            out[int(k)] = _parse_frame_block(block, energy_key=energy_key)
+    return out
+
+
 def read_xyz(filename: str, energy_key: str = "energy") -> List[Dict]:
     """Read extended XYZ file (GPUMD format).
 
@@ -330,8 +384,6 @@ def parse_nep_in(filename: str) -> Dict:
                 params["l_max"] = [int(x) for x in parts[1:]]
             elif key == "neuron":
                 params["neuron"] = int(parts[1])
-            elif key == "lambda_1":
-                params["lambda_1"] = float(parts[1])
             elif key == "lambda_e":
                 params["lambda_e"] = float(parts[1])
             elif key == "lambda_f":
@@ -342,8 +394,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_m"] = float(parts[1])
             elif key == "lambda_tau":
                 params["lambda_tau"] = float(parts[1])
-            elif key == "lambda_2":
-                params["lambda_2"] = float(parts[1])
+            elif key in ("lambda_1", "lambda_2", "pos_noise"):
+                # Retired regularization/noise controls are accepted for old
+                # input files but intentionally ignored.
+                continue
             elif key == "spin_descriptor":
                 raise ValueError(
                     "spin_descriptor is not part of the TorchNEP protocol; "
@@ -377,6 +431,8 @@ def parse_nep_in(filename: str) -> Dict:
                     "spin_dof_type and optional spin_env_type")
             elif key.startswith("spin_"):
                 raise ValueError(f"unsupported O/C spin parameter: {key}")
+            elif key == "weight_decay":
+                params["weight_decay"] = float(parts[1])
             elif key == "batch":
                 params["batch_size"] = int(parts[1])
             elif key == "eval_batch":
@@ -477,8 +533,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_v", 0.01)
     params.setdefault("lambda_m", 1.0)
     params.setdefault("lambda_tau", 0.0)
-    params.setdefault("lambda_1", 0.0)
-    params.setdefault("lambda_2", 0.0)
+    params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)
 
     # spin_mode 2 is the order/compression (O/C) magnetic descriptor.
@@ -604,3 +659,165 @@ def build_neighbor_list_np(positions, cell, cutoff):
     return (np.concatenate(all_i).astype(np.int64),
             np.concatenate(all_j).astype(np.int64),
             np.concatenate(all_rij))
+
+
+def valid_split_indices(n_frames: int, valid_ratio: float, run_seed: int):
+    """Train/validation split indices — the exact split ``train_nep`` makes.
+
+    ``train_nep(valid_ratio=r, run_seed=s)`` holds out
+    ``max(1, round(r * n))`` frames drawn from a dedicated torch generator
+    seeded with ``run_seed``. This helper is that draw, factored out so the
+    trainers and :func:`export_valid_split` can never disagree.
+
+    Returns ``(train_idx, valid_idx)`` — both sorted in input-file order.
+    """
+    import torch
+    if run_seed is None:
+        raise ValueError("run_seed is required: the split is drawn from it "
+                         "(train_nep uses the same seed to reproduce it)")
+    if not 0.0 < valid_ratio < 1.0:
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    g = torch.Generator()
+    g.manual_seed(run_seed)
+    perm = torch.randperm(n_frames, generator=g).tolist()
+    n_val = max(1, int(round(valid_ratio * n_frames)))
+    if n_val >= n_frames:
+        raise ValueError(f"valid_ratio={valid_ratio} leaves no training "
+                         f"frames ({n_frames} total)")
+    val_set = set(perm[:n_val])
+    train_idx = [i for i in range(n_frames) if i not in val_set]
+    return train_idx, sorted(val_set)
+
+
+def export_valid_split(data_file: str, valid_ratio: float, run_seed: int,
+                       output_dir: str = "split", strategy: str = "stratified",
+                       min_stratum: int = 20):
+    """Write GPUMD-ready ``train.xyz`` / ``test.xyz`` with train_nep's split.
+
+    Reproduces exactly the validation split that
+    ``train_nep(data_file, valid_ratio=r, run_seed=s, valid_strategy=...)``
+    uses internally, so the exported pair can train the SAME data partition
+    in GPUMD (or any other code) and loss curves stay comparable. Frames
+    are copied verbatim (raw text, untouched fields and precision), in
+    input-file order.
+
+    ``strategy``: "random" (default) or "stratified" — see
+    :func:`stratified_split_indices`.
+
+    Returns ``(train_path, test_path, n_train, n_valid)``.
+    """
+    import os
+    with open(data_file) as f:
+        blocks = _split_frames(f.readlines())
+    if strategy == "stratified":
+        metas = []
+        for b in blocks:
+            na = int(b[0].split()[0])
+            metas.append((na, {line.split()[0] for line in b[2:2 + na]}))
+        train_idx, val_idx, _ = stratified_split_indices(
+            metas, valid_ratio, run_seed, min_stratum=min_stratum)
+    elif strategy == "random":
+        train_idx, val_idx = valid_split_indices(len(blocks), valid_ratio,
+                                                 run_seed)
+    else:
+        raise ValueError(f"unknown split strategy: {strategy!r}")
+    os.makedirs(output_dir, exist_ok=True)
+    train_path = os.path.join(output_dir, "train.xyz")
+    test_path = os.path.join(output_dir, "test.xyz")
+    src = os.path.abspath(data_file)
+    for path, idxs in ((train_path, train_idx), (test_path, val_idx)):
+        if os.path.abspath(path) == src:
+            raise ValueError(f"output would overwrite the input: {src}")
+        with open(path, "w") as out:
+            for k in idxs:
+                out.writelines(blocks[k])
+    return train_path, test_path, len(train_idx), len(val_idx)
+
+
+def _size_class(natoms: int) -> int:
+    """Size class for stratified splitting: 0 = tiny cells (<=4 atoms,
+    dimers/trimers — the pair-specific short-range information), 1 = small
+    (5-15), 2 = bulk (>=16)."""
+    if natoms <= 4:
+        return 0
+    if natoms <= 15:
+        return 1
+    return 2
+
+
+def stratified_split_indices(metas, valid_ratio: float, run_seed: int,
+                             min_stratum: int = 20,
+                             tiny_to_train: bool = True):
+    """Coverage-aware train/validation split.
+
+    Frames are grouped into strata keyed by (element combination, size
+    class — see :func:`_size_class`). Within each stratum ``valid_ratio``
+    of the frames is held out for validation; strata with fewer than
+    ``min_stratum`` frames go ENTIRELY to training. Rationale: with many
+    element types a random split inevitably drops some rare stratum — e.g.
+    the only few Mo-Pd dimer curves — fully into validation, so the model
+    never sees that pair's short-range physics and can only fail on it.
+    Stratifying guarantees every represented (composition, size) group is
+    learned, and rare groups are never wasted on validation. The held-out
+    fraction is therefore slightly below ``valid_ratio`` (rare strata
+    contribute nothing); the validation set measures within-stratum
+    generalization only.
+
+    ``tiny_to_train`` (default True): tiny cells (size class 0, <= 4
+    atoms — dimer/trimer short-range scans) go ENTIRELY to training
+    regardless of stratum size. Their per-pair curves are sparse in
+    configuration space even when the stratum is populous, and their job
+    is to teach the short-range physics — holding some out both starves
+    the model and produces the dominant validation-error tail.
+
+    ``metas``: sequence of (natoms, iterable_of_species) per frame, in file
+    order. Deterministic for a given ``run_seed``; the trainers and
+    :func:`export_valid_split` share this implementation.
+
+    Returns ``(train_idx, valid_idx, stats)`` — index lists sorted in input
+    order plus a stats dict (n_strata, n_rare_strata, n_rare_frames,
+    n_tiny_frames).
+    """
+    import torch
+    if run_seed is None:
+        raise ValueError("run_seed is required: the split is drawn from it")
+    if not 0.0 < valid_ratio < 1.0:
+        raise ValueError(f"valid_ratio must be in (0, 1), got {valid_ratio}")
+    strata = {}
+    for i, (na, sp) in enumerate(metas):
+        key = ("-".join(sorted(set(sp))), _size_class(na))
+        strata.setdefault(key, []).append(i)
+
+    g = torch.Generator()
+    g.manual_seed(run_seed)
+    val, n_rare, n_rare_frames, n_tiny = [], 0, 0, 0
+    for key in sorted(strata):
+        idxs = strata[key]
+        if tiny_to_train and key[1] == 0:
+            n_tiny += len(idxs)
+            continue
+        if len(idxs) < min_stratum:
+            n_rare += 1
+            n_rare_frames += len(idxs)
+            continue
+        perm = torch.randperm(len(idxs), generator=g).tolist()
+        n_val = min(max(1, int(round(valid_ratio * len(idxs)))),
+                    len(idxs) - 1)
+        val.extend(idxs[p] for p in perm[:n_val])
+    # Fallback: when the eligible pool is too small for a meaningful
+    # holdout (e.g. a dataset made ENTIRELY of tiny cells, which
+    # tiny_to_train sends to training), a starved validation set would be
+    # useless-to-empty — fall back to a plain random split (same seed) and
+    # report it via stats["fallback"] so callers can log it.
+    if len(val) < max(1, int(round(0.5 * valid_ratio * len(metas)))):
+        train_idx, val_idx = valid_split_indices(len(metas), valid_ratio,
+                                                 run_seed)
+        stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
+                 "n_rare_frames": n_rare_frames, "n_tiny_frames": n_tiny,
+                 "fallback": "random"}
+        return train_idx, val_idx, stats
+    val_set = set(val)
+    train_idx = [i for i in range(len(metas)) if i not in val_set]
+    stats = {"n_strata": len(strata), "n_rare_strata": n_rare,
+             "n_rare_frames": n_rare_frames, "n_tiny_frames": n_tiny}
+    return train_idx, sorted(val_set), stats

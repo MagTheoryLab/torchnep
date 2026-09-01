@@ -11,12 +11,14 @@
 # You should have received a copy of the GNU General Public License
 # along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
 
-__version__ = "1.0.1"
+__version__ = "1.0.3a2"
 
-from .predict import predict_dataset
+from .predict import predict_dataset, predict_dataset_sharded
 from .train import train_nep
 from .train_sharded import train_nep_sharded
+from .data import export_valid_split
 
 __all__ = [
-    "predict_dataset", "train_nep", "train_nep_sharded",
+    "predict_dataset", "predict_dataset_sharded", "train_nep", "train_nep_sharded",
+    "export_valid_split",
 ]

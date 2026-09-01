@@ -23,7 +23,7 @@ import pytest
 import torch
 
 from torchnep.data import read_xyz, parse_nep_in
-from torchnep.train import (preprocess_structures, GPUDataStore, train_nep)
+from torchnep.train import (preprocess_structures, StreamDataStore, train_nep)
 from torchnep.model import NEPModel
 from _common import DATA_DIR
 
@@ -70,7 +70,7 @@ def _expected_split(n_frames, seed, ratio):
 def _valid_energy_mse(cfg, frames, nep_txt):
     """Energy MSE of a saved model on the given frames (per-atom, eV/atom)."""
     structs = preprocess_structures(frames, cfg, np.float64)
-    ds = GPUDataStore(structs, torch.device("cpu"), torch.float64, config=cfg)
+    ds = StreamDataStore(structs, torch.device("cpu"), torch.float64, config=cfg)
     m = NEPModel(cfg).to(torch.float64)
     m.load_weights_from_nep_txt(nep_txt)
     sq, n = 0.0, 0
@@ -113,6 +113,52 @@ def test_early_stop_triggers_on_plateau_with_validation(tmp_path):
     assert (out / "nep_final.txt").exists()
     assert (out / "nep_best.txt").exists()
     assert (out / "energy_test.out").exists()   # valid branch was active
+
+
+def test_early_stop_stage1_jumps_to_stage2(tmp_path):
+    """Per-stage early stop (MACE-style): a stage-1 plateau with a stage 2
+    still pending JUMPS into stage 2 at the next epoch instead of ending the
+    run; only a stage-2 plateau then terminates it. lr=0 (both stages) makes
+    every stage plateau within `early_stop` epochs, so the run must enter
+    stage 2 well before its scheduled epoch-30 start and stop shortly after —
+    far short of the full 40 epochs."""
+    _, xyz = _write_run_files(tmp_path, n_frames=20)
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 40\nbatch 8\nlr 0\nearly_stop 3\n"
+                     "stage2 1\nstart_stage2 30\nstage2_lr 0\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2)
+
+    log = (out / "output.log").read_text()
+    assert "Early stop (stage 1)" in log        # jumped, not stopped
+    assert "Stage 2 started at epoch" in log    # stage 2 actually ran
+    assert "Early stop:" in log                 # final stop was in stage 2
+    n_epochs = _loss_out_epochs(out)
+    assert n_epochs < 30, "run should end long before the scheduled stage-2 start"
+    assert n_epochs > 4, "stage 2 must have run at least a few epochs"
+
+
+def test_early_stop_stage2_jump_survives_resume(tmp_path):
+    """After an early-stop jump into stage 2, a resumed run must stay in
+    stage 2 (the checkpoint pins the effective start_stage2) — without the
+    persisted value, nep.in's start_stage2=30 would put the resumed epochs
+    back into stage 1."""
+    _, xyz = _write_run_files(tmp_path, n_frames=20)
+    nepin = tmp_path / "nep.in"
+    nepin.write_text(NEP_IN + "epoch 40\nbatch 8\nlr 0\nearly_stop 3\n"
+                     "stage2 1\nstart_stage2 30\nstage2_lr 0\n")
+    out = tmp_path / "out"
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2)
+    log1 = (out / "output.log").read_text()
+    assert "Early stop (stage 1)" in log1
+    n_first = _loss_out_epochs(out)
+    assert n_first < 30
+
+    # Resume from the early-stopped checkpoint (auto pickup via restart=True).
+    _train(nepin, xyz, out, run_seed=0, valid_ratio=0.2, restart=True)
+    log2 = (out / "output.log").read_text()
+    assert "Stage 2 resumed at epoch" in log2, \
+        "resumed run fell back to stage 1 — start_stage2 not restored"
 
 
 def test_no_early_stop_when_disabled(tmp_path):
@@ -312,3 +358,106 @@ def test_resume_preserves_valid_split(tmp_path):
     expected = np.array([frames[i]["energy"] / len(frames[i]["species"])
                          for i in val_idx])
     assert np.allclose(ref_resumed, expected, atol=1e-8)
+
+
+def test_export_valid_split_matches_train_nep(tmp_path):
+    """export_valid_split writes GPUMD-ready train/test files that
+    reproduce exactly the valid_ratio split train_nep uses: the reference
+    energies in energy_test.out equal the exported test.xyz energies (in
+    order), the two files partition the input verbatim, and the export is
+    deterministic."""
+    from torchnep import export_valid_split
+    nepin, xyz = _write_run_files(tmp_path)
+
+    out = tmp_path / "run"
+    train_nep(config_file=nepin, data_file=xyz, output_dir=str(out),
+              device="cpu", precision="float64", print_interval=100,
+              restart=False, checkpoint_interval=1000,
+              prediction_interval=1000, run_seed=11, valid_ratio=0.25)
+
+    tp, vp, n_tr, n_va = export_valid_split(
+        xyz, valid_ratio=0.25, run_seed=11,
+        output_dir=str(tmp_path / "split"))
+
+    orig = read_xyz(xyz)
+    tr, va = read_xyz(tp), read_xyz(vp)
+    assert n_tr == len(tr) and n_va == len(va)
+    assert len(tr) + len(va) == len(orig)
+
+    # Reference per-atom energies in energy_test.out (col 2) must equal the
+    # exported test.xyz frames, same order.
+    rows = np.loadtxt(out / "energy_test.out", ndmin=2)
+    assert rows.shape[0] == len(va)
+    ref = rows[:, 1]
+    exp = np.array([f["energy"] / f["natoms"] for f in va])
+    assert np.allclose(ref, exp, atol=1e-10)
+
+    # Verbatim: re-reading the two exports and the original gives the same
+    # frame multiset (match on energy + natoms fingerprints).
+    def fp(frames):
+        return sorted((f["natoms"], round(float(f["energy"]), 10))
+                      for f in frames)
+    assert fp(tr) + fp(va) != []  # sanity
+    assert sorted(fp(tr) + fp(va)) == fp(orig)
+
+    # Deterministic: exporting again is byte-identical.
+    tp2, vp2, _, _ = export_valid_split(
+        xyz, valid_ratio=0.25, run_seed=11,
+        output_dir=str(tmp_path / "split2"))
+    assert open(tp).read() == open(tp2).read()
+    assert open(vp).read() == open(vp2).read()
+
+
+def test_stratified_split_and_export(tmp_path):
+    """Stratified split: rare strata (< min_stratum frames) go entirely to
+    training, populous strata are split ~valid_ratio, trainer and export
+    agree, and the draw is deterministic."""
+    import numpy as np
+    from torchnep.data import stratified_split_indices
+    from torchnep import export_valid_split
+
+    # synthetic metas: one populous bulk stratum (60 frames), one populous
+    # tiny stratum (40), one rare tiny stratum (5)
+    metas = ([(32, {"Pd", "Cu"})] * 60
+             + [(2, {"Pd", "Cu"})] * 40
+             + [(2, {"Mo", "Pd"})] * 5)
+    tr, va, st = stratified_split_indices(metas, 0.25, run_seed=9,
+                                          min_stratum=20)
+    # default tiny_to_train=True consumes BOTH tiny strata (the rare
+    # Mo-Pd one included) before the rare-stratum rule sees them
+    assert st["n_strata"] == 3 and st["n_rare_strata"] == 0
+    assert st["n_tiny_frames"] == 45
+    assert all(i in tr for i in range(60, 105))
+    # the populous bulk stratum still holds out ~25%
+    va_bulk = [i for i in va if i < 60]
+    assert len(va_bulk) == 15 and len(va) == 15
+    assert sorted(tr + va) == list(range(105))
+    tr2, va2, _ = stratified_split_indices(metas, 0.25, run_seed=9,
+                                           min_stratum=20)
+    assert tr == tr2 and va == va2
+
+    # tiny_to_train=False: populous tiny stratum is split, rare one still
+    # goes fully to training
+    trf, vaf, stf = stratified_split_indices(metas, 0.25, run_seed=9,
+                                             min_stratum=20,
+                                             tiny_to_train=False)
+    assert stf["n_tiny_frames"] == 0 and stf["n_rare_frames"] == 5
+    assert len([i for i in vaf if 60 <= i < 100]) == 10
+    assert all(i in trf for i in range(100, 105))
+
+    # export parity on a real file: strategy="stratified" writes a
+    # partition consistent with the same helper on parsed frames
+    nepin, xyz = _write_run_files(tmp_path)
+    frames = read_xyz(xyz)
+    metas_f = [(f["natoms"], set(f["species"])) for f in frames]
+    trf, vaf, _ = stratified_split_indices(metas_f, 0.3, run_seed=5,
+                                           min_stratum=2)
+    tp, vp, n_tr, n_va = export_valid_split(
+        xyz, valid_ratio=0.3, run_seed=5,
+        output_dir=str(tmp_path / "strat"), strategy="stratified",
+        min_stratum=2)
+    assert (n_tr, n_va) == (len(trf), len(vaf))
+    got_va = read_xyz(vp)
+    assert [f["natoms"] for f in got_va] == [frames[i]["natoms"] for i in vaf]
+    assert np.allclose([f["energy"] for f in got_va],
+                       [frames[i]["energy"] for i in vaf])

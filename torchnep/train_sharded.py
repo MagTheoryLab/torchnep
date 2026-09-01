@@ -44,7 +44,8 @@ from torch.optim.swa_utils import AveragedModel
 
 import torch.nn as nn
 from .model import NEPModel, gpumd_init_parameters
-from .data import read_xyz, parse_nep_in
+from .data import (read_xyz, parse_nep_in, valid_split_indices,
+                   stratified_split_indices)
 from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
@@ -80,6 +81,13 @@ def _register_pg_atexit():
 
     def _cleanup():
         if dist.is_available() and dist.is_initialized():
+            # Rendezvous before tearing down: rank 0 hosts the TCPStore, and
+            # if it exits first the other ranks' NCCL heartbeat monitors spam
+            # "failed to recv" warnings while polling the dead store.
+            try:
+                dist.barrier()
+            except Exception:
+                pass
             dist.destroy_process_group()
 
     atexit.register(_cleanup)
@@ -98,7 +106,8 @@ class _NEPDDPShim(nn.Module):
     this shim's ``forward`` puts it on the DDP path.
     """
 
-    def __init__(self, model: NEPModel, use_compile: bool = False):
+    def __init__(self, model: NEPModel, use_compile: bool = False,
+                 use_autograd_forces: bool = False):
         super().__init__()
         self.model = model
         # torch.compile is applied to the bound analytical compute method, not
@@ -106,21 +115,36 @@ class _NEPDDPShim(nn.Module):
         # NOT in NEPModel.forward(), so compiling the module would be a no-op.
         # The compiled call stays INSIDE this shim's forward, so it remains on
         # DDP's forward path and the reducer still arms backward all-reduce; the
-        # compiled region does not span the DDP boundary. The autograd path is
-        # left eager (its create_graph=True double backward is incompatible with
-        # torch.compile's donated-buffer optimisation). See train.py for the
-        # single-device counterpart.
+        # compiled region does not span the DDP boundary.
+        self._ag_compute = None
         if use_compile and hasattr(torch, "compile"):
-            self._compute_cached = torch.compile(
-                model.compute_properties_cached, dynamic=True)
-        else:
+            if use_autograd_forces:
+                # make_fx-traced autograd forces (see compiled_autograd):
+                # parameters enter the traced graph as function inputs, so
+                # loss.backward() still fills the same nn.Parameter .grads
+                # that DDP's reducer hooks watch — every parameter appears
+                # in the graph (weight stacks touch all types), so no
+                # find_unused_parameters needed.
+                from .compiled_autograd import CompiledAutogradForce
+                self._ag_compute = CompiledAutogradForce(model)
+            else:
+                # Compile the branch-free core; result assembly stays eager
+                # in the wrapper (see NEPModel._cached_core).
+                import functools
+                self._compute_cached = functools.partial(
+                    model.compute_properties_cached,
+                    core_fn=torch.compile(model._cached_core, dynamic=True))
+        if not hasattr(self, "_compute_cached"):
             self._compute_cached = model.compute_properties_cached
 
     def forward(self, batch, use_autograd_forces: bool,
                 need_forces: bool, need_virial: bool,
                 need_mforce: bool, need_tau: bool, backend: str):
         if use_autograd_forces:
-            return self.model.compute_properties(
+            fn = (self._ag_compute.compute_properties
+                  if self._ag_compute is not None
+                  else self.model.compute_properties)
+            return fn(
                 batch["rij_rad"], batch["rij_ang"],
                 batch["pair_i_rad"], batch["pair_j_rad"],
                 batch["pair_i_ang"], batch["pair_j_ang"],
@@ -140,7 +164,7 @@ class _NEPDDPShim(nn.Module):
 
 from .train import (
     _BANNER, _AUTHOR,
-    _backend_info, GPUDataStore,
+    _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
     preprocess_structures, compute_max_neighbors,
     fit_energy_baseline_frames, spin_curriculum_scale,
@@ -152,9 +176,9 @@ from .train import (
     _trim_loss_log, _accumulate_true_loss_sums,
     _load_finetune_weights,
     evaluate_generator_curves,
-    _make_lr_scheduler, _scheduler_step,
+    _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
-    _clean_warning_format, _VIRIAL_6,
+    _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
 )
 
 
@@ -238,23 +262,24 @@ def train_nep_sharded(
     data_file: str,
     output_dir: str = ".",
     precision: str = "float32",
-    backend: str = "auto",
     use_autograd_forces: bool = False,
     use_swa: bool = False,
-    use_compile: bool = False,
-    print_interval: int = 10,
+    swa_start: int = None,
+    use_compile: bool = None,
+    print_interval: int = 1,
     restart: bool = True,
     checkpoint_interval: int = 100,
-    prediction_interval: int = 20,
+    prediction_interval: int = 100,
     finetune_from: str = None,
     resume_from: str = None,
     recompute_q_scaler: bool = False,
     slim_types: bool = False,
     energy_key: str = "energy",
-    use_gpumd_qscaler: bool = None,
+    use_gpumd_qscaler: bool = False,
     run_seed: int = None,
     valid_file: str = None,
     valid_ratio: float = None,
+    valid_strategy: str = "stratified",
 ):
     """Data-sharded NEP training.  Launch via torchrun (or any launcher that
     sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT).
@@ -291,14 +316,24 @@ def train_nep_sharded(
     validation loss. The validation frames are sharded across ranks like the
     training frames; the error sums are all-reduced, so every rank sees the
     identical validation loss (schedulers stay in lock-step).
+
+    Each rank keeps its shard in host memory and streams only the current
+    batch to its GPU (basis computed on the fly, CPU assembly prefetched
+    one batch ahead) — per-GPU memory scales with ``batch``, not shard
+    size. DDP collectives are untouched: same step count per rank,
+    gradients all-reduced as usual.
     """
     _clean_warning_format()
+    _default_alloc_conf()
+    # Quiet CPU-thread oversubscription for multi-process runs (torchrun
+    # sets this itself and warns when unset; other launchers may not).
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
 
     # ---- Distributed init ------------------------------------------------
     # Wrap local_rank around the number of visible GPUs — lets several
     # processes share one GPU (useful for locally simulating multi-rank DDP).
     # NCCL refuses to share a GPU across ranks, so fall back to gloo (slower
-    # but correct) when world_size > available GPUs.
+    # but correct) when the ranks on this node outnumber its GPUs.
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     cuda_available = torch.cuda.is_available()
     n_gpus = torch.cuda.device_count() if cuda_available else 0
@@ -311,7 +346,18 @@ def train_nep_sharded(
         dev = torch.device("cpu")
     if not dist.is_initialized():
         world_size_env = int(os.environ.get("WORLD_SIZE", 1))
-        ddp_backend = "nccl" if cuda_available and world_size_env <= n_gpus else "gloo"
+        # GPU sharing is a per-NODE question: on a multi-node run each node
+        # hosts LOCAL_WORLD_SIZE ranks (torchrun sets it; srun-style
+        # launchers expose SLURM_NTASKS_PER_NODE), and NCCL is fine as long
+        # as no two ranks on one node share a GPU. Comparing the GLOBAL
+        # world size against the local GPU count (the old heuristic) forced
+        # every multi-node run onto gloo.
+        local_world_env = int(
+            os.environ.get("LOCAL_WORLD_SIZE",
+                           os.environ.get("SLURM_NTASKS_PER_NODE",
+                                          world_size_env)))
+        ddp_backend = ("nccl" if cuda_available and local_world_env <= n_gpus
+                       else "gloo")
         # Pass device_id so NCCL can bind the rank to its CUDA device
         # deterministically (silences "Guessing device ID based on global
         # rank" and the collective-context warnings, and prevents hangs on
@@ -419,8 +465,6 @@ def train_nep_sharded(
             _log(line)
         _log("")
     config = orig_config
-    lambda_1 = config["lambda_1"]
-    lambda_2 = config["lambda_2"]
     num_epochs         = config["num_epochs"]
     batch_size         = config["batch_size"]
     eval_batch_size    = config["eval_batch_size"]
@@ -454,9 +498,140 @@ def train_nep_sharded(
     ]
     dist.broadcast_object_list(lineage_holder, src=0)
     initial_data_lineage = lineage_holder[0]
-    frames = read_xyz(data_file, energy_key=energy_key)
-    _log(f"  read {len(frames)} structures from {data_file} "
-         f"(energy label: {energy_key})")
+
+    # Streamed shard loading for large files: rank 0 makes one index pass
+    # (byte offset + natoms per frame, no parsing), broadcasts the offsets,
+    # and every rank then seek-reads ONLY its own frames. This replaces the
+    # old "every rank parses the whole file" path, whose readlines() line
+    # list alone costs tens of GB per rank on a multi-10-GB file.
+    _STREAM_THRESHOLD = int(os.environ.get("TORCHNEP_STREAM_THRESHOLD",
+                                           2 * 1024 ** 3))
+    streamed = os.path.getsize(data_file) >= _STREAM_THRESHOLD
+    _stream_valid_local = None
+    _slim_keep = None
+    if streamed:
+        from .data import index_xyz, read_xyz_at
+        bcast_dev = dev if dist.get_backend() == "nccl" else torch.device("cpu")
+        if is_main:
+            t0 = time.time()
+            offs_np, _nat_np = index_xyz(data_file)
+            _log(f"  indexed {len(offs_np)} structures from {data_file} in "
+                 f"{time.time() - t0:.1f}s (streamed shard loading, "
+                 f"{os.path.getsize(data_file) / 2**30:.1f} GiB; "
+                 f"energy label: {energy_key})")
+            n_all_t = torch.tensor([len(offs_np)], dtype=torch.long,
+                                   device=bcast_dev)
+        else:
+            n_all_t = torch.zeros(1, dtype=torch.long, device=bcast_dev)
+        dist.broadcast(n_all_t, 0)
+        n_all = int(n_all_t.item())
+        offs_t = torch.empty(n_all, dtype=torch.long, device=bcast_dev)
+        if is_main:
+            offs_t.copy_(torch.from_numpy(offs_np).to(bcast_dev))
+        dist.broadcast(offs_t, 0)
+        offs_all = offs_t.cpu().numpy()
+        del offs_t
+
+        if valid_file is not None and valid_ratio is not None:
+            raise ValueError(
+                "valid_file and valid_ratio are mutually exclusive")
+        val_idx_s = None
+        if valid_ratio is not None:
+            if valid_strategy == "stratified":
+                _log("  streamed loader: the stratified valid split needs "
+                     "full-file metadata — using the random strategy "
+                     "(same run_seed) for this large file")
+            train_idx_s, val_idx_s = valid_split_indices(
+                n_all, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx_s)} "
+                 f"frames for validation, {len(train_idx_s)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            train_idx_s = np.arange(n_all)
+        train_offs = offs_all[np.asarray(train_idx_s, dtype=np.int64)]
+        n_total = len(train_offs)
+
+        shuffle_g = torch.Generator()
+        shuffle_g.manual_seed(0)
+        global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+        n_local = (n_total + world_size - 1) // world_size  # ceil
+        pad = n_local * world_size - n_total
+        real_flags = [True] * n_total
+        if pad:
+            global_perm = global_perm + global_perm[:pad]
+            real_flags.extend([False] * pad)
+        local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        local_real_flags = real_flags[rank * n_local : (rank + 1) * n_local]
+        t0 = time.time()
+        frames = None
+        local_frames = read_xyz_at(
+            data_file, train_offs[np.asarray(local_global_idx)],
+            energy_key=energy_key)
+        _log(f"  parsed local shard ({len(local_frames)} frames) in "
+             f"{time.time() - t0:.1f}s")
+
+        valid_frames = None
+        n_valid_total = 0
+        valid_local_global_idx = None
+        if val_idx_s is not None and len(val_idx_s):
+            n_valid_total = len(val_idx_s)
+            voffs = offs_all[np.asarray(val_idx_s, dtype=np.int64)]
+            vsh_g = torch.Generator()
+            vsh_g.manual_seed(0)
+            vperm_sh = torch.randperm(n_valid_total,
+                                      generator=vsh_g).tolist()
+            n_vlocal = (n_valid_total + world_size - 1) // world_size
+            vpad = n_vlocal * world_size - n_valid_total
+            vreal_flags = [True] * n_valid_total
+            if vpad:
+                vperm_sh = vperm_sh + vperm_sh[:vpad]
+                vreal_flags.extend([False] * vpad)
+            valid_local_global_idx = \
+                vperm_sh[rank * n_vlocal : (rank + 1) * n_vlocal]
+            valid_local_real_flags = \
+                vreal_flags[rank * n_vlocal : (rank + 1) * n_vlocal]
+            _stream_valid_local = read_xyz_at(
+                data_file, voffs[np.asarray(valid_local_global_idx)],
+                energy_key=energy_key)
+
+        if slim_types:
+            # Global species union from the local shards (bitmask MAX).
+            present = torch.zeros(len(orig_config["type_names"]),
+                                  dtype=torch.long, device=dev)
+            name_pos = {t: i for i, t in
+                        enumerate(orig_config["type_names"])}
+            for f_ in local_frames + (_stream_valid_local or []):
+                for s in set(f_["species"]):
+                    present[name_pos[s]] = 1
+            dist.all_reduce(present, op=dist.ReduceOp.MAX)
+            keep = [t for i, t in enumerate(orig_config["type_names"])
+                    if int(present[i])]
+            removed = [t for t in orig_config["type_names"]
+                       if t not in keep]
+            if removed:
+                _slim_keep = keep
+                config = dict(orig_config)
+                config["type_names"] = keep
+                config["num_types"] = len(keep)
+                for key in ("spin_dof_type", "spin_env_type"):
+                    if config.get(key) is not None:
+                        config[key] = [
+                            name for name in config[key] if name in keep
+                        ]
+                if (config.get("spin_mode", 0)
+                        and config.get("spin_dof_type") == []):
+                    raise ValueError(
+                        "slim_types removed every active spin_dof_type")
+                _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
+                     f"(removing: {removed})")
+            else:
+                _log("  slim_types: all types present in data, "
+                     "nothing to remove")
+
+    if not streamed:
+        frames = read_xyz(data_file, energy_key=energy_key)
+        _log(f"  read {len(frames)} structures from {data_file} "
+             f"(energy label: {energy_key})")
 
     # ---- Validation set (same semantics as train_nep) ---------------------
     # The ratio split draws from run_seed via a dedicated generator —
@@ -464,37 +639,69 @@ def train_nep_sharded(
     # on the partition. Sorted indices keep *_test.out rows in input order.
     if valid_file is not None and valid_ratio is not None:
         raise ValueError("valid_file and valid_ratio are mutually exclusive")
-    valid_frames = None
+    if not streamed:
+        valid_frames = None
     if valid_file is not None:
         if os.path.samefile(data_file, valid_file):
             raise ValueError("valid_file must not be the training data file")
         valid_frames = read_xyz(valid_file, energy_key=energy_key)
         _log(f"  read {len(valid_frames)} validation structures "
              f"from {valid_file}")
-    elif valid_ratio is not None:
+    elif not streamed and valid_ratio is not None:
         if not 0.0 < valid_ratio < 1.0:
             raise ValueError(f"valid_ratio must be in (0, 1), "
                              f"got {valid_ratio}")
-        val_idx = grouped_validation_indices(
-            frames, valid_ratio, run_seed
-        )
-        n_val = len(val_idx)
-        val_set = set(val_idx)
+        has_response_groups = any("response_group" in f for f in frames)
+        if config.get("spin_mode", 0) == 2 and has_response_groups:
+            val_idx = grouped_validation_indices(frames, valid_ratio, run_seed)
+            val_set = set(val_idx)
+            train_idx = [i for i in range(len(frames)) if i not in val_set]
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} "
+                 f"frames, {len(train_idx)} remain for training "
+                 f"(whole response groups, split drawn from run_seed)")
+        elif valid_strategy == "stratified":
+            metas = [(f["natoms"], f["species"]) for f in frames]
+            train_idx, val_idx, st = stratified_split_indices(
+                metas, valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio} (stratified by composition x "
+                 f"cell size): held out {len(val_idx)} frames, "
+                 f"{len(train_idx)} remain (split drawn from run_seed)")
+        elif valid_strategy == "random":
+            train_idx, val_idx = valid_split_indices(
+                len(frames), valid_ratio, run_seed)
+            _log(f"  valid_ratio={valid_ratio}: held out {len(val_idx)} "
+                 f"frames for validation, {len(train_idx)} remain for "
+                 f"training (split drawn from run_seed)")
+        else:
+            raise ValueError(f"unknown valid_strategy: {valid_strategy!r}")
         valid_frames = [frames[i] for i in val_idx]
-        frames = [f for i, f in enumerate(frames) if i not in val_set]
-        _log(f"  valid_ratio={valid_ratio}: held out {n_val} frames for "
-             f"validation, {len(frames)} remain for training "
-             f"(whole response groups, split drawn from run_seed)")
+        frames = [frames[i] for i in train_idx]
+    contract_train_frames = local_frames if streamed else frames
+    contract_valid_frames = (
+        _stream_valid_local if streamed and _stream_valid_local is not None
+        else valid_frames)
     if config.get("spin_mode", 0):
-        validate_spin_frames(frames, "training")
-        if valid_frames is not None:
-            validate_spin_frames(valid_frames, "validation")
-    if valid_file is not None:
+        validate_spin_frames(contract_train_frames, "training")
+        if contract_valid_frames is not None:
+            validate_spin_frames(contract_valid_frames, "validation")
+    if valid_file is not None and not streamed:
         validate_response_group_disjoint(frames, valid_frames)
-    response_frames = (
-        select_generator_curve_frames(frames)
-        if config.get("spin_mode", 0) == 2 else []
-    )
+    if streamed and config.get("spin_mode", 0) == 2:
+        local_has_response = int(any(
+            "response_group" in frame
+            for frame in local_frames + (_stream_valid_local or [])))
+        response_flag = torch.tensor(local_has_response, device=dev)
+        dist.all_reduce(response_flag, op=dist.ReduceOp.MAX)
+        if int(response_flag):
+            raise ValueError(
+                "streamed sharded loading cannot preserve complete rotation "
+                "response groups; use a smaller dataset shard or raise "
+                "TORCHNEP_STREAM_THRESHOLD")
+        response_frames = []
+    else:
+        response_frames = (
+            select_generator_curve_frames(frames)
+            if config.get("spin_mode", 0) == 2 else [])
     valid_response_frames = (
         select_generator_curve_frames(valid_frames)
         if config.get("spin_mode", 0) == 2 and valid_frames is not None
@@ -521,11 +728,11 @@ def train_nep_sharded(
                 if valid_frames is not None else ""))
         _log(f"  generator objective: {GENERATOR_CURVE_SCHEMA}; "
              "one replicated complete group per ordinary optimizer step")
-    n_total = len(frames)
+    if not streamed:
+        n_total = len(frames)
 
     # slim_types: all ranks agree on which types to keep (deterministic scan)
-    _slim_keep = None
-    if slim_types:
+    if not streamed and slim_types:
         seen_species = set(s for f in frames for s in f["species"])
         if valid_frames is not None:
             seen_species |= set(s for f in valid_frames
@@ -551,10 +758,35 @@ def train_nep_sharded(
         else:
             _log("  slim_types: all types present in data, nothing to remove")
 
-    energy_baseline_values = (
-        fit_energy_baseline_frames(frames, config["type_names"])
-        if config.get("spin_mode", 0) else None
-    )
+    energy_baseline_values = None
+    if config.get("spin_mode", 0):
+        if not streamed:
+            energy_baseline_values = fit_energy_baseline_frames(
+                frames, config["type_names"])
+        else:
+            type_index = {
+                name: index for index, name in enumerate(config["type_names"])}
+            ntype = len(type_index)
+            ata = np.zeros((ntype, ntype), dtype=np.float64)
+            aty = np.zeros(ntype, dtype=np.float64)
+            for frame, is_real in zip(local_frames, local_real_flags):
+                if not is_real or "energy" not in frame:
+                    continue
+                x = np.zeros(ntype, dtype=np.float64)
+                for species in frame["species"]:
+                    x[type_index[species]] += 1.0
+                x /= len(frame["species"])
+                y = float(frame["energy"]) / len(frame["species"])
+                ata += np.outer(x, x)
+                aty += x * y
+            stats = torch.from_numpy(
+                np.concatenate([ata.ravel(), aty])).to(dev)
+            dist.all_reduce(stats)
+            stats_np = stats.cpu().numpy()
+            ata = stats_np[:ntype * ntype].reshape(ntype, ntype)
+            aty = stats_np[ntype * ntype:]
+            energy_baseline_values = np.linalg.lstsq(
+                ata, aty, rcond=None)[0]
 
     # Random sharding: shuffle globally with a fixed seed (identical on
     # every rank -> all ranks agree on the partition), then give rank r the
@@ -566,23 +798,23 @@ def train_nep_sharded(
     # every original frame exactly once.
     if n_total == 0:
         raise ValueError("training data contains no frames")
-    shuffle_g = torch.Generator()
-    shuffle_g.manual_seed(0)
-    global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
-    n_local = (n_total + world_size - 1) // world_size  # ceil
-    pad = n_local * world_size - n_total
-    real_flags = [True] * n_total
-    if pad:
-        global_perm.extend(
-            global_perm[index % n_total] for index in range(pad))
-        real_flags.extend([False] * pad)
-    local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
-    local_real_flags = real_flags[rank * n_local : (rank + 1) * n_local]
-    local_frames = [frames[i] for i in local_global_idx]
+    if not streamed:
+        shuffle_g = torch.Generator()
+        shuffle_g.manual_seed(0)
+        global_perm = torch.randperm(n_total, generator=shuffle_g).tolist()
+        n_local = (n_total + world_size - 1) // world_size  # ceil
+        pad = n_local * world_size - n_total
+        real_flags = [True] * n_total
+        if pad:
+            global_perm = global_perm + global_perm[:pad]
+            real_flags.extend([False] * pad)
+        local_global_idx = global_perm[rank * n_local : (rank + 1) * n_local]
+        local_real_flags = real_flags[rank * n_local : (rank + 1) * n_local]
+        local_frames = [frames[i] for i in local_global_idx]
     pad_note = (f", {pad} frame(s) duplicated for even split"
                 if pad else "")
     _log(f"  sharded across {world_size} ranks: "
-         f"{n_local} frames per rank{pad_note}")
+         f"{len(local_frames)} frames per rank{pad_note}")
 
     t0 = time.time()
     np_dtype = np.float64 if precision == "float64" else np.float32
@@ -602,8 +834,20 @@ def train_nep_sharded(
     # validation metrics also contain every original frame exactly once.
     structures_v = None
     response_structures_v = None
-    valid_local_global_idx = None
-    n_valid_total = 0
+    if not streamed or valid_frames is not None:
+        valid_local_global_idx = None
+        n_valid_total = 0
+    if _stream_valid_local is not None:
+        structures_v = preprocess_structures(_stream_valid_local, config,
+                                             np_dtype)
+        for structure, is_real in zip(
+                structures_v, valid_local_real_flags):
+            if not is_real:
+                for label in (
+                    "energy", "forces", "virial", "mforces", "tau"
+                ):
+                    structure.pop(label, None)
+        del _stream_valid_local
     if valid_frames is not None:
         n_valid_total = len(valid_frames)
         vsh_g = torch.Generator()
@@ -655,25 +899,26 @@ def train_nep_sharded(
     max_NN_rad, max_NN_ang = int(nn_t[0].item()), int(nn_t[1].item())
 
     t0 = time.time()
-    data_store = GPUDataStore(structures, dev, dtype, config=config)
+    data_store = StreamDataStore(structures, dev, dtype, config=config)
     del structures
     response_store = (
-        GPUDataStore(response_structures, dev, dtype, config=config)
+        StreamDataStore(response_structures, dev, dtype, config=config)
         if response_structures is not None else None
     )
     del response_structures
     valid_store = None
     valid_response_store = None
     if structures_v is not None:
-        valid_store = GPUDataStore(structures_v, dev, dtype, config=config)
+        valid_store = StreamDataStore(structures_v, dev, dtype, config=config)
         del structures_v
     if response_structures_v is not None:
-        valid_response_store = GPUDataStore(
+        valid_response_store = StreamDataStore(
             response_structures_v, dev, dtype, config=config)
         del response_structures_v
     if cuda_available:
         torch.cuda.synchronize()
-    _log(f"  loaded to {dev} in {time.time() - t0:.1f}s (cached basis)")
+    _log(f"  data store ready: shard in host memory, batches streamed "
+         f"to {dev} ({time.time() - t0:.1f}s)")
 
     # Aggregate data counts across all ranks for the banner
     counts_t = torch.tensor(
@@ -802,32 +1047,41 @@ def train_nep_sharded(
     # backend — the backend choice depends on it. Only the analytical path is
     # compiled; the autograd path's create_graph=True double backward is
     # incompatible with compile, so it stays eager.
+    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # stay eager on CPU (C++ Inductor warmup outweighs the gain for
+    # typical CPU-sized runs). Explicit True/False always wins; every
+    # failed capability check degrades to eager with a log line instead
+    # of raising.
+    if use_compile is None:
+        use_compile = dev.type in ("cuda", "xpu")
     compile_on = False
     compile_msg = None
     if use_compile:
         ok, msg = _compile_check(dev)
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
+        elif use_autograd_forces and model.spin_descriptor is not None:
+            compile_msg = ("  torch.compile: disabled for O/C custom "
+                           "autograd sectors")
         elif use_autograd_forces:
-            compile_msg = ("  torch.compile: skipped — incompatible with "
-                           "autograd double-backward forces")
+            compile_on = True
+            compile_msg = ("  torch.compile: enabled (make_fx autograd "
+                           "force graph)")
         else:
             compile_on = True
             method = "analytical compute method"
             compile_msg = f"  torch.compile: enabled ({method})"
 
-    # ``backend`` is the eager backend for the one-shot q_scaler pass
-    # (num_types-based); ``train_backend`` is what the per-batch compute uses —
-    # bmm whenever compiling. Explicit backend= wins for both.
+    # Backends are chosen automatically (see ops.resolve_backend):
+    # ``backend`` is the eager choice (q_scaler / eval), ``train_backend``
+    # adds the use_compile rule.
     from .ops import resolve_backend as _resolve_backend
-    orig_backend = backend
-    backend = _resolve_backend(orig_backend, num_types=model.num_types)
-    train_backend = _resolve_backend(
-        orig_backend, num_types=model.num_types, use_compile=compile_on)
-    if use_autograd_forces:
-        force_str = "autograd"
-    else:
-        force_str = "analytical"
+    backend = _resolve_backend("auto", num_types=model.num_types,
+                               device_type=dev.type)
+    train_backend = _resolve_backend("auto", num_types=model.num_types,
+                                     use_compile=compile_on,
+                                     device_type=dev.type)
+    force_str = "autograd" if use_autograd_forces else "analytical"
     if train_backend != backend:
         _log(f"  backend: {backend} (q_scaler) / {train_backend} (training), "
              f"forces: {force_str}")
@@ -843,10 +1097,14 @@ def train_nep_sharded(
             _log("  q_scaler: RECOMPUTED from the new dataset "
                  "(recompute_q_scaler=True) — the loaded weights will "
                  "see rescaled descriptors and must re-adapt")
-        # q_scaler: local shard -> all_reduce
+        # q_scaler: local shard -> all_reduce. The pass uses the training
+        # batch size so its transient GPU footprint stays batch-bound
+        # (min/max is chunking-invariant — result unchanged).
         t_qs = time.time()
         q_min, q_max = _compute_q_scaler_sharded(
-            model, data_store, backend=backend, gpumd_init=use_gpumd_qscaler)
+            model, data_store, backend=backend,
+            batch_size=batch_size,
+            gpumd_init=use_gpumd_qscaler)
         model.set_q_scaler(q_min, q_max)
         if cuda_available:
             torch.cuda.synchronize()
@@ -863,7 +1121,13 @@ def train_nep_sharded(
         _log(compile_msg)
     if compile_on:
         _quiet_compile_logs()
-    shim = _NEPDDPShim(model, use_compile=compile_on)
+        # Fuse the per-batch basis kernels too — same numerical status
+        # as the compiled compute (Inductor-level ~1e-7 deviations).
+        data_store.compile_basis()
+        if valid_store is not None:
+            valid_store.compile_basis()
+    shim = _NEPDDPShim(model, use_compile=compile_on,
+                       use_autograd_forces=use_autograd_forces)
     # All per-type nets are always touched in compute_properties_cached (dummy
     # pass for types absent in a given batch) so DDP sees every parameter in
     # every step — no need for find_unused_parameters, and no implicit grad
@@ -877,26 +1141,12 @@ def train_nep_sharded(
     raw_model = _shim.model
 
     # b1 is analytically determined (not gradient-trained) — exclude it from
-    # the optimizer (and L1), matching the single-GPU path.
-    trainable_params = [
-        p for name, p in raw_model.named_parameters()
-        if name != "b1" and p.requires_grad
-    ]
-    # Divisor for GPUMD's mean(|w|) / RMS(w) regularization (see reg block in
-    # the epoch loop). Identical on every rank (DDP replicates the model), so
-    # the reg term needs no all-reduce — each rank adds the same value and DDP's
-    # gradient averaging leaves the reg gradient at full strength.
-    n_par = sum(p.numel() for p in trainable_params)
-    # Constant L1 gradient coefficient (λ₁/N_par); the L2 coefficient depends
-    # on RMS(w) and is refreshed once per epoch below. Both are applied as
-    # fused in-place grad updates after backward (see the loop) — reg is added
-    # locally on each rank (identical params → identical value, so no all-reduce
-    # needed; DDP already averaged the data gradient).
-    l1_coeff = (lambda_1 / n_par) if lambda_1 > 0 else 0.0
-    # weight_decay stays 0: L2 is applied explicitly as GPUMD's λ₂·RMS(w),
-    # not as Adam's decoupled decay (different form, not comparable).
-    optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=0.0, amsgrad=True)
+    # the optimizer, matching the single-GPU path.
+    trainable_named = [(n, p) for n, p in raw_model.named_parameters()
+                       if n != "b1" and p.requires_grad]
+    # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
+    weight_decay = config["weight_decay"]
+    optimizer = _make_optimizer(trainable_named, lr, weight_decay)
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -921,6 +1171,13 @@ def train_nep_sharded(
         "curriculum_enabled": curriculum_enabled,
         "use_swa": bool(stage2 and use_swa),
     }
+
+    # SWA window: average only the tail of the run (default: the last 100
+    # epochs). Averaging the whole of stage 2 drags the energy back toward
+    # mid-descent weights (E converges late); the tail is a converged
+    # cloud, so averaging there is pure noise reduction.
+    if swa_start is None:
+        swa_start = max(1, num_epochs - 99)
 
     lr_scheduler = _make_lr_scheduler(
         optimizer, lr_scheduler_mode, scheduler_factor,
@@ -967,7 +1224,13 @@ def train_nep_sharded(
             config.get("stage2_scheduler_factor", scheduler_factor),
             config.get("stage2_scheduler_patience", scheduler_patience),
             stop_lr)
-        if use_swa and is_main:
+        if use_swa:
+            # EVERY rank maintains the average (DDP keeps raw_model
+            # identical across ranks, so the averages are identical too).
+            # Keeping it main-only deadlocked the tail: rank 0 entered the
+            # SWA-b1 all_reduce while the other ranks skipped the block and
+            # sat in the final predict's all_gather — collective sequences
+            # diverged and both sides hit the NCCL watchdog timeout.
             swa_model = AveragedModel(raw_model)
 
     # Snapshot of current loss weights — saved in checkpoint so a restart can
@@ -1009,20 +1272,29 @@ def train_nep_sharded(
     best_true_loss = float("inf")
     best_valid_loss = float("inf")
     cur_valid_info = initial_data_lineage
+    if valid_strategy != "random":
+        cur_valid_info["valid_strategy"] = valid_strategy
     stage2_lr_applied = False  # tracks whether stage2 lr/reset has fired yet
     resume_early_stop_state = None
     if resume_ckpt is not None:
         # Every rank loads the same file; model weights go into raw_model
         # (the plain NEPModel — keeps checkpoints interchangeable with
-        # single-GPU runs). swa_model is None on non-main ranks, so SWA
-        # state is restored on rank 0 only — consistent with rank-0-only
-        # SWA updates.
+        # single-GPU runs). Every rank also maintains and restores the same
+        # SWA state so final collective evaluation stays in lockstep.
         info = _load_checkpoint(
             resume_ckpt, raw_model, optimizer, swa_model, dev)
+        if weight_decay > 0:  # see train_nep: reapply after state load
+            for _g in optimizer.param_groups:
+                _g["weight_decay"] = weight_decay
         start_epoch = info["epoch"] + 1
         best_loss = info["best_loss"]
         best_true_loss = info["best_true_loss"]
         best_valid_loss = info["best_valid_loss"]
+        # A checkpoint already in stage 2 pins the EFFECTIVE stage-2 start
+        # (may be earlier than nep.in's after a stage-1 early-stop jump);
+        # stage-1 checkpoints defer to nep.in — see train_nep.
+        if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
+            start_stage2 = info["start_stage2"]
         saved_valid_info = info.get("valid_info")
         validate_resume_data_lineage(
             saved_valid_info, cur_valid_info,
@@ -1112,9 +1384,11 @@ def train_nep_sharded(
                     config.get(
                         "stage2_scheduler_patience", scheduler_patience),
                     stop_lr)
-            if info["in_stage2"] and is_main and swa_model is not None:
+            if info["in_stage2"] and swa_model is not None:
                 swa_model = AveragedModel(raw_model)
-                _log("  SWA accumulator reset for the new objective/config")
+                if is_main:
+                    _log("  SWA accumulator reset for the new "
+                         "objective/config")
             _log("  scheduler state reset for the new objective/config")
         else:
             _restore_scheduler_state(
@@ -1207,6 +1481,13 @@ def train_nep_sharded(
 
     train_t0 = time.time()
 
+    # GPU-side non-finite-gradient guard when the fused optimizer supports
+    # the AMP found_inf hook — see train_nep.
+    async_guard = (dev.type == "cuda"
+                   and optimizer.param_groups[0].get("fused", False)
+                   and getattr(optimizer, "_step_supports_amp_scaling",
+                               False))
+
     try:
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
@@ -1233,23 +1514,12 @@ def train_nep_sharded(
             g.manual_seed(run_seed + epoch * world_size + rank)
             perm = torch.randperm(n_local, generator=g).tolist()
 
-            sum_le = sum_lf = sum_lv = sum_ls = 0.0  # sum_ls is in (eV/A**3)**2
-            sum_lm = sum_lt = 0.0
-            sum_e_structs = sum_f_atoms = sum_v_structs = 0
-            sum_m_atoms = sum_t_atoms = 0
-            sum_e_resid = 0.0                # Σ(E_pred/Na − E_ref/Na) for b1
-            max_gn = 0.0
-
-            # L2 coefficient λ₂/(N_par·RMS(w)), refreshed once per epoch (RMS
-            # drifts slowly; matches GPUMD's per-generation recompute). Params
-            # are replicated across ranks, so RMS is identical everywhere — no
-            # all-reduce needed.
-            l2_coeff = 0.0
-            if lambda_2 > 0:
-                with torch.no_grad():
-                    sq = sum(p.pow(2).sum() for p in trainable_params)
-                    rms = float(torch.sqrt(sq / n_par).item())
-                l2_coeff = lambda_2 / (n_par * max(rms, 1e-12))
+            # Device-side accumulators, fetched (and all-reduced) once per
+            # epoch — see train_nep. Layout: E/F/V/stress/M/Tau sums,
+            # E/F/V/M/Tau counts, and the signed E residual.
+            acc = torch.zeros(12, dtype=torch.float64, device=dev)
+            max_gn_t = torch.zeros((), dtype=dtype, device=dev)
+            n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
             in_stage2 = stage2 and epoch >= start_stage2
             if in_stage2:
@@ -1347,9 +1617,10 @@ def train_nep_sharded(
                 if in_stage2 and response_store is not None else []
             )
 
-            for start in range(0, n_local, batch_size):
-                idx = perm[start:start + batch_size]
-                batch = data_store.collate(idx)
+            batch_indices = [perm[start:start + batch_size]
+                             for start in range(0, n_local, batch_size)]
+            for batch_index, batch in enumerate(
+                    iter_collated(data_store, batch_indices)):
 
                 # Go through DDP wrapper (not raw_model.compute_*) so the
                 # reducer arms backward all-reduce for this step.
@@ -1359,15 +1630,21 @@ def train_nep_sharded(
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
                 e_pa_ref = batch["energy"] / batch["natoms"]
-                e_mask = batch["energy_mask"]
-                f_mask = batch["force_mask"] if has_forces else None
-                v_mask = batch["virial_mask"] if has_virial else None
                 active = (
                     raw_model.spin_dof_type_active[batch["atom_types"]]
                     if has_mforces or has_tau else None)
                 m_mask = (
                     batch["mforce_mask"] & active if has_mforces else None)
                 t_mask = batch["tau_mask"] & active if has_tau else None
+                emf = batch["energy_mask"].to(dtype)
+                fmf = (batch["force_mask"].to(dtype).unsqueeze(-1)
+                       if has_forces else None)
+                vmf = (batch["virial_mask"].to(dtype).unsqueeze(-1)
+                       if has_virial else None)
+                mmf = (m_mask.to(dtype).unsqueeze(-1)
+                       if m_mask is not None else None)
+                tmf = (t_mask.to(dtype).unsqueeze(-1)
+                       if t_mask is not None else None)
 
                 # --- DDP-correct normalisation --------------------------
                 # DDP averages gradients by world_size. If each rank used a
@@ -1380,81 +1657,87 @@ def train_nep_sharded(
                 # by the GLOBAL count (all-reduced per batch). The * world_size
                 # factor cancels DDP's /world_size averaging — giving a true
                 # global-mean loss regardless of how atoms are sharded.
-                counts = torch.tensor([
-                    float(e_mask.sum().item()),
-                    float(f_mask.sum().item()) if f_mask is not None else 0.0,
-                    float(v_mask.sum().item()) if v_mask is not None else 0.0,
-                    float(m_mask.sum().item()) if m_mask is not None else 0.0,
-                    float(t_mask.sum().item()) if t_mask is not None else 0.0,
-                ], device=dev, dtype=torch.float64)
+                # Counts stay DEVICE tensors end to end (the all_reduce and
+                # the divisions are stream-ordered) — fetching them per batch
+                # would drain the compute stream every step. Loss and metric
+                # terms are likewise branchless masked sums; the scalars are
+                # read back together after the grad-norm guard's sync, where
+                # they cost nothing.
+                counts = torch.stack([
+                    emf.sum(),
+                    fmf.sum() if fmf is not None else emf.new_zeros(()),
+                    vmf.sum() if vmf is not None else emf.new_zeros(()),
+                    mmf.sum() if mmf is not None else emf.new_zeros(()),
+                    tmf.sum() if tmf is not None else emf.new_zeros(()),
+                ]).to(torch.float64)
                 dist.all_reduce(counts)
-                n_e_g = max(counts[0].item(), 1.0)
-                n_f_g = max(counts[1].item(), 1.0)
-                n_v_g = max(counts[2].item(), 1.0)
-                n_m_g = max(counts[3].item(), 1.0)
-                n_t_g = max(counts[4].item(), 1.0)
+                cg = counts.clamp(min=1.0).to(dtype)
                 ws = float(world_size)
 
-                # Keep DDP's reducer armed even when this rank receives only
-                # label-free padding in the current step.
+                # A padding-only local batch can have every supervision mask
+                # cleared.  Keep a zero-valued dependency on the DDP forward
+                # so backward still arms and completes the same reducer hooks
+                # on every rank; an independent scalar would have no grad_fn
+                # and leave peers blocked in their gradient all-reduce.
                 loss = result["Etot"].sum() * 0.0
+                m_le = m_resid = m_lf = m_lv = m_ls = None
+                m_lm = m_lt = None
 
-                if e_mask.any():
-                    diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    sum_sq_e = (diff_e ** 2).sum()
-                    loss = loss + cur_pref_e * sum_sq_e * ws / n_e_g
-                    sum_le += sum_sq_e.item()  # global sum-of-squared-errors
+                if batch["has_e"]:
+                    de = (e_pa_pred - e_pa_ref) * emf
+                    loss = loss + cur_pref_e * (de ** 2).sum() * ws / cg[0]
+                    m_le = (de ** 2).sum()           # global SSE
                     # Signed residual for the analytical b1 update (folded into
                     # this pass; all-reduced below with the other metrics).
-                    sum_e_resid += diff_e.sum().item()
+                    m_resid = de.sum()
 
-                if f_mask is not None and f_mask.any():
-                    f_pred = result["forces"][f_mask]
-                    f_ref = batch["forces"][f_mask]
-                    sum_sq_f = ((f_pred - f_ref) ** 2).sum()
+                if fmf is not None and batch["has_f"]:
+                    df = (result["forces"] - batch["forces"]) * fmf
                     # 3 components per atom -> divide by (3 * n_f_g)
-                    loss = loss + cur_pref_f * sum_sq_f * ws / (3.0 * n_f_g)
-                    sum_lf += (sum_sq_f.item() / 3.0)
+                    loss = loss + cur_pref_f * (df ** 2).sum() * ws / (3.0 * cg[1])
+                    m_lf = (df ** 2).sum() / 3.0
 
-                if v_mask is not None and v_mask.any() and "virial" in result:
-                    v_atom = result["virial"]
-                    v_sys = torch.zeros(batch["num_structures"], 9,
-                                        dtype=dtype, device=dev)
-                    si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
-                    v_sys.scatter_add_(0, si, v_atom)
-                    v_ref = batch["virial"]
-                    if v_ref.shape[1] == 9:
-                        na = batch["natoms"][v_mask].unsqueeze(-1)
-                        # 6 unique components only (see _VIRIAL_6); all 9 would
-                        # weight the symmetric off-diagonals twice.
-                        v_pred_pa = v_sys[:, _VIRIAL_6][v_mask] / na
-                        v_ref_pa = v_ref[:, _VIRIAL_6][v_mask] / na
-                        v_diff = v_pred_pa - v_ref_pa
-                        sum_sq_v = (v_diff ** 2).sum()
-                        # 6 components per frame -> divide by (6 * n_v_g)
-                        loss = loss + cur_pref_v * sum_sq_v * ws / (6.0 * n_v_g)
-                        sum_lv += (sum_sq_v.item() / 6.0)
-                        # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
-                        scale = (batch["natoms"][v_mask]
-                                 / batch["volumes"][v_mask]).unsqueeze(-1)
-                        sum_sq_s = ((v_diff * scale) ** 2).sum()
-                        sum_ls += (sum_sq_s.item() / 6.0)
+                if (vmf is not None and batch["has_v"] and "virial" in result
+                        and batch["virial"].shape[1] == 9):
+                    na = batch["natoms"].unsqueeze(-1)
 
-                if m_mask is not None and m_mask.any():
-                    m_diff = result["mforces"][m_mask] - batch["mforces"][m_mask]
+                    def _v_pred_pa(res):
+                        v_sys = torch.zeros(batch["num_structures"], 9,
+                                            dtype=dtype, device=dev)
+                        si = batch["struct_idx"].unsqueeze(-1).expand_as(
+                            res["virial"])
+                        v_sys.scatter_add_(0, si, res["virial"])
+                        return v_sys[:, _VIRIAL_6] / na
+                    # 6 unique components only (see _VIRIAL_6); all 9 would
+                    # weight the symmetric off-diagonals twice.
+                    v_pred_pa = _v_pred_pa(result)
+                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                    dv = (v_pred_pa - v_ref_pa) * vmf
+                    # 6 components per frame -> divide by (6 * n_v_g)
+                    loss = loss + cur_pref_v * (dv ** 2).sum() * ws / (6.0 * cg[2])
+                    m_lv = (dv ** 2).sum() / 6.0
+                    # Stress (eV/A**3) = virial_total / V. Sign cancels in MSE.
+                    # clamp: masked-out frames may carry volume 0 — their
+                    # contribution is already zeroed by the mask factor.
+                    scale = (batch["natoms"]
+                             / batch["volumes"].clamp(min=1e-9)).unsqueeze(-1)
+                    m_ls = ((dv * scale) ** 2).sum() / 6.0
+
+                if mmf is not None and batch["has_m"]:
+                    m_diff = (result["mforces"] - batch["mforces"]) * mmf
                     sum_sq_m = (m_diff ** 2).sum()
-                    loss = loss + cur_pref_m * sum_sq_m * ws / (3.0 * n_m_g)
-                    sum_lm += sum_sq_m.item() / 3.0
+                    loss = loss + cur_pref_m * sum_sq_m * ws / (3.0 * cg[3])
+                    m_lm = sum_sq_m / 3.0
 
-                if t_mask is not None and t_mask.any():
-                    t_diff = result["tau"][t_mask] - batch["tau"][t_mask]
+                if tmf is not None and batch["has_tau"]:
+                    t_diff = (result["tau"] - batch["tau"]) * tmf
                     sum_sq_t = (t_diff ** 2).sum()
-                    loss = loss + cur_pref_tau * sum_sq_t * ws / (3.0 * n_t_g)
-                    sum_lt += sum_sq_t.item() / 3.0
+                    loss = loss + cur_pref_tau * sum_sq_t * ws / (3.0 * cg[4])
+                    m_lt = sum_sq_t / 3.0
 
                 if response_batches:
                     response_idx = response_batches[
-                        (start // batch_size) % len(response_batches)]
+                        batch_index % len(response_batches)]
                     response_batch = response_store.collate(response_idx)
                     response_batch["need_mforce"] = True
                     response_batch["need_tau"] = False
@@ -1481,72 +1764,78 @@ def train_nep_sharded(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # GPUMD-style regularization (snes.cu:524-525): gradient of
-                # λ₁·mean(|w|) + λ₂·RMS(w) added into .grad, fused across params
-                # (no autograd graph, no per-step sync). Applied after DDP has
-                # averaged the data gradient — reg is identical on every rank,
-                # so adding it locally is exactly right (must NOT be averaged).
-                # See the single-GPU path for the MSE-vs-RMSE balance caveat.
-                if l1_coeff or l2_coeff:
-                    with torch.no_grad():
-                        reg_params = [
-                            p for p in trainable_params if p.grad is not None
-                        ]
-                        grads = [p.grad for p in reg_params]
-                        if l2_coeff:
-                            torch._foreach_add_(grads, reg_params,
-                                                alpha=l2_coeff)
-                        if l1_coeff:
-                            torch._foreach_add_(
-                                grads, torch._foreach_sign(reg_params),
-                                alpha=l1_coeff)
-
                 # Apply the same complete-gradient curriculum on every rank
-                # after DDP reduction and local regularization.
+                # after DDP reduction and before clipping/AdamW.
                 raw_model.apply_spin_curriculum_gradients()
-
-                if max_grad_norm > 0:
-                    gn = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), max_grad_norm).item()
-                else:
-                    gn = torch.sqrt(sum(
-                        p.grad.norm() ** 2 for p in raw_model.parameters()
-                        if p.grad is not None)).item()
-
-                if not np.isfinite(gn):
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-
                 curriculum_rows = raw_model.capture_spin_curriculum_rows()
-                optimizer.step()
+                if max_grad_norm > 0:
+                    gn_t = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_grad_norm)
+                else:
+                    gn_t = torch.sqrt(sum(
+                        p.grad.norm() ** 2 for p in raw_model.parameters()
+                        if p.grad is not None))
+
+                if async_guard:
+                    # GPU-side non-finite skip via the fused-Adam AMP hook —
+                    # see train_nep. NOTE: with the sync guard each rank
+                    # could in principle skip independently (a latent
+                    # lock-step hazard); the async flag keeps every rank
+                    # stepping, so collectives always stay aligned.
+                    bad = (~torch.isfinite(gn_t)).to(dtype)
+                    optimizer.found_inf = bad
+                    optimizer.step()
+                    n_bad_t += bad
+                    ok_f = (1.0 - bad).to(torch.float64)
+                else:
+                    gn = float(gn_t)
+                    if not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    optimizer.step()
+                    ok_f = 1.0
+
                 raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)
 
-                if in_stage2 and swa_model is not None and is_main:
+                if (in_stage2 and swa_model is not None
+                        and epoch >= swa_start):
                     swa_model.update_parameters(raw_model)
 
-                sum_e_structs += batch["energy_mask"].sum().item()
-                sum_f_atoms += batch["force_mask"].sum().item()
-                sum_v_structs += batch["virial_mask"].sum().item()
-                if m_mask is not None:
-                    sum_m_atoms += int(m_mask.sum().item())
-                if t_mask is not None:
-                    sum_t_atoms += int(t_mask.sum().item())
-                max_gn = max(max_gn, gn)
+                zero64 = acc.new_zeros(())
+                acc += ok_f * torch.stack([
+                    m_le.double() if m_le is not None else zero64,
+                    m_lf.double() if m_lf is not None else zero64,
+                    m_lv.double() if m_lv is not None else zero64,
+                    m_ls.double() if m_ls is not None else zero64,
+                    m_lm.double() if m_lm is not None else zero64,
+                    m_lt.double() if m_lt is not None else zero64,
+                    (batch["energy_mask"].sum().double()
+                     if m_le is not None else zero64),
+                    (batch["force_mask"].sum().double()
+                     if m_lf is not None else zero64),
+                    (batch["virial_mask"].sum().double()
+                     if m_lv is not None else zero64),
+                    (m_mask.sum().double()
+                     if m_lm is not None else zero64),
+                    (t_mask.sum().double()
+                     if m_lt is not None else zero64),
+                    m_resid.double() if m_resid is not None else zero64,
+                ])
+                max_gn_t = torch.maximum(
+                    max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
 
-            metrics = torch.tensor(
-                [sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
-                 float(sum_e_structs), float(sum_f_atoms),
-                 float(sum_v_structs), float(sum_m_atoms),
-                 float(sum_t_atoms), sum_e_resid],
-                device=dev)
-            dist.all_reduce(metrics)
-            gn_t = torch.tensor(max_gn, device=dev)
-            dist.all_reduce(gn_t, op=dist.ReduceOp.MAX)
+            # One epoch-level all-reduce + fetch of the device accumulators
+            # (the only metric sync of the epoch).
+            dist.all_reduce(acc)
+            dist.all_reduce(max_gn_t, op=dist.ReduceOp.MAX)
+            dist.all_reduce(n_bad_t, op=dist.ReduceOp.MAX)
             (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
              sum_e_structs, sum_f_atoms, sum_v_structs,
-             sum_m_atoms, sum_t_atoms,
-             sum_e_resid) = metrics.tolist()
-            max_gn = gn_t.item()
+             sum_m_atoms, sum_t_atoms, sum_e_resid) = acc.tolist()
+            max_gn = float(max_gn_t)
+            if is_main and int(n_bad_t):
+                _log(f"  warning: {int(n_bad_t)} step(s) skipped this epoch "
+                     f"(non-finite gradient norm)")
 
             # Analytical b1 (GPUMD-style), folded into the training pass and
             # all-reduced above — identical on every rank. Updated before the
@@ -1641,7 +1930,9 @@ def train_nep_sharded(
                                 lr_scheduler_mode, optimizer, stop_lr)
 
             # Early stopping (see train_nep). Every rank sees the identical
-            # all-reduced sched_loss, so all ranks stop on the same epoch.
+            # all-reduced sched_loss, so all ranks stop on the same epoch —
+            # and, per-stage (MACE-style), all ranks jump into stage 2
+            # together when stage 1 plateaus with a stage 2 still pending.
             stop_now = False
             curriculum_ready = (
                 not curriculum_enabled or epoch >= curriculum_end)
@@ -1655,7 +1946,16 @@ def train_nep_sharded(
                 else:
                     es_wait += 1
                     if es_wait >= early_stop:
-                        stop_now = True
+                        if stage2 and not in_stage2:
+                            _log(f"Early stop (stage 1): {monitored} did "
+                                 f"not improve for {early_stop} epochs — "
+                                 f"starting stage 2 at epoch {epoch + 1} "
+                                 f"(was scheduled for epoch {start_stage2}).")
+                            start_stage2 = epoch + 1
+                            es_best = float("inf")
+                            es_wait = 0
+                        else:
+                            stop_now = True
             prev_in_stage2 = in_stage2
 
             if is_main:
@@ -1770,7 +2070,7 @@ def train_nep_sharded(
                     early_stop_state={
                         "best": es_best, "wait": es_wait,
                         "prev_in_stage2": prev_in_stage2,
-                    })
+                    }, start_stage2=start_stage2)
 
             # Interim predict — uses the CURRENT-epoch weights (not nep_best)
             # so the predict loss matches the line just logged for this epoch:
@@ -1788,15 +2088,14 @@ def train_nep_sharded(
                     raw_model, data_store, local_global_idx,
                     n_total_frames=n_total,
                     output_dir=output_dir,
-                    batch_size=eval_batch_size, backend=backend,
-                    verbose=False,
+                    batch_size=eval_batch_size, verbose=False,
                     local_real_flags=local_real_flags)
                 if valid_store is not None:
                     predict_from_store_sharded(
                         raw_model, valid_store, valid_local_global_idx,
                         n_total_frames=n_valid_total,
                         output_dir=output_dir,
-                        batch_size=eval_batch_size, backend=backend,
+                        batch_size=eval_batch_size,
                         verbose=False, suffix="test",
                         local_real_flags=valid_local_real_flags)
 
@@ -1816,26 +2115,20 @@ def train_nep_sharded(
     if is_main:
         raw_model.save_nep_txt(os.path.join(output_dir, "nep_final.txt"),
                                max_NN_rad, max_NN_ang)
-
-    # Rank 0 owns the SWA accumulator. Broadcast its averaged parameters so
-    # every rank can fit one global analytical b1 over the sharded training
-    # set before rank 0 exports the model. Restore final weights afterwards.
-    swa_ready_tensor = torch.tensor(
-        int(is_main and swa_model is not None
-            and int(swa_model.n_averaged.item()) > 0),
-        dtype=torch.long,
-        device=dev,
-    )
-    dist.broadcast(swa_ready_tensor, src=0)
-    if bool(swa_ready_tensor.item()):
-        final_state = {
-            key: value.clone() for key, value in raw_model.state_dict().items()
-        }
+    if swa_model is not None and int(swa_model.n_averaged) == 0:
         if is_main:
-            swa_state = swa_model.module.state_dict()
-            raw_model.load_state_dict(swa_state)
-        for parameter in raw_model.parameters():
-            dist.broadcast(parameter.data, src=0)
+            _log("SWA window never reached (run ended before swa_start) — "
+                 "nep_average.txt not written")
+        swa_model = None
+    if swa_model is not None:
+        # All ranks: load the averaged weights and re-solve b1 from the
+        # GLOBAL energy residual (b1's per-epoch analytic values were
+        # averaged along the trajectory — a stale offset for the averaged
+        # weights; see train_nep). Energy-only pass over each shard,
+        # all-reduced.
+        swa_state = swa_model.module.state_dict()
+        final_state = {k: v.clone() for k, v in raw_model.state_dict().items()}
+        raw_model.load_state_dict(swa_state)
         _evaluate_sharded(
             data_store, eval_batch_size,
             False, False, False, False,
@@ -1845,7 +2138,8 @@ def train_nep_sharded(
         if is_main:
             raw_model.save_nep_txt(os.path.join(output_dir, "nep_average.txt"),
                                    max_NN_rad, max_NN_ang)
-            _log("SWA model saved to nep_average.txt")
+            _log("SWA model saved to nep_average.txt (b1 re-solved for the "
+                 "averaged weights)")
         raw_model.load_state_dict(final_state)
 
     if is_main:
@@ -1870,17 +2164,15 @@ def train_nep_sharded(
         raw_model, data_store, local_global_idx,
         n_total_frames=n_total,
         output_dir=output_dir,
-        batch_size=eval_batch_size, backend=backend,
-        verbose=is_main,
+        batch_size=eval_batch_size, verbose=is_main,
         local_real_flags=local_real_flags)
     if valid_store is not None:
         predict_from_store_sharded(
             raw_model, valid_store, valid_local_global_idx,
             n_total_frames=n_valid_total,
             output_dir=output_dir,
-            batch_size=eval_batch_size, backend=backend,
-            verbose=False, suffix="test",
-            local_real_flags=valid_local_real_flags)
+            batch_size=eval_batch_size, verbose=False,
+            suffix="test", local_real_flags=valid_local_real_flags)
     if is_main:
         _log(f"  Prediction time: {time.time() - pred_t0:.1f}s")
 

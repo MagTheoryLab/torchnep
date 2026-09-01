@@ -25,41 +25,93 @@ from .constants import (PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B,
 from .oc_cuda_struct_center import structural_center_sector
 
 
+# Keep the magnetic descriptor's internal dependency surface limited to this
+# operations module.  Imports stay lazy so the pure-Torch reference does not
+# load CUDA extension wrappers unless the corresponding sector is reached.
+def oc_cuda_density_bank(*args, **kwargs):
+    from .oc_cuda_bank import density_bank
+    return density_bank(*args, **kwargs)
+
+
+def oc_cuda_center_sector(*args, **kwargs):
+    from .oc_cuda_center import center_sector
+    return center_sector(*args, **kwargs)
+
+
+def oc_cuda_full_descriptor(*args, **kwargs):
+    from .oc_cuda_full import full_descriptor
+    return full_descriptor(*args, **kwargs)
+
+
+def oc_cuda_moment_gate(*args, **kwargs):
+    from .oc_cuda_train import moment_gate
+    return moment_gate(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Backend selection
 #
-# Two concrete implementations of the type-pair contraction plus one meta:
-#   "loop" : pure PyTorch, nested for-loop over (t1, t2) type pairs. Wins when
-#            ntypes is small (<= ~5) — the outer loop runs few times.
-#   "bmm"  : pure PyTorch, fancy index + torch.bmm (dispatched to cuBLAS on
-#            CUDA, MKL on CPU, MPS on Apple). Wins when ntypes >= ~8 — one
-#            batched GEMM replaces the O(ntypes**2) python-level loop.
-#   "auto" : picks by num_types (>= 8 -> bmm, else loop).
+# Three concrete implementations of the type-pair contraction plus one meta:
+#   "loop"   : pure PyTorch, nested for-loop over (t1, t2) type pairs. Wins
+#              eager when ntypes is small — the outer loop runs few times.
+#   "bmm"    : pure PyTorch, fancy index + torch.bmm (dispatched to cuBLAS on
+#              CUDA, rocBLAS on ROCm, MKL on CPU). One batched GEMM replaces
+#              the O(ntypes**2) python-level loop — but the per-pair matrices
+#              are only (n_max+1, basis_size+1) ~ 9x9, far too small for GEMM
+#              libraries to run well.
+#   "mulsum" : same vectorised gather as bmm but the contraction is written
+#              as (c_p * basis).sum(-1). Meant for torch.compile: Inductor
+#              fuses gather+mul+reduce into one Triton kernel with no BLAS
+#              call at all — fastest compiled backend on both CUDA and ROCm.
+#              Eager it launches the same unfused kernels as bmm.
+#   "auto"   : see resolve_backend.
 #
-# Both backends are autograd-compatible and run on any PyTorch backend.
+# All backends are autograd-compatible and run on any PyTorch backend.
 # ---------------------------------------------------------------------------
 
-Backend = Literal["auto", "loop", "bmm"]
+Backend = Literal["auto", "loop", "bmm", "mulsum"]
+
+
+# NN formulation switch: batched-matmul on CUDA/CPU, explicit
+# multiply+reduce on ROCm (rocBLAS handles the skinny batched shapes
+# poorly — see NEPModel._cached_core). Module-level so tests can compare
+# both formulations on any device.
+NN_MULSUM = torch.version.hip is not None
 
 
 def resolve_backend(backend: str = "auto",
                     num_types: Optional[int] = None,
-                    use_compile: bool = False) -> str:
+                    use_compile: bool = False,
+                    device_type: Optional[str] = None) -> str:
     """Resolve "auto" into a concrete backend.
 
-    under torch.compile -> "bmm"   (vectorised path fuses far better; the per-
-                                    type Python loop forces graph breaks, so bmm
-                                    is consistently fastest once compiled)
-    ntypes >= 8         -> "bmm"   (fancy-index + batched GEMM wins)
-    otherwise           -> "loop"  (few-types eager; inline Python loop fastest)
+    GPU (CUDA / ROCm):
+        under torch.compile -> "mulsum"  (single fused graph, atomic-free
+                                          backward; fastest at every type
+                                          count on MI250X, V100 and A2000)
+        eager, ntypes <= 32 -> "mulsum"  (fastest eager path on every GPU
+                                          tested; loop and bmm lose by
+                                          2-30x depending on ntypes)
+        eager, ntypes >  32 -> "bmm"     (eager mulsum stores the one-hot
+                                          matrix (pairs x ntypes^2) for the
+                                          backward — ~8 GiB at 64+ types —
+                                          while bmm stays flat and is the
+                                          fastest non-mulsum eager path)
+    CPU / MPS (unbenchmarked on the 89-element sweep — GPU rules are from
+    an 8-variant x {1..87}-type sweep on MI250X + V100 + A2000):
+        ntypes >= 20 -> "bmm", else "loop".
 
     Any non-"auto" string is returned unchanged (explicit override wins).
     """
     if backend != "auto":
         return backend
-    if use_compile:
-        return "bmm"
-    if num_types is not None and num_types >= 8:
+    if device_type in ("cuda", None):
+        if use_compile:
+            return "mulsum"
+        if num_types is not None and num_types > 32:
+            return "bmm"
+        return "mulsum"
+    if num_types is not None and num_types >= 20:
         return "bmm"
     return "loop"
 
@@ -68,6 +120,8 @@ def _select_contraction_funcs(backend: str):
     """Return (scatter_fn, type_fn) for the concrete backend."""
     if backend == "bmm":
         return _scatter_contraction_bmm, _type_contraction_bmm
+    if backend == "mulsum":
+        return _scatter_contraction_mulsum, _type_contraction_mulsum
     # "loop" — default
     return _scatter_contraction_loop, _type_contraction_loop
 
@@ -305,7 +359,7 @@ def compute_descriptors(
     c3b_coeffs, c4b_coeffs, c5b_coeffs, c4b2_coeffs :
         per-body fixed coefficient tensors.
     dtype, device   : torch dtype / device for outputs.
-    backend         : "auto" | "loop" | "bmm" (see resolve_backend).
+    backend         : "auto" | "loop" | "bmm" | "mulsum" (see resolve_backend).
 
     Returns
     -------
@@ -579,6 +633,76 @@ def compute_zbl(
     return e_atom
 
 
+def compute_zbl_pair(atom_types, pair_i, pair_j, rij,
+                     zizj_tab, a_inv_tab, rc_inner_tab, rc_outer_tab,
+                     need_grad: bool):
+    """Branch-free ZBL over ALL pairs — static shapes, analytic derivative.
+
+    Table variant of :func:`compute_zbl` for the compiled cached core: the
+    per-type-pair constants (Z_i*Z_j, screening-length inverse, switching
+    window) come from (T, T) tables gathered with one flat index, and no
+    boolean compaction is done — the smooth cutoff fc and its derivative
+    are exactly zero at/beyond the per-pair rc_outer, so out-of-range
+    pairs contribute exact zeros instead of being dropped. The derivative
+    is analytic (no inner autograd.grad), which is what lets the whole
+    term live inside the torch.compile graph with no breaks.
+
+    Parameters
+    ----------
+    atom_types : (N,) int64
+    pair_i, pair_j : (P,) int64      angular-list pairs (ZBL reuses them).
+    rij : (P, 3) float               displacement vectors (A).
+    zizj_tab : (T, T) float          K_C_SP * Z_i * Z_j.
+    a_inv_tab : (T, T) float         (Z_i^0.23 + Z_j^0.23) * 2.134563.
+    rc_inner_tab, rc_outer_tab : (T, T) float
+        Per-type-pair switching window; typewise mode bakes
+        min((cov_i+cov_j)*factor, rc_outer_default) into rc_outer_tab
+        with rc_inner_tab = 0, plain mode fills both with the globals.
+    need_grad : bool                 also return the pair gradient.
+
+    Returns
+    -------
+    e_half : (P,) float      0.5 * pair energy (scatter to pair_i for Ei;
+             the directed list holds each physical pair twice).
+    g : (P, 3) float or None d(e_half)/d(rij) — same per-pair dE/drij
+        convention as the gradients fed to accumulate_forces_virial.
+    """
+    T = zizj_tab.shape[0]
+    idx = atom_types[pair_i] * T + atom_types[pair_j]
+    zizj = zizj_tab.reshape(-1)[idx]
+    a_inv = a_inv_tab.reshape(-1)[idx]
+    rc_i = rc_inner_tab.reshape(-1)[idx]
+    rc_o = rc_outer_tab.reshape(-1)[idx]
+
+    d = torch.norm(rij, dim=-1)
+    x = d * a_inv
+    e1 = torch.exp(-ZBL_PARA[1] * x)
+    e2 = torch.exp(-ZBL_PARA[3] * x)
+    e3 = torch.exp(-ZBL_PARA[5] * x)
+    e4 = torch.exp(-ZBL_PARA[7] * x)
+    phi = (ZBL_PARA[0] * e1 + ZBL_PARA[2] * e2
+           + ZBL_PARA[4] * e3 + ZBL_PARA[6] * e4)
+
+    inv_w = 1.0 / (rc_o - rc_i)
+    t = torch.clamp((d - rc_i) * inv_w, 0.0, 1.0)
+    fc = 0.5 * torch.cos(PI * t) + 0.5
+
+    e_half = 0.5 * (zizj * phi / d * fc)
+    if not need_grad:
+        return e_half, None
+
+    # d(phi)/dd = d(phi)/dx * a_inv;  d(fc)/dd via the clamped t: sin(pi*t)
+    # vanishes at both clamp boundaries, so the formula is exact everywhere.
+    dphi = -(ZBL_PARA[0] * ZBL_PARA[1] * e1 + ZBL_PARA[2] * ZBL_PARA[3] * e2
+             + ZBL_PARA[4] * ZBL_PARA[5] * e3
+             + ZBL_PARA[6] * ZBL_PARA[7] * e4) * a_inv
+    dfc = -0.5 * PI * torch.sin(PI * t) * inv_w
+    # e_pair = zizj * phi * fc / d
+    de = zizj * (dphi * fc + phi * dfc - phi * fc / d) / d
+    g = (0.5 * de / d).unsqueeze(-1) * rij
+    return e_half, g
+
+
 def _scatter_contraction_loop(basis, pair_i, pair_j, atom_types, c, N):
     r"""Type-pair loop: \Sigma_k c[t1, t2, n, k]*basis[p, k] then scatter_add into q.
 
@@ -653,6 +777,71 @@ def _type_contraction_bmm(basis, pair_i, pair_j, atom_types, c):
     return torch.bmm(c_p, basis.unsqueeze(-1)).squeeze(-1)      # (P, N_out)
 
 
+def _gather_c_onehot(basis, pair_i, pair_j, atom_types, c):
+    """Per-pair coefficient tables via one-hot matmul, then mul+sum.
+
+    Two problems with the bmm path, one per direction:
+      forward  — the per-pair matrices are only (N_out, K) ~ 9x9, far below
+                 the sizes GEMM libraries are tuned for (cuBLAS falls back
+                 to gemv kernels; rocBLAS does much worse);
+      backward — autograd turns the fancy-index gather ``c[t1, t2]`` into
+                 ``index_put_(accumulate=True)``: millions of pairs
+                 atomically accumulate into the ~1e3-element c tensor.
+                 The same-address atomic contention dominates the whole
+                 training step on MI250X (11 ms per kernel, ~50% of GPU
+                 time; NVIDIA L2 atomics hide it).
+
+    Gathering with a one-hot GEMM fixes both: forward adds exact zeros (so
+    values are unchanged), and the backward becomes ``one_hotᵀ @ grad`` —
+    one clean deterministic GEMM into (T², N_out*K), no atomics at all.
+    The subsequent contraction is broadcast-multiply + K-reduction, which
+    Inductor fuses into a single Triton kernel with no BLAS call. Meant
+    for torch.compile; eager it launches the same unfused kernels as bmm.
+
+    Above 32 types on NVIDIA the plain fancy-index gather is used instead:
+    the one-hot matrix is (pairs, ntypes²) — ~2.5 GiB at 87 types — while
+    the atomic contention the one-hot form exists to avoid becomes
+    negligible once the gradient spreads over a large c tensor (V100,
+    87 types: gather 42.6 vs one-hot 58.2 ms/step). On ROCm the one-hot
+    form wins at every type count (MI250X same-address atomics are slow:
+    gather 53-303 ms vs one-hot 8-41), so it is always used there. The
+    two forms produce bit-identical values — the one-hot GEMM has exactly
+    one nonzero term per row.
+
+    Returns gn : (P, N_out).
+    """
+    T = c.shape[0]
+    # The one-hot matmul exists ONLY for the backward (atomic-free grad_c).
+    # Without grad — prediction, q_scaler, frozen-weight eval — the plain
+    # gather is bit-identical, launches less work, and avoids the (P, T²)
+    # one-hot matrix, which at prediction batch sizes reaches GiB already
+    # at 16 types. Same for CUDA above 32 types even with grad (the c
+    # tensor is large enough there that backward atomic contention is
+    # negligible — V100 benchmark in the docstring).
+    need_grad = torch.is_grad_enabled() and (c.requires_grad
+                                             or basis.requires_grad)
+    if not need_grad or (T > 32 and torch.version.hip is None):
+        return (c[atom_types[pair_i], atom_types[pair_j]]
+                * basis.unsqueeze(1)).sum(-1)                   # (P, N_out)
+    pt = atom_types[pair_i] * T + atom_types[pair_j]            # (P,)
+    w = torch.nn.functional.one_hot(pt, T * T).to(basis.dtype)  # (P, T*T)
+    c_p = (w @ c.reshape(T * T, -1)).view(-1, c.shape[2], c.shape[3])
+    return (c_p * basis.unsqueeze(1)).sum(-1)                   # (P, N_out)
+
+
+def _scatter_contraction_mulsum(basis, pair_i, pair_j, atom_types, c, N):
+    """One-hot gather + mul/sum contraction + scatter into per-atom q."""
+    gn = _gather_c_onehot(basis, pair_i, pair_j, atom_types, c)
+    q = torch.zeros(N, c.shape[2], dtype=basis.dtype, device=basis.device)
+    q.scatter_add_(0, pair_i.unsqueeze(-1).expand_as(gn), gn)
+    return q
+
+
+def _type_contraction_mulsum(basis, pair_i, pair_j, atom_types, c):
+    """Mul+sum counterpart of ``_type_contraction_bmm`` (see above)."""
+    return _gather_c_onehot(basis, pair_i, pair_j, atom_types, c)
+
+
 def compute_descriptors_cached(
     fk_rad, fk_ang, blm,
     pi_rad, pj_rad, pi_ang, pj_ang,
@@ -691,9 +880,10 @@ def compute_descriptors_cached(
     dtype, device : torch dtype / device for outputs.
     return_intermediates : bool  also return s and gn_ang (needed by the
                                  analytical-force path).
-    backend : "loop" | "bmm"  type-pair contraction implementation:
-        "loop" — pure-PyTorch ntypes**2 loop (few types)
-        "bmm"  — fancy-index + torch.bmm (many types)
+    backend : "loop" | "bmm" | "mulsum"  type-pair contraction:
+        "loop"   — pure-PyTorch ntypes**2 loop (few types, eager)
+        "bmm"    — fancy-index + torch.bmm (many types, eager)
+        "mulsum" — fancy-index + fused multiply/sum (under torch.compile)
 
     Returns
     -------
@@ -1012,6 +1202,7 @@ def compute_analytical_forces(
     compute_virial: bool = True,
     backend: str = "loop",
     has_q_123: int = 0, has_q_233: int = 0, has_q_134: int = 0,
+    g_extra_ang=None,
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -1041,7 +1232,12 @@ def compute_analytical_forces(
         body-order coefficient tensors.
     dtype, device : torch dtype / device for outputs.
     compute_virial : bool  if False, ``virial`` output is ``None``.
-    backend : "loop" | "bmm" — see ``compute_descriptors_cached``.
+    backend : "loop" | "bmm" | "mulsum" — see ``compute_descriptors_cached``.
+    g_extra_ang : (P_ang, 3) float or None
+        Extra per-pair dE/drij on the angular pair list (the compiled ZBL
+        term) — folded into the angular scatter so it costs no additional
+        scatter kernels; accumulated separately if the angular block is
+        inactive (l_max_3b = 0).
 
     Returns
     -------
@@ -1120,11 +1316,20 @@ def compute_analytical_forces(
         hat_dot_dblm = (hat.unsqueeze(1) * dblm_dhat).sum(-1)  # (P, num_lm)
         t2_sc = (w_gn * hat_dot_dblm).sum(1) * d12inv_ang
         f12_ang = f12_gnp + term1 - t2_sc.unsqueeze(-1) * hat
+        if g_extra_ang is not None:
+            f12_ang = f12_ang + g_extra_ang
 
         forces.scatter_add_(0, _exp(pi_ang, f12_ang), f12_ang)
         forces.scatter_add_(0, _exp(pj_ang, f12_ang), -f12_ang)
         if compute_virial:
             v9_a = -(rij_ang.unsqueeze(-1) * f12_ang.unsqueeze(-2)).reshape(-1, 9)
+            virial.scatter_add_(0, pj_ang.unsqueeze(-1).expand_as(v9_a), v9_a)
+    elif g_extra_ang is not None and pi_ang.shape[0] > 0:
+        forces.scatter_add_(0, _exp(pi_ang, g_extra_ang), g_extra_ang)
+        forces.scatter_add_(0, _exp(pj_ang, g_extra_ang), -g_extra_ang)
+        if compute_virial:
+            v9_a = -(rij_ang.unsqueeze(-1)
+                     * g_extra_ang.unsqueeze(-2)).reshape(-1, 9)
             virial.scatter_add_(0, pj_ang.unsqueeze(-1).expand_as(v9_a), v9_a)
 
     return forces, virial

@@ -34,10 +34,6 @@ import math
 import torch
 
 from . import ops
-from .oc_cuda_bank import density_bank as _oc_cuda_density_bank
-from .oc_cuda_center import center_sector as _oc_cuda_center_sector
-from .oc_cuda_full import full_descriptor as _oc_cuda_full_descriptor
-from .oc_cuda_train import moment_gate as _oc_cuda_moment_gate
 
 
 @dataclass(frozen=True)
@@ -674,7 +670,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         pair_i_coupled: torch.Tensor | None = None,
         pair_j_coupled: torch.Tensor | None = None,
     ):
-        candidate = _oc_cuda_full_descriptor(
+        candidate = ops.oc_cuda_full_descriptor(
             self,
             rij,
             pair_i,
@@ -745,14 +741,14 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
 
         edge_anchor = None
         center = None
-        fused = _oc_cuda_density_bank(
+        fused = ops.oc_cuda_density_bank(
             self, rij, pair_i, pair_j, spins, atom_types, c_spin_2body,
             spin_dof_type_active, spin_env_type_active,
         )
         if fused is not None:
             primitive, auxiliary = fused[:2]
             edge_anchor = fused[2] if len(fused) > 2 else None
-            center = _oc_cuda_center_sector(self, primitive, spins)
+            center = ops.oc_cuda_center_sector(self, primitive, spins)
             if center is not None and primitive.shape[1] == 85:
                 return self._forward_fused_center(
                     primitive, spins, blocks[0], center, edge_anchor
@@ -1049,7 +1045,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
                     :, edge_gate_offset:
                     edge_gate_offset + self.spin_compress
                 ] if fused is not None else
-                _oc_cuda_moment_gate(weights, pair_i, pair_j, spins)
+                ops.oc_cuda_moment_gate(weights, pair_i, pair_j, spins)
             )
             if self.spin_soc and self.spin_l_max >= 1:
                 polar_left = self._project(density["polar"], 0)

@@ -1,22 +1,30 @@
 # TorchNEP
 
+[![PyPI](https://img.shields.io/pypi/v/torchnep?logo=pypi&logoColor=white)](https://pypi.org/project/torchnep/)
+[![Python](https://img.shields.io/pypi/pyversions/torchnep?logo=python&logoColor=white)](https://pypi.org/project/torchnep/)
+[![Tests](https://github.com/mushroomfire/torchnep/actions/workflows/test.yml/badge.svg)](https://github.com/mushroomfire/torchnep/actions/workflows/test.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](https://www.gnu.org/licenses/gpl-3.0)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A52.0-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Downloads](https://img.shields.io/pypi/dm/torchnep)](https://pypi.org/project/torchnep/)
+
 A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (Neuroevolution Potential) training framework.
 
-## Features
+## ✨ Features
 
-- **GPUMD-compatible structural NEP4** — nonmagnetic output `nep.txt` files
-  load directly into GPUMD. Versioned `nep4_spin2` files use the O/C extension;
-  its downstream CUDA reader still requires a separate parity gate
-- **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
-- **Multi-GPU training** — distributed data parallel (DDP) across on one node or multiple nodes
-- **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to do fine-tuning; optionally slim the model to only the element types present in the new dataset
-- **ZBL** — Universal ZBL repulsive potential with optional typewise cutoffs
-- **O/C magnetic potentials** — order-nested, radially compressed spin
-  descriptors with conservative magnetic forces and torques
+- 🔄 **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
+- 🎯 **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
+- 🖥️ **Multi-GPU training** — distributed data parallel (DDP) on one node or multiple nodes
+- ⚡ **Fast on NVIDIA and AMD** — `torch.compile` support with automatic backend selection, tuned on both CUDA and ROCm GPUs
+- 💾 **Memory-friendly** — the dataset stays in host memory and batches are streamed to the GPU, so memory scales with batch size, not dataset size
+- 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
+- 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
+- 🧲 **O/C magnetic potentials** — order-nested, radially compressed spin
+  descriptors with conservative magnetic forces and torques. Versioned
+  `nep4_spin2` models require an O/C-aware downstream reader
 
 ---
 
-## Installation
+## 📦 Installation
 
 TorchNEP needs only `torch >= 2.0` and `numpy`, but neither is installed automatically — install the PyTorch build that matches your CUDA/CPU setup first (see the [official guide](https://pytorch.org/get-started/locally/); numpy comes with it).
 
@@ -24,6 +32,12 @@ Then install TorchNEP with:
 
 ```bash
 pip install torchnep -U
+```
+
+or install the latest development version directly from GitHub:
+
+```bash
+pip install git+https://github.com/mushroomfire/torchnep.git
 ```
 
 or install from source code:
@@ -36,7 +50,7 @@ pip install .
 
 ---
 
-## Training data (extended-XYZ)
+## 📄 Training data (extended-XYZ)
 
 TorchNEP reads extended-XYZ files. The parser is strict — the rules below are
 enforced, and violations raise on load.
@@ -80,7 +94,7 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 
 ---
 
-## Training Parameters
+## ⚙️ Training Parameters
 
 ### Model architecture (GPUMD-compatible)
 
@@ -126,12 +140,10 @@ See
 | `lambda_v` | `0.01` | Virial loss weight |
 | `lambda_m` | `1.0` | Magnetic-force loss weight |
 | `lambda_tau` | `0.0` | Spin-torque loss weight |
-| `lambda_1` | `0.0` | L1 regularisation weight |
-| `lambda_2` | `0.0` | L2 regularisation weight |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
-| `early_stop` | `0` | Stop early if the monitored loss does not improve for this many epochs (`0` = off). The monitored loss is the **validation** loss when `valid_file`/`valid_ratio` is set, otherwise the training loss. Set it **larger than `scheduler_patience`** so the LR gets a chance to decay first |
+| `early_stop` | `0` | Stop if the monitored loss (validation loss when a validation set is used, else training loss) hasn't improved for N epochs (`0` = off). Per-stage: a stage-1 plateau jumps into Stage 2 instead of ending the run. Use a value larger than `scheduler_patience` |
 | `scheduler_factor` | `0.7` | LR reduction factor — multiplied on each decay in both modes |
 | `stage2` | `0` | Enable Stage 2 (`1` = on) |
 | `start_stage2` | 50 % of epochs | Epoch to switch to Stage 2 |
@@ -143,6 +155,7 @@ See
 | `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
 | `stage2_lambda_m` | `lambda_m` | Stage 2 magnetic-force weight |
 | `stage2_lambda_tau` | `lambda_tau` | Stage 2 torque weight |
+| `weight_decay` | `1e-4` | AdamW decoupled weight decay on all trainable parameters (`b1` is solved analytically and never decays). `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
 
 ### Runtime arguments
 
@@ -155,11 +168,12 @@ function (`train_nep` / `train_nep_sharded`):
 | `precision` | `"float32"` | dtype for training + store, `"float32"` or `"float64"` |
 | `backend` | `"auto"` | `"loop"`, `"bmm"`, or `"auto"` |
 | `use_autograd_forces` | `False` | autograd-through-rij; O/C spin models select the full autograd E/F/V/MF/Tau path automatically |
-| `use_swa` | `False` | with Stage 2, maintain an SWA-averaged model and save `nep_average.txt`; no Stage 2 means no SWA accumulator/output |
-| `use_compile` | `False` | `torch.compile` the analytical compute (faster epochs after a one-time compile; needs Triton; ignored on the autograd path) |
-| `print_interval` | `10` | log to screen every N epochs |
+| `use_swa` | `False` | maintain SWA-averaged model and save `nep_average.txt` |
+| `swa_start` | last 100 epochs | first epoch included in the SWA average |
+| `use_compile` | `None` | auto: compile on GPU, eager on CPU; `True`/`False` force it. Missing Triton/C++ toolchain degrades to eager with a log note |
+| `print_interval` | `1` | log to screen every N epochs |
 | `checkpoint_interval` | `100` | save `checkpoint.pt` every N epochs |
-| `prediction_interval` | `20` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
+| `prediction_interval` | `100` | every N epochs run predict with the current-epoch weights and overwrite `{energy,force,virial}_train.out` |
 | `restart` | `True` | resume from `checkpoint.pt` if present |
 | `finetune_from` | `None` | load weights from a `.pt` or `nep.txt` and start a NEW training from them |
 | `resume_from` | `None` | path to a checkpoint to CONTINUE from (e.g. `checkpoint_stage1.pt` to redo Stage 2); takes precedence over the automatic `checkpoint.pt` pickup |
@@ -170,10 +184,11 @@ function (`train_nep` / `train_nep_sharded`):
 | `run_seed` | `None` | master RNG seed. `None` = random each run; an int makes the run reproducible (weight init + batch shuffle). Saved in `checkpoint.pt`, restored on resume |
 | `valid_file` | `None` | validation `.xyz`, `nep_best` and the plateau LR schedule follow the validation loss; writes GPUMD-style `*_test.out` |
 | `valid_ratio` | `None` | hold out this fraction (e.g. `0.1`) of `data_file` as the validation set; the split is drawn from `run_seed` and preserved on resume. Mutually exclusive with `valid_file` |
+| `valid_strategy` | `"stratified"` | `"random"` or `"stratified"` (split within (element combination × cell-size) groups; tiny cells ≤4 atoms and groups < 20 frames stay in training; auto-falls back to `"random"` if the validation set would be starved) |
 
 ---
 
-## Output Files
+## 📊 Output Files
 
 | File | Contents |
 |------|----------|
@@ -194,7 +209,7 @@ function (`train_nep` / `train_nep_sharded`):
 
 ---
 
-## Launch training
+## 🚀 Launch training
 
 ### Single GPU / CPU / MPS — `train_nep`
 
@@ -206,6 +221,15 @@ train_nep("nep.in", "train.xyz", output_dir="output")
 # with a validation set (either form):
 train_nep("nep.in", "train.xyz", output_dir="output", valid_file="valid.xyz")
 train_nep("nep.in", "train.xyz", output_dir="output", valid_ratio=0.1)
+
+# export the exact valid_ratio split as GPUMD-ready files — train the same
+# partition in GPUMD (or anything else) and compare loss curves directly:
+from torchnep import export_valid_split
+export_valid_split("train.xyz", valid_ratio=0.1, run_seed=42,
+                   output_dir="split")   # writes split/train.xyz + split/test.xyz
+# coverage-aware split (same strategy as valid_strategy="stratified"):
+export_valid_split("train.xyz", valid_ratio=0.1, run_seed=42,
+                   output_dir="split", strategy="stratified")
 ```
 
 ```bash
@@ -256,7 +280,7 @@ srun --nodes=$SLURM_NNODES --ntasks-per-node=1 bash -c "
 
 ---
 
-## Restart and Resume
+## 🔁 Restart and Resume
 
 Two ways to resume:
 
@@ -294,7 +318,7 @@ distributed reduction order numerically identical.
 
 ---
 
-## Fine-Tuning
+## 🔧 Fine-Tuning
 
 Fine-tuning starts from a pre-trained model's weights instead of random initialisation. The architecture (`nep.in` parameters) must match the source model, but the new dataset's element types may be a subset of the original.
 
@@ -333,7 +357,7 @@ slimmed.save_nep_txt("nep_slim.txt", max_NN_radial, max_NN_angular)
 
 ---
 
-## Prediction
+## 🔮 Prediction
 
 ### Single-structure prediction
 
@@ -400,7 +424,11 @@ model needs a downstream reader/parity update before deployment there.
 
 ### Full-dataset prediction
 
-Runs batched GPU inference on an entire `.xyz` file and writes GPUMD-compatible output files.
+Runs streamed, batched inference on an entire `.xyz` file and writes GPUMD-compatible output files.
+The file is indexed once, then processed chunk by chunk (~`chunk_atoms` atoms each: read → neighbor
+lists → device-sized batches → rows appended to the outputs), so host memory is bounded by the chunk and
+device memory by the batch — a dataset of any size finishes on any machine, only the wall time differs.
+A progress bar (tqdm if installed) shows frames done.
 
 ```python
 from torchnep import predict_dataset
@@ -409,37 +437,49 @@ predict_dataset(
     "nep.txt",
     "test.xyz",
     output_dir="results",
-    dtype="float32",       # float32 or float64
-    batch_size=500,
     output_descriptor=0,   # 0=off, 1=per-frame mean, 2=per-atom (matches GPUMD)
+    batch_size=None,       # auto from free GPU memory (OOM-halving retry); or an int
+    chunk_atoms=None,      # atoms per streamed chunk, default 200000 (env TORCHNEP_PREDICT_CHUNK_ATOMS)
 )
 # writes energy/force/virial/stress_train.out; spin models also write
 # mforce/tau_train.out; descriptor.out is optional
 ```
 
+### Multi-GPU / multi-node prediction
+
+`predict_dataset_sharded` has the same arguments and writes the same files, but is launched with one
+process per GPU (`torchrun --nproc_per_node=8 script.py`, or `srun` under Slurm).
+
+
+```python
+from torchnep import predict_dataset_sharded
+predict_dataset_sharded("nep.txt", "huge.xyz", output_dir="results")
+```
+
 ---
 
-## Source layout
+## 🗂️ Source layout
 
 The `torchnep/` package is organised as follows:
 
 | File | Role |
 |------|------|
-| `__init__.py` | Public API — re-exports the three entry points `train_nep`, `train_nep_sharded`, `predict_dataset` |
+| `__init__.py` | Public API — re-exports the entry points `train_nep`, `train_nep_sharded`, `predict_dataset`, `predict_dataset_sharded` |
 | `data.py` | I/O and parsing — reads extended-XYZ frames and `nep.in`, plus the NumPy brute-force neighbor builder used for training |
 | `neighbor.py` | PyTorch linked-cell (cell-list) neighbor search, O(N) for the large structures of an ASE-driven MD run |
 | `model.py` | Trainable NEP4 model (`NEPModel`) as an `nn.Module`, per-type fitting nets, ZBL, and `slim_model` |
-| `ops.py` | Core differentiable kernels — Chebyshev/angular basis, descriptors, ANN evaluation, ZBL; pure-PyTorch `loop`/`bmm` backends |
+| `ops.py` | Core differentiable kernels — Chebyshev/angular basis, descriptors, ANN evaluation, ZBL; pure-PyTorch `loop`/`bmm`/`mulsum` backends |
 | `nep.py` | `NEPCalculator` — loads a `nep.txt` and computes energy/forces/virial/descriptors for single structures |
-| `predict.py` | Batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
-| `train.py` | Single-GPU/CPU training (`train_nep`): data store, two-stage loop, schedulers, checkpoint/restart, periodic predict |
+| `predict.py` | Streamed, batched full-dataset inference (`predict_dataset`), writing GPUMD-compatible `*_train.out` files |
+| `train.py` | Single-GPU/CPU training (`train_nep`): host-resident streaming data store (`StreamDataStore` + prefetching `iter_collated`), two-stage loop, schedulers, checkpoint/restart, periodic predict |
 | `train_sharded.py` | Data-sharded multi-GPU/multi-node training (`train_nep_sharded`) via DDP |
+| `compiled_autograd.py` | `torch.compile` for the autograd force path: the first-order dE/drij gradient is materialized into the graph with `make_fx`, so `use_autograd_forces=True` + `use_compile=True` runs one fused dynamic-shape graph instead of an uncompilable double backward |
 | `ase_calculator.py` | ASE `Calculator` wrapper (`NEP`) for relaxation, MD, EOS, phonons, … |
 | `constants.py` | Shared constants — element table, covalent radii, NEP polynomial coefficients |
 
 ---
 
-## Citation
+## 📚 Citation
 
 If you use TorchNEP in your research, please cite the following paper:
 
