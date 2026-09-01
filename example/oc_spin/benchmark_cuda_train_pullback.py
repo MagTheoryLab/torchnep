@@ -270,7 +270,7 @@ def timed(callable_, warmup, repeats):
         callable_()
         torch.cuda.synchronize()
         values.append((time.perf_counter() - start) * 1.0e3)
-    return median_mad(values)
+    return {**median_mad(values), "samples_ms": values}
 
 
 def performance_case(base, batch, enabled, warmup, repeats):
@@ -348,8 +348,10 @@ def cuda_graph_train_case(base, batch, warmup, repeats):
         loss.backward()
         optimizer.step()
 
-    # Materialize Inductor graphs, autograd metadata, gradients and Adam state
-    # before CUDA stream capture. Addresses are then stable across replays.
+    # Materialize autograd metadata, gradients and Adam state before CUDA
+    # stream capture. The narrow native-HVP candidate must not invoke Inductor;
+    # this timer therefore exposes any remaining shape-dependent cold cost.
+    cold_start = time.perf_counter()
     side_stream = torch.cuda.Stream()
     side_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side_stream):
@@ -366,6 +368,7 @@ def cuda_graph_train_case(base, batch, warmup, repeats):
         loss.backward()
         optimizer.step()
     torch.cuda.synchronize()
+    cold_prepare_capture_ms = (time.perf_counter() - cold_start) * 1.0e3
     torch.cuda.reset_peak_memory_stats()
     copy_keys = [
         key for key, value in static_batch.items() if torch.is_tensor(value)
@@ -381,6 +384,7 @@ def cuda_graph_train_case(base, batch, warmup, repeats):
         "train_step": replay,
         "peak_memory_mib": torch.cuda.max_memory_allocated() / (1024 ** 2),
         "shape_cache_key": [batch["N"], batch["edges"]],
+        "cold_prepare_capture_ms": cold_prepare_capture_ms,
     }
     os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "0"
     return result
@@ -479,7 +483,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=9)
-    parser.add_argument("--candidate", choices=("narrow", "full"), default="narrow")
+    parser.add_argument(
+        "--candidate", choices=("reference", "narrow", "full"),
+        default="narrow",
+    )
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--performance-only", action="store_true")
     parser.add_argument("--graph-parity-only", action="store_true")

@@ -17,7 +17,7 @@ setup(
     name="torchnep-oc-moment-gate",
     ext_modules=[
         CUDAExtension(
-            name="torchnep_oc_moment_gate_v1",
+            name="torchnep_oc_moment_gate_v2",
             sources=[str(HERE / "oc_moment_gate.cu")],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
         )

@@ -17,6 +17,13 @@ def _fixture(n_atoms, neighbors, dtype=torch.float64):
     return weights, pair_i, pair_j, spins
 
 
+def _zero_unused(values, inputs):
+    return tuple(
+        torch.zeros_like(input_value) if value is None else value
+        for value, input_value in zip(values, inputs)
+    )
+
+
 def test_moment_gate_cpu_fallback_matches_reference_and_double_backward():
     weights, pair_i, pair_j, spins = _fixture(5, 3)
     weights.requires_grad_(True)
@@ -40,6 +47,12 @@ def test_cuda_moment_gate_forward_vjp_hvp_parity(
     monkeypatch, n_atoms, neighbors
 ):
     monkeypatch.setenv("TORCHNEP_OC_CUDA_TRAIN", "1")
+    monkeypatch.setattr(
+        torch, "compile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("native moment-gate HVP must not compile by shape")
+        ),
+    )
     values = _fixture(n_atoms, neighbors)
     weights_a = values[0].cuda().requires_grad_(True)
     weights_b = values[0].cuda().requires_grad_(True)
@@ -77,12 +90,35 @@ def test_cuda_moment_gate_forward_vjp_hvp_parity(
         + (first_b[1] * tangent_s).sum()
     )
     second_a = torch.autograd.grad(
-        scalar_a, (weights_a, spins_a, pull_a)
+        scalar_a, (weights_a, spins_a, pull_a), retain_graph=True
     )
     second_b = torch.autograd.grad(
-        scalar_b, (weights_b, spins_b, pull_b)
+        scalar_b, (weights_b, spins_b, pull_b), retain_graph=True
     )
     for candidate, reference in zip(second_a, second_b):
+        torch.testing.assert_close(candidate, reference, rtol=2e-11, atol=2e-11)
+
+    # Exercise both nullable custom-double-backward cotangents separately.
+    inputs_a = (weights_a, spins_a, pull_a)
+    inputs_b = (weights_b, spins_b, pull_b)
+    only_weight_a = _zero_unused(torch.autograd.grad(
+        first_a[0].square().sum(), inputs_a,
+        retain_graph=True, allow_unused=True,
+    ), inputs_a)
+    only_weight_b = _zero_unused(torch.autograd.grad(
+        first_b[0].square().sum(), inputs_b,
+        retain_graph=True, allow_unused=True,
+    ), inputs_b)
+    for candidate, reference in zip(only_weight_a, only_weight_b):
+        torch.testing.assert_close(candidate, reference, rtol=2e-11, atol=2e-11)
+
+    only_spin_a = _zero_unused(torch.autograd.grad(
+        first_a[1].square().sum(), inputs_a, allow_unused=True
+    ), inputs_a)
+    only_spin_b = _zero_unused(torch.autograd.grad(
+        first_b[1].square().sum(), inputs_b, allow_unused=True
+    ), inputs_b)
+    for candidate, reference in zip(only_spin_a, only_spin_b):
         torch.testing.assert_close(candidate, reference, rtol=2e-11, atol=2e-11)
 
     # HVP symmetry is the JVP/VJP consistency gate for this scalar sector.

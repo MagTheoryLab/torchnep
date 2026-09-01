@@ -48,6 +48,12 @@ from . import ops
 from . import __version__
 from .predict import predict_from_store
 from .spin_schema import resolve_gpumd_qscaler
+from .oc_cuda_graph import (
+    OCCudaGraphTrainCache,
+    configure_graph_optimizer,
+    graph_cache_requested,
+    graph_support_reason,
+)
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
@@ -2257,11 +2263,36 @@ def train_nep(
     if compile_msg is not None:
         _log(compile_msg)
 
+    oc_graph_reason = graph_support_reason(raw_model, dev)
+    if graph_cache_requested() and use_autograd_forces and not oc_graph_reason:
+        oc_graph_enabled = True
+        # Keep capture on the production Torch oracle.  The native moment-gate
+        # HVP and the shape-specialized Inductor experiment are separate,
+        # opt-in research paths and must not leak into this cache.
+        os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
+        os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
+        os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
+        _log("  O3-C2 CUDA train graph: enabled "
+             "(Torch reference, bounded exact-ragged-shape LRU)")
+    else:
+        oc_graph_enabled = False
+        if graph_cache_requested():
+            reason = (
+                oc_graph_reason or
+                "the graph cache requires autograd response training"
+            )
+            _log(f"  O3-C2 CUDA train graph: disabled — {reason}")
+
     # weight_decay stays 0: L2 is applied explicitly in the loss as GPUMD's
     # λ₂·RMS(w) (see the reg block below), NOT as Adam's decoupled decay —
     # the two are different functional forms and would not be comparable.
-    optimizer = torch.optim.Adam(trainable_params, lr=lr,
-                                 weight_decay=0.0, amsgrad=True)
+    graph_optimizer_options = (
+        {"capturable": True, "fused": True} if oc_graph_enabled else {}
+    )
+    optimizer = torch.optim.Adam(
+        trainable_params, lr=lr, weight_decay=0.0, amsgrad=True,
+        **graph_optimizer_options,
+    )
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -2445,6 +2476,16 @@ def train_nep(
                 info, lr_scheduler, stage2_scheduler,
                 require_versioned=raw_model.spin_descriptor is not None,
             )
+
+    oc_graph_cache = None
+    if oc_graph_enabled:
+        configure_graph_optimizer(optimizer)
+        oc_graph_cache = OCCudaGraphTrainCache(
+            # The loop backend contains a data-dependent ``Tensor.any()``
+            # host branch and cannot be captured.  bmm is numerically
+            # identical and has a fixed launch topology for each ragged key.
+            raw_model, optimizer, backend="bmm",
+        )
 
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -2673,6 +2714,51 @@ def train_nep(
                 batch["need_mforce"] = has_mforces
                 batch["need_tau"] = has_tau
 
+                # A generator-response group changes the objective and shape
+                # independently of the ordinary ragged batch, so keep that
+                # less common stage-2 path eager.  Every ordinary O3-C2 batch
+                # replays descriptor -> E/F/V/MF/Tau -> backward -> Adam.
+                if oc_graph_cache is not None and not response_batches:
+                    graph_step = oc_graph_cache.step(
+                        batch,
+                        weights=(
+                            cur_pref_e, cur_pref_f, cur_pref_v,
+                            cur_pref_m, cur_pref_tau,
+                        ),
+                        l1_coeff=l1_coeff,
+                        l2_coeff=l2_coeff,
+                        max_grad_norm=max_grad_norm,
+                        curriculum_scale=(
+                            raw_model._spin_order3_gradient_scale
+                        ),
+                        need_forces=has_forces,
+                        need_virial=has_virial,
+                        need_mforce=has_mforces,
+                        need_tau=has_tau,
+                    )
+                    graph_metrics = graph_step.metrics
+                    sum_le += graph_metrics["sum_le"].item()
+                    sum_lf += graph_metrics["sum_lf"].item()
+                    sum_lv += graph_metrics["sum_lv"].item()
+                    sum_ls += graph_metrics["sum_ls"].item()
+                    sum_lm += graph_metrics["sum_lm"].item()
+                    sum_lt += graph_metrics["sum_lt"].item()
+                    sum_e_resid += graph_metrics["sum_e_resid"].item()
+                    gn = graph_step.grad_norm.item()
+                    found_inf = bool(graph_step.found_inf.item())
+                    if found_inf or not np.isfinite(gn):
+                        optimizer.zero_grad(set_to_none=False)
+                        continue
+                    sum_e_structs += int(graph_metrics["count_e"].item())
+                    sum_f_atoms += int(graph_metrics["count_f"].item())
+                    sum_v_structs += int(graph_metrics["count_v"].item())
+                    sum_m_atoms += int(graph_metrics["count_m"].item())
+                    sum_t_atoms += int(graph_metrics["count_t"].item())
+                    max_gn = max(max_gn, gn)
+                    if in_stage2 and swa_model is not None:
+                        swa_model.update_parameters(raw_model)
+                    continue
+
                 if use_autograd_forces:
                     result = compute_props(
                         batch["rij_rad"], batch["rij_ang"],
@@ -2839,6 +2925,10 @@ def train_nep(
                     continue
 
                 curriculum_rows = raw_model.capture_spin_curriculum_rows()
+                # Fused Adam consults this optional capture scalar.  An eager
+                # response-group step must not inherit it from a prior replay.
+                if oc_graph_cache is not None and hasattr(optimizer, "found_inf"):
+                    del optimizer.found_inf
                 optimizer.step()
                 raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)
 
@@ -3009,6 +3099,13 @@ def train_nep(
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
                     f"{v_str}{spin_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
+            if oc_graph_cache is not None:
+                graph_stats = oc_graph_cache.stats()
+                line += (
+                    f" | graph {graph_stats['hit_rate'] * 100:.1f}% hit "
+                    f"({graph_stats['entries']}/{graph_stats['max_entries']}, "
+                    f"capture {graph_stats['total_capture_ms']:.1f} ms)"
+                )
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
             else:
