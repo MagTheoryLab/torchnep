@@ -17,6 +17,10 @@ import numpy as np
 import pytest
 import torch
 
+from example.oc_spin.benchmark_production_response_toy import (
+    _recipe as response_benchmark_recipe,
+    _write_config as write_response_benchmark_config,
+)
 from torchnep.data import parse_nep_in, read_xyz
 from torchnep.model import NEPModel
 from torchnep.response_training import (
@@ -27,7 +31,11 @@ from torchnep.response_training import (
     normalized_group_batches,
     select_generator_curve_frames,
 )
-from torchnep.spin_diagnostics import relative_vector_error, svd_health
+from torchnep.spin_diagnostics import (
+    generator_reweighting_health,
+    relative_vector_error,
+    svd_health,
+)
 from torchnep.train import (
     _load_finetune_weights,
     build_data_lineage,
@@ -107,6 +115,76 @@ def test_jacobian_health_does_not_center_linear_map_columns():
         np.array([1.0, 2.0]), np.array([1.0, 2.1]))
     assert error["finite"] is True
     assert error["relative_rms"] > 0.0
+
+
+def test_generator_reweighting_is_rank_neutral_and_directional():
+    coordinates = np.array([-0.2, 0.0, 0.2, -0.2, 0.0, 0.2])
+    tangent = np.column_stack((
+        -np.sin(coordinates), np.cos(coordinates), np.zeros(6)
+    ))
+    target = np.column_stack((
+        np.cos(coordinates), np.sin(coordinates), np.zeros(6)
+    ))
+    struct_idx = np.arange(6, dtype=np.int64)
+    groups = np.array([0, 0, 0, 1, 1, 1])
+
+    standard = generator_reweighting_health(
+        tangent, target, struct_idx, groups,
+        mforce_weight=1.0, generator_weight=0.0,
+    )
+    generator = generator_reweighting_health(
+        tangent, target, struct_idx, groups,
+        mforce_weight=1.0, generator_weight=0.3,
+    )
+    generator_only = generator_reweighting_health(
+        tangent, target, struct_idx, groups,
+        mforce_weight=0.0, generator_weight=0.3,
+    )
+
+    assert standard["strict_observation_rank_gain"] == 0
+    assert generator["strict_observation_rank_gain"] == 0
+    assert generator_only["strict_observation_rank_gain"] == 6
+    assert generator_only["complete_mforce_supervision"] is False
+    assert generator["generator_operator"]["effective_rank"] == 6
+    assert generator["ordinary_mforce_components"] == 18
+    assert standard["aligned_curvature_gain_min"] == 1.0
+    assert standard["aligned_curvature_gain_max"] == 1.0
+    assert generator["orthogonal_curvature_gain"] == 1.0
+    assert generator["aligned_curvature_gain_min"] > 1.0
+    assert generator["aligned_curvature_gain_max"] >= \
+        generator["aligned_curvature_gain_min"]
+
+
+def test_generator_reweighting_rejects_incomplete_structure_map():
+    tangent = np.ones((2, 3))
+    target = np.ones((2, 3))
+    with pytest.raises(ValueError, match="every response structure"):
+        generator_reweighting_health(
+            tangent, target, np.array([0, 0]), np.array([0, 1]),
+            mforce_weight=1.0, generator_weight=0.3,
+        )
+
+
+def test_response_benchmark_has_distinct_standard_and_generator_recipes(
+    tmp_path,
+):
+    standard = response_benchmark_recipe("standard", 0.1, 3.0)
+    generator = response_benchmark_recipe("generator", 0.1, 1.0)
+    lighter_generator = response_benchmark_recipe(
+        "generator", 0.1, 1.0, generator_weight=0.03
+    )
+    assert standard["generator_enabled"] is False
+    assert standard["generator_weight"] == 0.0
+    assert generator["generator_enabled"] is True
+    assert generator["generator_weight"] > 0.0
+    assert lighter_generator["generator_weight"] == 0.03
+    assert "lambda_R=0.03" in lighter_generator["label"]
+
+    config_path = tmp_path / "nep.in"
+    write_response_benchmark_config(config_path, 20, 0.1, 3.0)
+    config = parse_nep_in(config_path)
+    assert config["lambda_m"] == 0.1
+    assert config["stage2_pref_m"] == 3.0
 
 
 def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):

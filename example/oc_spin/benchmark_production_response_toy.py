@@ -7,13 +7,16 @@
 
 """Sealed production-trainer A/B for grouped magnetic response.
 
-The two variants use identical noisy E/MF labels, O3-C2 descriptor, scalar
-ANN, split, seed, and epochs.  The only difference is whether controlled
-rotation frames declare ``spin_tangent`` and therefore activate the internal
-Stage-2 centered generator-curve objective.
+Every run uses identical noisy E/MF labels, O3-C2 descriptor, scalar ANN,
+split, seed, and epochs. ``standard`` runs supervise the controlled scans only
+through their ordinary E/MF labels. ``generator`` runs additionally declare
+``spin_tangent`` and activate the Stage-2 generator-curve objective. Explicit
+magnetic-force weights make a global ``lambda_m`` sweep an independent control
+for the targeted generator reweighting.
 """
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 
@@ -22,7 +25,16 @@ import torch
 
 from torchnep import train_nep
 from torchnep.nep import NEPCalculator
-from torchnep.spin_diagnostics import relative_vector_error, svd_health
+from torchnep.response_training import (
+    GENERATOR_CURVE_MEAN_WEIGHT,
+    GENERATOR_CURVE_SCALE_FLOOR,
+    GENERATOR_CURVE_WEIGHT,
+)
+from torchnep.spin_diagnostics import (
+    generator_reweighting_health,
+    relative_vector_error,
+    svd_health,
+)
 
 
 SPECIES = ["Fe"] * 4
@@ -181,7 +193,9 @@ def _write_xyz(path, frames, with_tangent):
     path.write_text("\n".join(lines) + "\n")
 
 
-def _write_config(path, epochs):
+def _write_config(path, epochs, lambda_m, stage2_lambda_m):
+    if lambda_m < 0.0 or stage2_lambda_m < 0.0:
+        raise ValueError("magnetic-force weights must be nonnegative")
     path.write_text(
         "type 1 Fe\n"
         "cutoff 4.0 4.0\n"
@@ -198,14 +212,14 @@ def _write_config(path, epochs):
         "lambda_e 1.0\n"
         "lambda_f 0.0\n"
         "lambda_v 0.0\n"
-        "lambda_m 0.10\n"
+        f"lambda_m {lambda_m:.16g}\n"
         "lambda_tau 0.0\n"
         "stage2 1\n"
         f"start_stage2 {max(2, epochs // 2)}\n"
         "stage2_lambda_e 0.20\n"
         "stage2_lambda_f 0.0\n"
         "stage2_lambda_v 0.0\n"
-        "stage2_lambda_m 1.0\n"
+        f"stage2_lambda_m {stage2_lambda_m:.16g}\n"
         "stage2_lambda_tau 0.0\n"
         "stage2_lr 0.0005\n"
         "batch 16\n"
@@ -215,6 +229,45 @@ def _write_config(path, epochs):
         "scheduler_patience 20\n"
         "stage2_scheduler_patience 20\n"
     )
+
+
+def _recipe(
+    variant, lambda_m, stage2_lambda_m,
+    generator_weight=GENERATOR_CURVE_WEIGHT,
+):
+    if variant not in ("standard", "generator"):
+        raise ValueError(f"unknown response benchmark variant: {variant}")
+    if generator_weight < 0.0:
+        raise ValueError("generator weight must be nonnegative")
+    active_generator_weight = (
+        float(generator_weight) if variant == "generator" else 0.0
+    )
+    return {
+        "variant": variant,
+        "lambda_m": float(lambda_m),
+        "stage2_lambda_m": float(stage2_lambda_m),
+        "generator_enabled": variant == "generator",
+        "generator_weight": active_generator_weight,
+        "label": (
+            f"{variant} | lambda_m={float(lambda_m):g} -> "
+            f"{float(stage2_lambda_m):g}"
+            + (
+                f" | lambda_R={active_generator_weight:g}"
+                if variant == "generator" else ""
+            )
+        ),
+    }
+
+
+def _train_with_internal_generator_weight(recipe, **kwargs):
+    """Run one sealed benchmark arm without expanding the public config."""
+    train_module = importlib.import_module("torchnep.train")
+    previous = train_module.GENERATOR_CURVE_WEIGHT
+    train_module.GENERATOR_CURVE_WEIGHT = recipe["generator_weight"]
+    try:
+        train_nep(**kwargs)
+    finally:
+        train_module.GENERATOR_CURVE_WEIGHT = previous
 
 
 def _fit_curve(theta, values):
@@ -227,7 +280,54 @@ def _nrmse(prediction, target):
     return float(np.sqrt(np.mean(np.square(prediction - target))) / max(scale, 1e-14))
 
 
-def _evaluate(model_file, blind, device):
+def _evaluate_generalization(calculator, frames):
+    def evaluate_slice(selected):
+        energy_target = []
+        energy_prediction = []
+        mforce_target = []
+        mforce_prediction = []
+        for frame in selected:
+            exact_energy, exact_mforces, _ = _teacher(
+                frame["positions"], frame["spins"]
+            )
+            result = calculator.compute(
+                SPECIES, frame["positions"], CELL, spins=frame["spins"]
+            )
+            energy_target.append(exact_energy / len(SPECIES))
+            energy_prediction.append(
+                float(result["energy"].sum().item()) / len(SPECIES)
+            )
+            mforce_target.append(exact_mforces)
+            mforce_prediction.append(
+                result["mforces"].detach().cpu().numpy()
+            )
+        if not selected:
+            return None
+        energy_target = np.asarray(energy_target)
+        energy_prediction = np.asarray(energy_prediction)
+        mforce_target = np.concatenate(mforce_target, axis=0)
+        mforce_prediction = np.concatenate(mforce_prediction, axis=0)
+        return {
+            "structures": len(selected),
+            "energy_rmse_ev_atom": float(np.sqrt(np.mean(np.square(
+                energy_prediction - energy_target
+            )))),
+            "mforce_rmse_ev_mub": float(np.sqrt(np.mean(np.square(
+                mforce_prediction - mforce_target
+            )))),
+            "mforce_nrmse": _nrmse(mforce_prediction, mforce_target),
+        }
+
+    ordinary = [frame for frame in frames if "group" not in frame]
+    response = [frame for frame in frames if "group" in frame]
+    return {
+        "all": evaluate_slice(frames),
+        "ordinary": evaluate_slice(ordinary),
+        "response": evaluate_slice(response),
+    }
+
+
+def _evaluate(model_file, blind, general_frames, device):
     calculator = NEPCalculator(model_file, dtype=torch.float32, device=device)
     all_target = []
     all_prediction = []
@@ -267,6 +367,9 @@ def _evaluate(model_file, blind, device):
         "j_target": j_target, "j_prediction": j_prediction,
         "d_target": d_target, "d_prediction": d_prediction,
         "curves": curves,
+        "generalization": _evaluate_generalization(
+            calculator, general_frames
+        ),
     }
 
 
@@ -477,34 +580,102 @@ def _training_log_health(path):
     }
 
 
+def _response_reweighting_health(frames, recipe):
+    response_frames = [frame for frame in frames if "group" in frame]
+    tangents = np.concatenate(
+        [frame["tangent"] for frame in response_frames], axis=0
+    )
+    targets = np.concatenate(
+        [frame["mforces"] for frame in response_frames], axis=0
+    )
+    struct_idx = np.repeat(
+        np.arange(len(response_frames), dtype=np.int64), len(SPECIES)
+    )
+    group_lookup = {}
+    group_ids = []
+    for frame in response_frames:
+        group_ids.append(group_lookup.setdefault(
+            frame["group"], len(group_lookup)
+        ))
+    return generator_reweighting_health(
+        tangents,
+        targets,
+        struct_idx,
+        group_ids,
+        mforce_weight=recipe["stage2_lambda_m"],
+        generator_weight=recipe["generator_weight"],
+        ordinary_mforce_components=sum(
+            np.asarray(frame["mforces"]).size for frame in frames
+        ),
+        mean_weight=GENERATOR_CURVE_MEAN_WEIGHT,
+        scale_floor=GENERATOR_CURVE_SCALE_FLOOR,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--variant", choices=("absolute", "curve", "joint"), required=True)
+        "--variant", choices=("standard", "generator"), required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--lambda-m", type=float, default=0.10)
+    parser.add_argument("--stage2-lambda-m", type=float, default=1.0)
+    parser.add_argument(
+        "--generator-weight", type=float, default=GENERATOR_CURVE_WEIGHT,
+        help="Internal benchmark seam; this is not a nep.in parameter.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--evaluate-only", action="store_true",
+        help="Reuse an existing model/nep_best.txt and refresh result.json.",
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     train, valid, blind = _dataset()
     train_file = args.output / "train.xyz"
     valid_file = args.output / "valid.xyz"
     config_file = args.output / "nep.in"
-    with_tangent = args.variant != "absolute"
-    _write_xyz(train_file, train, with_tangent)
-    _write_xyz(valid_file, valid, with_tangent)
-    _write_config(config_file, args.epochs)
-    model_dir = args.output / "model"
-    train_nep(
-        str(config_file), str(train_file), output_dir=str(model_dir),
-        device=args.device, precision="float32", restart=False,
-        prediction_interval=0, run_seed=args.seed,
-        valid_file=str(valid_file), use_swa=False,
+    recipe = _recipe(
+        args.variant, args.lambda_m, args.stage2_lambda_m,
+        args.generator_weight,
     )
+    with_tangent = recipe["generator_enabled"]
+    model_dir = args.output / "model"
+    if args.evaluate_only:
+        result_path = args.output / "result.json"
+        if result_path.is_file():
+            stored = json.loads(result_path.read_text())
+            if stored.get("variant") != args.variant \
+                    or int(stored.get("seed", -1)) != args.seed:
+                raise ValueError(
+                    "evaluate-only variant/seed does not match result.json"
+                )
+            recipe = stored.get("recipe", recipe)
+        if not (model_dir / "nep_best.txt").is_file():
+            raise FileNotFoundError(
+                f"missing existing model: {model_dir / 'nep_best.txt'}"
+            )
+    else:
+        _write_xyz(train_file, train, with_tangent)
+        _write_xyz(valid_file, valid, with_tangent)
+        _write_config(
+            config_file, args.epochs, args.lambda_m, args.stage2_lambda_m
+        )
+        _train_with_internal_generator_weight(
+            recipe,
+            config_file=str(config_file), data_file=str(train_file),
+            output_dir=str(model_dir),
+            device=args.device, precision="float32", restart=False,
+            prediction_interval=0, run_seed=args.seed,
+            valid_file=str(valid_file), use_swa=False,
+        )
     result = {
         "variant": args.variant, "seed": args.seed, "epochs": args.epochs,
-        "metrics": _evaluate(model_dir / "nep_best.txt", blind, args.device),
+        "recipe": recipe,
+        "metrics": _evaluate(
+            model_dir / "nep_best.txt", blind, valid, args.device
+        ),
     }
     health_calculator = NEPCalculator(
         model_dir / "nep_best.txt", dtype=torch.float64, device=args.device
@@ -520,6 +691,7 @@ def main():
         "derivatives": _finite_difference_health(
             health_calculator, blind[0][len(blind[0]) // 2]
         ),
+        "response_reweighting": _response_reweighting_health(train, recipe),
         "training_log": _training_log_health(model_dir / "loss.out"),
     }
     (args.output / "result.json").write_text(json.dumps(result, indent=2))
