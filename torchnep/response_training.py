@@ -243,6 +243,55 @@ def normalized_group_batches(
     return weighted
 
 
+def balanced_group_step_batches(
+    group_ids: Sequence[int], num_steps: int, seed: int = 0
+):
+    """Assign complete response groups to optimizer steps with exact balance.
+
+    Returns one ``[(indices, weight), ...]`` list per optimizer step.  Across
+    the epoch every group has total coefficient ``num_steps / num_groups`` and
+    all returned weights sum to ``num_steps``.  When there are fewer ordinary
+    steps than groups, several complete groups share a step; otherwise groups
+    cycle and repeated groups receive the inverse of their occurrence count.
+    This keeps the mean response strength unchanged while removing the
+    first-groups-win bias of a truncated modulo cycle.
+    """
+    if num_steps < 0:
+        raise ValueError("num_steps must be non-negative")
+    if num_steps == 0:
+        return []
+    units = complete_group_batches(group_ids, batch_size=1, seed=seed)
+    num_groups = len(units)
+    if num_groups == 0:
+        return []
+
+    if num_steps < num_groups:
+        # Partition one full shuffled group pass over the available steps.
+        # generator_curve_loss averages the groups within a combined batch,
+        # hence h * num_steps / num_groups gives every group coefficient
+        # num_steps / num_groups exactly.
+        quotient, remainder = divmod(num_groups, num_steps)
+        result = []
+        cursor = 0
+        for step in range(num_steps):
+            width = quotient + (1 if step < remainder else 0)
+            selected = units[cursor:cursor + width]
+            cursor += width
+            indices = [index for unit in selected for index in unit]
+            result.append([(
+                indices, width * num_steps / float(num_groups)
+            )])
+        return result
+
+    selected_units = [step % num_groups for step in range(num_steps)]
+    counts = [0] * num_groups
+    for unit in selected_units:
+        counts[unit] += 1
+    return [[(
+        units[unit], num_steps / float(num_groups * counts[unit])
+    )] for unit in selected_units]
+
+
 def _frame_generator(
     mforces: torch.Tensor,
     tangent: torch.Tensor,

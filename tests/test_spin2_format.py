@@ -118,15 +118,15 @@ def test_spin_options_require_explicit_spin_mode_two(tmp_path):
         NEPModel(config)
 
 
-def test_retired_unpublished_spin_mode_three_is_rejected(tmp_path):
+def test_unknown_spin_modes_are_rejected(tmp_path):
     path = tmp_path / "nep.in"
-    path.write_text("type 1 Fe\nspin_mode 3\n")
-    with pytest.raises(ValueError, match="spin_mode must be 0 or 2"):
+    path.write_text("type 1 Fe\nspin_mode 4\n")
+    with pytest.raises(ValueError, match="spin_mode must be 0, 2, or 3"):
         parse_nep_in(path)
 
     config = _config(order=3, compress=2)
-    config["spin_mode"] = 3
-    with pytest.raises(ValueError, match="spin_mode must be 0 or 2"):
+    config["spin_mode"] = 4
+    with pytest.raises(ValueError, match="spin_mode must be 0, 2, or 3"):
         NEPModel(config)
 
 

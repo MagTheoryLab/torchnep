@@ -39,7 +39,7 @@ import warnings
 import torch
 import numpy as np
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel, slim_model, gpumd_init_parameters
@@ -61,6 +61,7 @@ from .response_training import (
     GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
     GENERATOR_CURVE_WEIGHT,
+    balanced_group_step_batches,
     complete_group_batches,
     generator_curve_loss,
     group_balanced_generator_rms,
@@ -199,6 +200,10 @@ def format_config_summary(config: dict) -> List[str]:
                      f"{config['spin_cutoff'][0]}")
         lines.append(f"  {tag('spin_curriculum'):10}  spin_curriculum "
                      f"{int(config['spin_curriculum'])}")
+        if config.get("spin_mode") == 3:
+            lines.append(f"  {tag('spin_mforce_mode'):10}  "
+                         "spin_mforce_mode "
+                         f"{config.get('spin_mforce_mode', 'full')}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
@@ -295,7 +300,7 @@ class StreamDataStore:
         self.has_spin = bool(config.get("spin_mode", 0))
         if self.has_spin and any("spins" not in s for s in structures):
             raise ValueError(
-                "spin_mode 2 requires a spin/moment vector for every atom")
+                "spin_mode 2 or 3 requires a spin/moment vector for every atom")
         self._pin = device.type == "cuda"
 
         # Basis parameters (needed at collate time).
@@ -1022,7 +1027,7 @@ def validate_spin_frames(frames, source_name):
         preview = ", ".join(str(index) for index in missing[:5])
         suffix = "..." if len(missing) > 5 else ""
         raise ValueError(
-            f"spin_mode 2 requires spins in every {source_name} frame; "
+            f"spin_mode 2 or 3 requires spins in every {source_name} frame; "
             f"missing at indices {preview}{suffix}"
         )
 
@@ -1121,9 +1126,70 @@ def validate_resume_data_lineage(saved, current, require_versioned=False):
 _VIRIAL_6 = [0, 4, 8, 1, 5, 6]
 
 
+def virial6_for_loss(virial: torch.Tensor, spin_mode: int) -> torch.Tensor:
+    """Return ``xx yy zz xy yz zx`` for the training loss.
+
+    A spin-orbit model's position-only virial may have a physical
+    antisymmetric spin-lattice part, while stress labels constrain symmetric
+    strain.  spin3 therefore compares the symmetric tensor.  The direct six
+    contractions below avoid materializing a 3x3 transpose; spin2 keeps its
+    historical component selection unchanged.
+    """
+    if virial.shape[-1] != 9:
+        raise ValueError("virial loss expects a row-major 9-component tensor")
+    if spin_mode != 3:
+        return virial[..., _VIRIAL_6]
+    half = virial.new_tensor(0.5)
+    return torch.stack((
+        virial[..., 0],
+        virial[..., 4],
+        virial[..., 8],
+        half * (virial[..., 1] + virial[..., 3]),
+        half * (virial[..., 5] + virial[..., 7]),
+        half * (virial[..., 6] + virial[..., 2]),
+    ), dim=-1)
+
+
+def magnetic_force_residual(
+    prediction: torch.Tensor,
+    reference: torch.Tensor,
+    spins: torch.Tensor,
+    mode: str,
+):
+    """Return the configured magnetic-force residual and intrinsic DOF.
+
+    ``full`` supervises ``-dE/dS`` in all three Cartesian directions.
+    ``transverse`` removes the component parallel to ``S`` and has two
+    intrinsic components.  Zero-moment sites carry no orientation and hence
+    contribute a zero residual in transverse mode.
+    """
+    residual = prediction - reference
+    if mode == "full":
+        return residual, 3, torch.ones(
+            residual.shape[:-1], dtype=torch.bool, device=residual.device
+        )
+    if mode != "transverse":
+        raise ValueError(
+            "spin_mforce_mode must be 'full' or 'transverse'"
+        )
+    spin_square = spins.square().sum(dim=-1, keepdim=True)
+    resolved = spin_square > (
+        64.0 * torch.finfo(spins.dtype).eps
+    )
+    longitudinal = (
+        (residual * spins).sum(dim=-1, keepdim=True)
+        / spin_square.clamp_min(torch.finfo(spins.dtype).tiny)
+    ) * spins
+    return (
+        torch.where(resolved, residual - longitudinal, 0.0),
+        2,
+        resolved.squeeze(-1),
+    )
+
+
 @torch.no_grad()
 def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
-                     gpumd_init=False):
+                     gpumd_init=False, return_rms=False):
     """Compute descriptor min/max across training set.
 
     Uses the cached-basis path (reusing data_store's precomputed Chebyshev +
@@ -1146,6 +1212,11 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
     dtype = next(model.parameters()).dtype
     q_min = torch.full((model.dim,), float("inf"), dtype=dtype, device=dev)
     q_max = torch.full((model.dim,), float("-inf"), dtype=dtype, device=dev)
+    q_square_sum = (
+        torch.zeros(model.dim, dtype=dtype, device=dev)
+        if return_rms else None
+    )
+    q_count = 0
 
     if gpumd_init:
         c2 = torch.ones_like(model.c_param_2)
@@ -1188,9 +1259,53 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
             q = torch.cat((q, q_spin), dim=-1)
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
+        if return_rms:
+            q_square_sum.add_(q.square().sum(0))
+            q_count += q.shape[0]
 
     model.train()
+    if return_rms:
+        if q_count == 0:
+            raise ValueError("cannot compute q RMS from an empty dataset")
+        return q_min, q_max, (q_square_sum / q_count).sqrt()
     return q_min, q_max
+
+
+@torch.no_grad()
+def refresh_order3_q_scaler(raw_model, q_min, q_max, q_rms):
+    """Refresh only the still-gated spin3 order-3 input columns.
+
+    The O1/O2 rows already represent a trained function and must not move.
+    O3 fitting rows are exactly zero during warm-up, so changing their input
+    scale is function-preserving.  A nonzero row fails closed.
+    """
+    if raw_model.spin_mode != 3 or not raw_model.spin_curriculum:
+        return False
+    start = raw_model.spin_order3_input_start
+    if start >= raw_model.dim:
+        return False
+    if any(bool(torch.count_nonzero(net.w0[start:]).item())
+           for net in raw_model.fitting_nets):
+        return False
+    previous = raw_model.q_scaler.clone()
+    raw_model.set_q_scaler(q_min, q_max, q_rms)
+    raw_model.q_scaler[:start].copy_(previous[:start])
+    return True
+
+
+@torch.no_grad()
+def reset_order3_optimizer_state(raw_model, optimizer):
+    """Discard Adam moments tied to the pre-refresh O3 input scale."""
+    if raw_model.spin_mode != 3:
+        return
+    start = raw_model.spin_order3_input_start
+    for net in raw_model.fitting_nets:
+        parameter = net.w0
+        state = optimizer.state.get(parameter, {})
+        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+            value = state.get(name)
+            if torch.is_tensor(value) and value.shape == parameter.shape:
+                value[start:].zero_()
 
 
 @torch.no_grad()
@@ -1413,7 +1528,7 @@ def _load_checkpoint(path, model, optimizer, swa_model, device):
         if m.spin_mode:
             raise ValueError(
                 "spin checkpoint is missing model_signature; export a "
-                "versioned nep4_spin2 model before fine-tuning")
+                "versioned nep4_spin2/nep4_spin3 model before fine-tuning")
         warnings.warn(
             "legacy checkpoint has no architecture signature; only tensor "
             "shapes can be checked",
@@ -1498,7 +1613,7 @@ def _load_finetune_weights(target, path, device):
         if target.spin_mode:
             raise ValueError(
                 "spin .pt weights are missing model_signature; use a "
-                "versioned checkpoint or nep4_spin2 text model")
+                "versioned checkpoint or nep4_spin2/nep4_spin3 text model")
         warnings.warn(
             "legacy .pt weights have no architecture signature; only tensor "
             "shapes can be checked",
@@ -1540,7 +1655,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                                compute_props, compute_props_cached,
                                use_autograd_forces, backend,
                                has_forces, has_virial, has_mforce, has_tau,
-                               dtype, dev):
+                               dtype, dev, mforce_mode="full"):
     """Frozen-weight squared-error sums over the LOCAL data_store.
 
     Mirrors the training-epoch accumulation exactly (same masks, same
@@ -1622,9 +1737,12 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         si = batch["struct_idx"].unsqueeze(-1).expand_as(v_atom)
                         v_sys.scatter_add_(0, si, v_atom)
                         na = batch["natoms"][v_mask].unsqueeze(-1)
-                        # 6 unique components only (see _VIRIAL_6).
-                        v_pred6 = v_sys[:, _VIRIAL_6]
-                        v_ref6 = batch["virial"][:, _VIRIAL_6]
+                        v_pred6 = virial6_for_loss(
+                            v_sys, raw_model.spin_mode
+                        )
+                        v_ref6 = virial6_for_loss(
+                            batch["virial"], raw_model.spin_mode
+                        )
                         v_diff = (v_pred6[v_mask] - v_ref6[v_mask]) / na
                         sum_lv += (v_diff ** 2).mean(dim=1).sum().item()
                         # Stress (eV/A**3) = virial_per_atom * natoms / V.
@@ -1637,12 +1755,15 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                 if has_mforce and "mforces" in result:
                     active = raw_model.spin_dof_type_active[
                         batch["atom_types"]]
-                    m_mask = batch["mforce_mask"] & active
+                    m_diff, m_dof, defined = magnetic_force_residual(
+                        result["mforces"], batch["mforces"],
+                        batch["spins"], mforce_mode,
+                    )
+                    m_mask = batch["mforce_mask"] & active & defined
                     if m_mask.any():
-                        m_diff = (
-                            result["mforces"][m_mask]
-                            - batch["mforces"][m_mask])
-                        sum_lm += (m_diff ** 2).mean(dim=1).sum().item()
+                        sum_lm += (
+                            m_diff[m_mask].square().sum(dim=1) / m_dof
+                        ).sum().item()
                         n_m += int(m_mask.sum().item())
 
                 if has_tau and "tau" in result:
@@ -1651,7 +1772,10 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                     t_mask = batch["tau_mask"] & active
                     if t_mask.any():
                         t_diff = result["tau"][t_mask] - batch["tau"][t_mask]
-                        sum_lt += (t_diff ** 2).mean(dim=1).sum().item()
+                        tau_dof = 2 if raw_model.spin_mode == 3 else 3
+                        sum_lt += (
+                            t_diff.square().sum(dim=1) / tau_dof
+                        ).sum().item()
                         n_t += int(t_mask.sum().item())
     finally:
         if was_training:
@@ -1664,7 +1788,8 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
 def _evaluate_true_loss(data_store, batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, backend,
-                        pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
+                        pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev,
+                        mforce_mode="full"):
     """Weighted loss + RMSEs of the CURRENT (frozen) weights, full dataset.
 
     Single-GPU wrapper around ``_accumulate_true_loss_sums`` — used to
@@ -1688,7 +1813,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
         data_store, batch_size, raw_model,
         compute_props, compute_props_cached,
         use_autograd_forces, backend, has_forces, has_virial,
-        has_mforce, has_tau, dtype, dev)
+        has_mforce, has_tau, dtype, dev, mforce_mode)
     (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
      n_e, n_f, n_v, n_m, n_t, sum_e_resid) = sums
     # Exact optimal b1 for these frozen weights, solved from this same pass.
@@ -1713,7 +1838,8 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
                          compute_props, compute_props_cached,
                          use_autograd_forces, backend,
-                         pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
+                         pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev,
+                         mforce_mode="full"):
     """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
 
     Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
@@ -1735,7 +1861,7 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
         valid_store, batch_size, raw_model,
         compute_props, compute_props_cached,
         use_autograd_forces, backend, has_forces, has_virial,
-        has_mforce, has_tau, dtype, dev)
+        has_mforce, has_tau, dtype, dev, mforce_mode)
     (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
      n_e, n_f, n_v, n_m, n_t, _) = sums
     mse_e = sum_le / max(n_e, 1)
@@ -1873,6 +1999,70 @@ def spin_curriculum_scale(epoch: int, full_o3_epoch: int) -> float:
     if epoch >= full_o3_epoch:
         return 1.0
     return (epoch - warmup_end) / (full_o3_epoch - warmup_end)
+
+
+@torch.no_grad()
+def prepare_spin3_curriculum_clip(raw_model):
+    """Weight frozen/ramping O3 rows only in the clipping norm.
+
+    spin3 applies its curriculum to the realized Adam displacement, not to the
+    gradient consumed by Adam.  Nevertheless, a frozen row must not force the
+    active O1/O2 gradients through global clipping.  Temporarily scaling the
+    small O3 row slices lets the stock foreach clip compute the effective norm;
+    :func:`restore_spin3_curriculum_clip` then restores the full gradients
+    (with the same global clip coefficient) before the optimizer sees them.
+    """
+    scale = raw_model._spin_order3_gradient_scale
+    if (raw_model.spin_mode != 3 or not raw_model.spin_curriculum
+            or scale >= 1.0):
+        return None
+    start = raw_model.spin_order3_input_start
+    saved = []
+    for net in raw_model.fitting_nets:
+        gradient = net.w0.grad
+        if gradient is None:
+            saved.append(None)
+            continue
+        original = gradient[start:].clone()
+        gradient[start:].mul_(scale)
+        saved.append(original)
+    return tuple(saved)
+
+
+@torch.no_grad()
+def restore_spin3_curriculum_clip(
+    raw_model, saved_rows, effective_norm, max_norm
+):
+    """Restore full O3 gradients after effective-norm clipping."""
+    if saved_rows is None:
+        return
+    coefficient = torch.clamp(
+        effective_norm.new_tensor(float(max_norm))
+        / (effective_norm + 1.0e-6),
+        max=1.0,
+    )
+    start = raw_model.spin_order3_input_start
+    for net, original in zip(raw_model.fitting_nets, saved_rows):
+        if original is not None:
+            net.w0.grad[start:].copy_(original * coefficient)
+
+
+def spin_curriculum_end(
+    spin_mode: int,
+    num_epochs: int,
+    stage2: bool,
+    start_stage2: Optional[int],
+) -> int:
+    """Resolve the full-O3 epoch without changing spin2 schedules."""
+    if not stage2:
+        return max(2, (2 * num_epochs) // 3)
+    if start_stage2 is None:
+        raise ValueError("stage2 curriculum requires start_stage2")
+    if spin_mode != 3:
+        return start_stage2
+    # Give spin3 O3 channels a full-strength Stage-1 window before the loss,
+    # response objective and learning rate all change at the Stage-2 boundary.
+    return max(2, start_stage2 - max(1, num_epochs // 10))
 
 
 def train_nep(
@@ -2040,6 +2230,7 @@ def train_nep(
     pref_v             = config["lambda_v"]
     pref_m             = config["lambda_m"]
     pref_tau           = config["lambda_tau"]
+    mforce_mode        = config["spin_mforce_mode"]
     # Optional stage-2 block
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")  # may be None -> auto 0.5*num_epochs
@@ -2119,7 +2310,7 @@ def train_nep(
         # The same draw export_valid_split reproduces (see data.py) — the
         # split can be exported as GPUMD-ready train.xyz/test.xyz files.
         has_response_groups = any("response_group" in f for f in frames)
-        if config.get("spin_mode", 0) == 2 and has_response_groups:
+        if config.get("spin_mode", 0) in (2, 3) and has_response_groups:
             val_idx = grouped_validation_indices(frames, valid_ratio, run_seed)
             val_set = set(val_idx)
             train_idx = [i for i in range(len(frames)) if i not in val_set]
@@ -2160,11 +2351,11 @@ def train_nep(
 
     response_frames = (
         select_generator_curve_frames(frames)
-        if config.get("spin_mode", 0) == 2 else []
+        if config.get("spin_mode", 0) in (2, 3) else []
     )
     valid_response_frames = (
         select_generator_curve_frames(valid_frames)
-        if config.get("spin_mode", 0) == 2 and valid_frames is not None
+        if config.get("spin_mode", 0) in (2, 3) and valid_frames is not None
         else []
     )
     response_enabled = bool(response_frames)
@@ -2299,9 +2490,10 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode == 2 and not use_autograd_forces:
+    if model.spin_mode in (2, 3) and not use_autograd_forces:
         use_autograd_forces = True
-        _log("  spin_mode 2: using the full autograd E/F/V/MF/Tau path")
+        _log(f"  spin_mode {model.spin_mode}: using the full autograd "
+             "E/F/V/MF/Tau path")
     if energy_baseline_values is not None:
         model.set_energy_baseline(torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev))
@@ -2434,10 +2626,12 @@ def train_nep(
         # The q-scaler pass uses the training batch size so its transient
         # GPU footprint stays batch-bound (min/max over the dataset is
         # chunking-invariant, so the result is unchanged).
-        q_min, q_max = compute_q_scaler(model, data_store, backend=backend,
-                                        batch_size=batch_size,
-                                        gpumd_init=use_gpumd_qscaler)
-        model.set_q_scaler(q_min, q_max)
+        q_stats = compute_q_scaler(
+            model, data_store, backend=backend, batch_size=batch_size,
+            gpumd_init=use_gpumd_qscaler,
+            return_rms=model.spin_mode == 3,
+        )
+        model.set_q_scaler(*q_stats)
         if dev.type == "cuda":
             torch.cuda.synchronize()
         _log(f"  q_scaler in {time.time() - t0:.1f}s")
@@ -2512,8 +2706,8 @@ def train_nep(
     curriculum_enabled = (
         raw_model.spin_curriculum and finetune_from is None
     )
-    curriculum_end = (
-        start_stage2 if stage2 else max(2, (2 * num_epochs) // 3)
+    curriculum_end = spin_curriculum_end(
+        raw_model.spin_mode, num_epochs, stage2, start_stage2
     )
     if curriculum_enabled and not 2 <= curriculum_end <= num_epochs:
         raise ValueError(
@@ -2526,6 +2720,8 @@ def train_nep(
         "curriculum_enabled": curriculum_enabled,
         "use_swa": bool(stage2 and use_swa),
     }
+    if raw_model.spin_mode == 3:
+        schedule_state["order3_scaler_refreshed"] = False
 
     # SWA window: average only the tail of the run (default: the last 100
     # epochs). Averaging the whole of stage 2 drags the energy back toward
@@ -2579,6 +2775,11 @@ def train_nep(
             float(response_store.generator_curve_scale.item())
             if response_enabled else 0.0),
     }
+    if raw_model.spin_mode == 3:
+        cur_loss_weights["spin_mforce_mode"] = mforce_mode
+        cur_loss_weights["generator_curve_step_balance"] = (
+            "exact-per-epoch" if response_enabled else None
+        )
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
     # peek); here the full training state is actually restored.
@@ -2616,6 +2817,10 @@ def train_nep(
         )
         saved_schedule = info.get("schedule_state")
         if saved_schedule is not None:
+            if raw_model.spin_mode == 3:
+                schedule_state["order3_scaler_refreshed"] = bool(
+                    saved_schedule.get("order3_scaler_refreshed", False)
+                )
             saved_stage2_start = saved_schedule.get("stage2_start")
             saved_use_swa = bool(saved_schedule.get("use_swa", False))
             if info["in_stage2"]:
@@ -2822,10 +3027,32 @@ def train_nep(
                 raw_model.set_spin_curriculum_scale(scale)
                 warmup_end = max(1, curriculum_end // 2)
                 if epoch in (start_epoch, warmup_end, curriculum_end):
+                    scale_name = (
+                        "step_scale" if raw_model.spin_mode == 3
+                        else "gradient_scale"
+                    )
                     _log(
                         f"  O3 curriculum epoch {epoch}: "
-                        f"gradient_scale={scale:.6f}"
+                        f"{scale_name}={scale:.6f}"
                     )
+                if (raw_model.spin_mode == 3 and curriculum_enabled
+                        and epoch == warmup_end + 1
+                        and not schedule_state["order3_scaler_refreshed"]):
+                    fresh_stats = compute_q_scaler(
+                        raw_model, data_store, backend=backend,
+                        batch_size=batch_size, gpumd_init=False,
+                        return_rms=True,
+                    )
+                    if not refresh_order3_q_scaler(
+                            raw_model, *fresh_stats):
+                        raise RuntimeError(
+                            "spin3 O3 q_scaler refresh lost its zero-row "
+                            "function-preserving precondition"
+                        )
+                    reset_order3_optimizer_state(raw_model, optimizer)
+                    schedule_state["order3_scaler_refreshed"] = True
+                    _log("  O3 curriculum: refreshed order-3 q_scaler and "
+                         "reset its Adam moments")
 
             # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
             # run_seed + epoch: distinct order every epoch, reproducible for a
@@ -2926,19 +3153,28 @@ def train_nep(
                 raw_model.spin_descriptor is not None
                 and data_store.has_tau and cur_pref_tau > 0)
 
-            # Pair one complete response group with each ordinary optimizer
-            # step.  This optimizes L_ordinary + lambda_R L_response in one
-            # backward pass instead of changing the effective number of
-            # optimizer steps according to the number of response groups.
-            response_batches = (
-                complete_group_batches(
-                    response_store.response_group_ids, 1,
-                    seed=run_seed + epoch)
-                if in_stage2 and response_store is not None else []
-            )
-
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_structs, batch_size)]
+            # Pair response groups with the existing ordinary optimizer steps.
+            # spin3 makes the per-group total coefficient exactly equal within
+            # every epoch; spin2 retains its historical modulo cycle.
+            if in_stage2 and response_store is not None:
+                if raw_model.spin_mode == 3:
+                    response_batches = balanced_group_step_batches(
+                        response_store.response_group_ids,
+                        len(batch_indices), seed=run_seed + epoch,
+                    )
+                else:
+                    legacy = complete_group_batches(
+                        response_store.response_group_ids, 1,
+                        seed=run_seed + epoch,
+                    )
+                    response_batches = [
+                        [(legacy[index % len(legacy)], 1.0)]
+                        for index in range(len(batch_indices))
+                    ]
+            else:
+                response_batches = []
             _tp = [0.0, 0.0]
             if _PROF and dev.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
@@ -3056,9 +3292,12 @@ def train_nep(
                         si = batch["struct_idx"].unsqueeze(-1).expand_as(
                             res["virial"])
                         v_sys.scatter_add_(0, si, res["virial"])
-                        return v_sys[:, _VIRIAL_6] / na
-                    # 6 unique components only (see _VIRIAL_6).
-                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                        return virial6_for_loss(
+                            v_sys, raw_model.spin_mode
+                        ) / na
+                    v_ref_pa = virial6_for_loss(
+                        batch["virial"], raw_model.spin_mode
+                    ) / na
                     v_pred_pa = _v_pred_pa(result)
                     dv = (v_pred_pa - v_ref_pa) * vmf
                     loss = loss + cur_pref_v * ((dv ** 2).sum() / (6.0 * nv_b))
@@ -3072,16 +3311,22 @@ def train_nep(
                     m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 if has_mforces and batch["has_m"]:
+                    dm, m_dof, m_defined = magnetic_force_residual(
+                        result["mforces"], batch["mforces"],
+                        batch["spins"], mforce_mode,
+                    )
                     m_mask = (
                         batch["mforce_mask"]
                         & raw_model.spin_dof_type_active[
-                            batch["atom_types"]])
+                            batch["atom_types"]]
+                        & m_defined)
                     mmf = m_mask.to(dtype).unsqueeze(-1)
                     nm_b = mmf.sum()
-                    dm = (result["mforces"] - batch["mforces"]) * mmf
+                    dm = dm * mmf
                     loss = loss + cur_pref_m * (
-                        (dm ** 2).sum() / (3.0 * nm_b.clamp_min(1.0)))
-                    m_lm = (dm ** 2).sum() / 3.0
+                        dm.square().sum()
+                        / (m_dof * nm_b.clamp_min(1.0)))
+                    m_lm = dm.square().sum() / m_dof
 
                 if has_tau and batch["has_tau"]:
                     t_mask = (
@@ -3091,41 +3336,53 @@ def train_nep(
                     tmf = t_mask.to(dtype).unsqueeze(-1)
                     nt_b = tmf.sum()
                     dtau = (result["tau"] - batch["tau"]) * tmf
+                    tau_dof = 2 if raw_model.spin_mode == 3 else 3
                     loss = loss + cur_pref_tau * (
-                        (dtau ** 2).sum() / (3.0 * nt_b.clamp_min(1.0)))
-                    m_lt = (dtau ** 2).sum() / 3.0
+                        dtau.square().sum()
+                        / (tau_dof * nt_b.clamp_min(1.0)))
+                    m_lt = dtau.square().sum() / tau_dof
 
                 if response_batches:
-                    response_idx = response_batches[
-                        batch_index % len(response_batches)]
-                    response_batch = response_store.collate(response_idx)
-                    response_batch["need_mforce"] = True
-                    response_batch["need_tau"] = False
-                    response_result = compute_props_cached(
-                        response_batch, need_forces=False,
-                        need_virial=False, backend=train_backend,
-                        create_graph=True)
-                    curve_loss = generator_curve_loss(
-                        response_result["mforces"],
-                        response_batch["mforces"],
-                        response_batch["spin_tangent"],
-                        response_batch["struct_idx"],
-                        response_batch["response_group_ids"],
-                        response_batch["response_coordinates"],
-                        response_batch["num_structures"],
-                        normalization_scale=(
-                            response_store.generator_curve_scale))
-                    loss = loss + GENERATOR_CURVE_WEIGHT * curve_loss
+                    for response_idx, response_weight in response_batches[
+                            batch_index]:
+                        response_batch = response_store.collate(response_idx)
+                        response_batch["need_mforce"] = True
+                        response_batch["need_tau"] = False
+                        response_result = compute_props_cached(
+                            response_batch, need_forces=False,
+                            need_virial=False, backend=train_backend,
+                            create_graph=True)
+                        curve_loss = generator_curve_loss(
+                            response_result["mforces"],
+                            response_batch["mforces"],
+                            response_batch["spin_tangent"],
+                            response_batch["struct_idx"],
+                            response_batch["response_group_ids"],
+                            response_batch["response_coordinates"],
+                            response_batch["num_structures"],
+                            normalization_scale=(
+                                response_store.generator_curve_scale))
+                        loss = loss + (
+                            GENERATOR_CURVE_WEIGHT * response_weight
+                            * curve_loss
+                        )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # Scale the complete O3 gradient before clipping and AdamW.
+                # spin2 keeps its historical gradient gate; spin3 gates only
+                # the realized parameter displacement below.
                 raw_model.apply_spin_curriculum_gradients()
                 curriculum_rows = raw_model.capture_spin_curriculum_rows()
                 if max_grad_norm > 0:
+                    curriculum_clip_rows = prepare_spin3_curriculum_clip(
+                        raw_model
+                    )
                     gn_t = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_grad_norm)
+                    restore_spin3_curriculum_clip(
+                        raw_model, curriculum_clip_rows, gn_t, max_grad_norm
+                    )
                 else:
                     gn_t = torch.sqrt(sum(
                         p.grad.norm()**2 for p in raw_model.parameters()
@@ -3247,7 +3504,7 @@ def train_nep(
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
                     cur_pref_e, cur_pref_f, cur_pref_v,
-                    cur_pref_m, cur_pref_tau, dtype, dev)
+                    cur_pref_m, cur_pref_tau, dtype, dev, mforce_mode)
                 rmse_s_gpa = rmse_s * EV_PER_A3_TO_GPa
 
             response_metric = None
@@ -3272,7 +3529,7 @@ def train_nep(
                         compute_props, compute_props_cached,
                         use_autograd_forces, train_backend,
                         cur_pref_e, cur_pref_f, cur_pref_v,
-                        cur_pref_m, cur_pref_tau, dtype, dev)
+                        cur_pref_m, cur_pref_tau, dtype, dev, mforce_mode)
                 if in_stage2 and valid_response_store is not None:
                     valid_response_metric = evaluate_generator_curves(
                         valid_response_store, eval_batch_size, raw_model,
@@ -3429,7 +3686,7 @@ def train_nep(
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
                     cur_pref_e, cur_pref_f, cur_pref_v,
-                    cur_pref_m, cur_pref_tau, dtype, dev)
+                    cur_pref_m, cur_pref_tau, dtype, dev, mforce_mode)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()

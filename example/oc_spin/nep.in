@@ -5,13 +5,14 @@ basis_size 8 8
 l_max 4 2 0
 neuron 30
 
-spin_mode 2
+spin_mode 3
 spin_cutoff 6
 spin_l_max 2
 spin_compress 2
 spin_order 3
 spin_soc 1
 spin_curriculum 1
+spin_mforce_mode full
 spin_dof_type Fe Ge
 spin_env_type Fe Ge
 
@@ -22,7 +23,7 @@ lambda_e 0.01
 lambda_f 1.0
 lambda_v 0.01
 lambda_m 1.0
-lambda_tau 0.1
+lambda_tau 0.0
 
 stage2 1
 start_stage2 400
@@ -31,4 +32,4 @@ stage2_lambda_e 1.0
 stage2_lambda_f 0.05
 stage2_lambda_v 0.1
 stage2_lambda_m 1.0
-stage2_lambda_tau 0.1
+stage2_lambda_tau 0.0

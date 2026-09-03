@@ -29,8 +29,8 @@ from typing import Dict
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
 from .neighbor import build_neighbor_list, CellList
 from . import ops
-from .magnetic_polynomial import MagneticPolynomialDescriptor
 from .spin_schema import (
+    make_spin_descriptor,
     spin_projection_parameters,
     spin_projection_size,
 )
@@ -110,7 +110,8 @@ class NEPCalculator:
         version_str = header[0]  # "nep4", "nep4_zbl", etc.
         self.has_zbl = "zbl" in version_str
         header_spin_mode = (
-            2 if "spin2" in version_str
+            3 if "spin3" in version_str
+            else 2 if "spin2" in version_str
             else 0
         )
         self.spin_mode = header_spin_mode
@@ -157,7 +158,7 @@ class NEPCalculator:
                 if key == "spin_descriptor":
                     raise ValueError(
                         "spin_descriptor is not supported; the standalone "
-                        "O/C protocol uses spin_mode 2")
+                        "O/C protocol uses spin_mode 2 or 3")
                 if key not in allowed_spin_metadata:
                     raise ValueError(f"unknown O/C model metadata: {key}")
                 if key in seen_spin_metadata:
@@ -239,14 +240,16 @@ class NEPCalculator:
                 f"header declares spin_mode {header_spin_mode}, but the "
                 f"metadata block declares {self.spin_mode}"
             )
-        if self.spin_mode not in (0, 2):
-            raise ValueError("spin_mode must be 0 or 2")
+        if self.spin_mode not in (0, 2, 3):
+            raise ValueError("spin_mode must be 0, 2, or 3")
         self.spin_descriptor_kind = (
             "magnetic_polynomial"
             if self.spin_mode == 2
+            else "magnetic_polynomial_v3"
+            if self.spin_mode == 3
             else None
         )
-        if self.spin_mode == 2:
+        if self.spin_mode in (2, 3):
             required = {
                 "spin_baseline", "spin_basis_size", "spin_l_max",
                 "spin_compress", "spin_cutoff", "spin_order", "spin_soc",
@@ -263,7 +266,8 @@ class NEPCalculator:
                 raise ValueError("spin_soc must be 0 or 1")
             if self.spin_projection_size is None:
                 raise ValueError(
-                    "nep4_spin2 model is missing spin_projection_size"
+                    f"nep4_spin{self.spin_mode} model is missing "
+                    "spin_projection_size"
                 )
         if bool((self.spin_dof_type_active
                  & ~self.spin_env_type_active).any().item()):
@@ -343,7 +347,8 @@ class NEPCalculator:
         self.spin_descriptor = None
         self.spin_dim = 0
         if self.spin_mode:
-            self.spin_descriptor = MagneticPolynomialDescriptor(
+            self.spin_descriptor = make_spin_descriptor(
+                self.spin_mode,
                 spin_compress=self.spin_compress,
                 spin_l_max=self.spin_l_max[0],
                 spin_order=self.spin_order,
@@ -414,7 +419,7 @@ class NEPCalculator:
             di += c_spin_size
 
         expected_projection_size = spin_projection_size(self)
-        if self.spin_mode == 2:
+        if self.spin_mode in (2, 3):
             if self.spin_projection_size != expected_projection_size:
                 raise ValueError(
                     "spin_projection_size does not match the descriptor: "

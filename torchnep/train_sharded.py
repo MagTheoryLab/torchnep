@@ -57,6 +57,7 @@ from .response_training import (
     GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
     GENERATOR_CURVE_WEIGHT,
+    balanced_group_step_batches,
     complete_group_batches,
     generator_curve_loss,
     select_generator_curve_frames,
@@ -168,6 +169,10 @@ from .train import (
     format_config_summary,
     preprocess_structures, compute_max_neighbors,
     fit_energy_baseline_frames, spin_curriculum_scale,
+    spin_curriculum_end,
+    prepare_spin3_curriculum_clip, restore_spin3_curriculum_clip,
+    refresh_order3_q_scaler, reset_order3_optimizer_state,
+    magnetic_force_residual, virial6_for_loss,
     grouped_validation_indices, validate_spin_frames,
     validate_response_group_disjoint, build_data_lineage,
     validate_resume_data_lineage,
@@ -178,7 +183,7 @@ from .train import (
     evaluate_generator_curves,
     _make_optimizer, _make_lr_scheduler, _scheduler_step,
     _compile_check, _quiet_compile_logs, _maybe_enable_tf32,
-    _clean_warning_format, _default_alloc_conf, _VIRIAL_6,
+    _clean_warning_format, _default_alloc_conf,
 )
 
 
@@ -188,7 +193,8 @@ from .train import (
 
 @torch.no_grad()
 def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
-                               backend="loop", gpumd_init=False):
+                               backend="loop", gpumd_init=False,
+                               return_rms=False, local_real_flags=None):
     """Compute descriptor min/max over the local shard, then all-reduce.
 
     Uses cached basis from data_store (no Chebyshev recompute). batch_size
@@ -197,6 +203,10 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
     ``gpumd_init`` mirrors train.compute_q_scaler: False (default) uses the
     model's actual init coefficients (self-consistent); True forces all
     coefficients to 1.0, matching GPUMD's generation-0 q_scaler.
+
+    ``local_real_flags`` excludes the duplicate frames used only to equalize
+    DDP step counts.  Min/max are duplicate-invariant, but the spin3 RMS is
+    not, so padded atoms must never enter any scaler statistic.
     """
     model.eval()
     dev = next(model.parameters()).device
@@ -204,6 +214,16 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
 
     q_min = torch.full((model.dim,), float("inf"), dtype=dtype, device=dev)
     q_max = torch.full((model.dim,), float("-inf"), dtype=dtype, device=dev)
+    q_square_sum = (
+        torch.zeros(model.dim, dtype=dtype, device=dev)
+        if return_rms else None
+    )
+    q_count = torch.zeros((), dtype=torch.int64, device=dev)
+    if (local_real_flags is not None
+            and len(local_real_flags) != data_store.n):
+        raise ValueError(
+            "local_real_flags must contain one value per local frame"
+        )
 
     if gpumd_init:
         c2 = torch.ones_like(model.c_param_2)
@@ -217,7 +237,8 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
-        batch = data_store.collate(list(range(start, end)))
+        frame_indices = list(range(start, end))
+        batch = data_store.collate(frame_indices)
         q = ops.compute_descriptors_cached(
             batch["fk_rad"], batch["fk_ang"], batch["blm"],
             batch["pair_i_rad"], batch["pair_j_rad"],
@@ -243,13 +264,31 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
                 model.spin_env_type_active,
             )
             q = torch.cat((q, q_spin), dim=-1)
+        if local_real_flags is not None:
+            frame_is_real = torch.as_tensor(
+                local_real_flags[start:end], dtype=torch.bool, device=dev
+            )
+            atom_is_real = frame_is_real.index_select(0, batch["struct_idx"])
+            q = q[atom_is_real]
+        if q.shape[0] == 0:
+            continue
         q_min = torch.min(q_min, q.min(0).values)
         q_max = torch.max(q_max, q.max(0).values)
+        if return_rms:
+            q_square_sum.add_(q.square().sum(0))
+            q_count.add_(q.shape[0])
 
     dist.all_reduce(q_min, op=dist.ReduceOp.MIN)
     dist.all_reduce(q_max, op=dist.ReduceOp.MAX)
+    if return_rms:
+        dist.all_reduce(q_square_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(q_count, op=dist.ReduceOp.SUM)
 
     model.train()
+    if return_rms:
+        if int(q_count.item()) == 0:
+            raise ValueError("cannot compute q RMS from an empty dataset")
+        return q_min, q_max, (q_square_sum / q_count).sqrt()
     return q_min, q_max
 
 
@@ -480,6 +519,7 @@ def train_nep_sharded(
     pref_v             = config["lambda_v"]
     pref_m             = config["lambda_m"]
     pref_tau           = config["lambda_tau"]
+    mforce_mode        = config["spin_mforce_mode"]
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")
     stage2_lr          = config["stage2_lr"]
@@ -652,7 +692,7 @@ def train_nep_sharded(
             raise ValueError(f"valid_ratio must be in (0, 1), "
                              f"got {valid_ratio}")
         has_response_groups = any("response_group" in f for f in frames)
-        if config.get("spin_mode", 0) == 2 and has_response_groups:
+        if config.get("spin_mode", 0) in (2, 3) and has_response_groups:
             val_idx = grouped_validation_indices(frames, valid_ratio, run_seed)
             val_set = set(val_idx)
             train_idx = [i for i in range(len(frames)) if i not in val_set]
@@ -686,7 +726,7 @@ def train_nep_sharded(
             validate_spin_frames(contract_valid_frames, "validation")
     if valid_file is not None and not streamed:
         validate_response_group_disjoint(frames, valid_frames)
-    if streamed and config.get("spin_mode", 0) == 2:
+    if streamed and config.get("spin_mode", 0) in (2, 3):
         local_has_response = int(any(
             "response_group" in frame
             for frame in local_frames + (_stream_valid_local or [])))
@@ -701,10 +741,10 @@ def train_nep_sharded(
     else:
         response_frames = (
             select_generator_curve_frames(frames)
-            if config.get("spin_mode", 0) == 2 else [])
+            if config.get("spin_mode", 0) in (2, 3) else [])
     valid_response_frames = (
         select_generator_curve_frames(valid_frames)
-        if config.get("spin_mode", 0) == 2 and valid_frames is not None
+        if config.get("spin_mode", 0) in (2, 3) and valid_frames is not None
         else []
     )
     response_enabled = bool(response_frames)
@@ -961,9 +1001,10 @@ def train_nep_sharded(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode == 2 and not use_autograd_forces:
+    if model.spin_mode in (2, 3) and not use_autograd_forces:
         use_autograd_forces = True
-        _log("  spin_mode 2: using the full autograd E/F/V/MF/Tau path")
+        _log(f"  spin_mode {model.spin_mode}: using the full autograd "
+             "E/F/V/MF/Tau path")
     if energy_baseline_values is not None:
         baseline = torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev
@@ -1101,11 +1142,15 @@ def train_nep_sharded(
         # batch size so its transient GPU footprint stays batch-bound
         # (min/max is chunking-invariant — result unchanged).
         t_qs = time.time()
-        q_min, q_max = _compute_q_scaler_sharded(
+        q_stats = _compute_q_scaler_sharded(
             model, data_store, backend=backend,
             batch_size=batch_size,
-            gpumd_init=use_gpumd_qscaler)
-        model.set_q_scaler(q_min, q_max)
+            gpumd_init=use_gpumd_qscaler,
+            return_rms=model.spin_mode == 3,
+            local_real_flags=(
+                local_real_flags if model.spin_mode == 3 else None
+            ))
+        model.set_q_scaler(*q_stats)
         if cuda_available:
             torch.cuda.synchronize()
         _log(f"  q_scaler in {time.time() - t_qs:.1f}s "
@@ -1157,8 +1202,8 @@ def train_nep_sharded(
     curriculum_enabled = (
         raw_model.spin_curriculum and finetune_from is None
     )
-    curriculum_end = (
-        start_stage2 if stage2 else max(2, (2 * num_epochs) // 3)
+    curriculum_end = spin_curriculum_end(
+        raw_model.spin_mode, num_epochs, stage2, start_stage2
     )
     if curriculum_enabled and not 2 <= curriculum_end <= num_epochs:
         raise ValueError(
@@ -1171,6 +1216,8 @@ def train_nep_sharded(
         "curriculum_enabled": curriculum_enabled,
         "use_swa": bool(stage2 and use_swa),
     }
+    if raw_model.spin_mode == 3:
+        schedule_state["order3_scaler_refreshed"] = False
 
     # SWA window: average only the tail of the run (default: the last 100
     # epochs). Averaging the whole of stage 2 drags the energy back toward
@@ -1194,7 +1241,8 @@ def train_nep_sharded(
             store, eval_bs, raw_model,
             raw_model.compute_properties, _shim._compute_cached,
             use_autograd_forces, train_backend,
-            need_forces, need_virial, need_mforce, need_tau, dtype, dev)
+            need_forces, need_virial, need_mforce, need_tau, dtype, dev,
+            mforce_mode)
         sums_t = torch.tensor(sums, device=dev, dtype=torch.float64)
         dist.all_reduce(sums_t)
         (s_le, s_lf, s_lv, s_ls, s_lm, s_lt,
@@ -1264,6 +1312,11 @@ def train_nep_sharded(
             float(response_store.generator_curve_scale.item())
             if response_enabled else 0.0),
     }
+    if raw_model.spin_mode == 3:
+        cur_loss_weights["spin_mforce_mode"] = mforce_mode
+        cur_loss_weights["generator_curve_step_balance"] = (
+            "exact-per-epoch" if response_enabled else None
+        )
 
     # resume_ckpt / ckpt_path were resolved before data loading (the seed
     # peek); here the full training state is actually restored.
@@ -1302,6 +1355,10 @@ def train_nep_sharded(
         )
         saved_schedule = info.get("schedule_state")
         if saved_schedule is not None:
+            if raw_model.spin_mode == 3:
+                schedule_state["order3_scaler_refreshed"] = bool(
+                    saved_schedule.get("order3_scaler_refreshed", False)
+                )
             saved_stage2_start = saved_schedule.get("stage2_start")
             saved_use_swa = bool(saved_schedule.get("use_swa", False))
             if info["in_stage2"]:
@@ -1500,10 +1557,33 @@ def train_nep_sharded(
                 raw_model.set_spin_curriculum_scale(scale)
                 warmup_end = max(1, curriculum_end // 2)
                 if epoch in (start_epoch, warmup_end, curriculum_end):
+                    scale_name = (
+                        "step_scale" if raw_model.spin_mode == 3
+                        else "gradient_scale"
+                    )
                     _log(
                         f"  O3 curriculum epoch {epoch}: "
-                        f"gradient_scale={scale:.6f}"
+                        f"{scale_name}={scale:.6f}"
                     )
+                if (raw_model.spin_mode == 3 and curriculum_enabled
+                        and epoch == warmup_end + 1
+                        and not schedule_state["order3_scaler_refreshed"]):
+                    fresh_stats = _compute_q_scaler_sharded(
+                        raw_model, data_store, backend=backend,
+                        batch_size=batch_size, gpumd_init=False,
+                        return_rms=True,
+                        local_real_flags=local_real_flags,
+                    )
+                    if not refresh_order3_q_scaler(
+                            raw_model, *fresh_stats):
+                        raise RuntimeError(
+                            "spin3 O3 q_scaler refresh lost its zero-row "
+                            "function-preserving precondition"
+                        )
+                    reset_order3_optimizer_state(raw_model, optimizer)
+                    schedule_state["order3_scaler_refreshed"] = True
+                    _log("  O3 curriculum: refreshed order-3 q_scaler and "
+                         "reset its Adam moments")
 
             # Per-epoch local frame shuffle. Each rank independently
             # permutes its own n_local frames (different seeds across ranks
@@ -1603,22 +1683,29 @@ def train_nep_sharded(
                 raw_model.spin_descriptor is not None
                 and global_has_tau and cur_pref_tau > 0)
 
-            # The response subset is deliberately replicated.  Every rank
-            # selects the same complete group and DDP therefore averages an
-            # identical response gradient while reducing the sharded ordinary
-            # gradient.  At a matched optimizer step this forms
-            # L_ordinary + lambda_R L_response.  Cross-world-size trajectory
-            # comparisons additionally require a fixed global batch and the
-            # same number/order of optimizer steps.
-            response_batches = (
-                complete_group_batches(
-                    response_store.response_group_ids, 1,
-                    seed=run_seed + epoch)
-                if in_stage2 and response_store is not None else []
-            )
-
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_local, batch_size)]
+            # The response subset is deliberately replicated. Every rank uses
+            # the same group schedule, so DDP averages an identical response
+            # gradient while reducing the sharded ordinary gradient. spin3
+            # balances every group's total coefficient within the epoch.
+            if in_stage2 and response_store is not None:
+                if raw_model.spin_mode == 3:
+                    response_batches = balanced_group_step_batches(
+                        response_store.response_group_ids,
+                        len(batch_indices), seed=run_seed + epoch,
+                    )
+                else:
+                    legacy = complete_group_batches(
+                        response_store.response_group_ids, 1,
+                        seed=run_seed + epoch,
+                    )
+                    response_batches = [
+                        [(legacy[index % len(legacy)], 1.0)]
+                        for index in range(len(batch_indices))
+                    ]
+            else:
+                response_batches = []
             for batch_index, batch in enumerate(
                     iter_collated(data_store, batch_indices)):
 
@@ -1633,8 +1720,16 @@ def train_nep_sharded(
                 active = (
                     raw_model.spin_dof_type_active[batch["atom_types"]]
                     if has_mforces or has_tau else None)
-                m_mask = (
-                    batch["mforce_mask"] & active if has_mforces else None)
+                if has_mforces:
+                    m_diff, m_dof, m_defined = magnetic_force_residual(
+                        result["mforces"], batch["mforces"],
+                        batch["spins"], mforce_mode,
+                    )
+                    m_mask = batch["mforce_mask"] & active & m_defined
+                else:
+                    m_diff = None
+                    m_dof = 3
+                    m_mask = None
                 t_mask = batch["tau_mask"] & active if has_tau else None
                 emf = batch["energy_mask"].to(dtype)
                 fmf = (batch["force_mask"].to(dtype).unsqueeze(-1)
@@ -1707,11 +1802,13 @@ def train_nep_sharded(
                         si = batch["struct_idx"].unsqueeze(-1).expand_as(
                             res["virial"])
                         v_sys.scatter_add_(0, si, res["virial"])
-                        return v_sys[:, _VIRIAL_6] / na
-                    # 6 unique components only (see _VIRIAL_6); all 9 would
-                    # weight the symmetric off-diagonals twice.
+                        return virial6_for_loss(
+                            v_sys, raw_model.spin_mode
+                        ) / na
                     v_pred_pa = _v_pred_pa(result)
-                    v_ref_pa = batch["virial"][:, _VIRIAL_6] / na
+                    v_ref_pa = virial6_for_loss(
+                        batch["virial"], raw_model.spin_mode
+                    ) / na
                     dv = (v_pred_pa - v_ref_pa) * vmf
                     # 6 components per frame -> divide by (6 * n_v_g)
                     loss = loss + cur_pref_v * (dv ** 2).sum() * ws / (6.0 * cg[2])
@@ -1724,53 +1821,66 @@ def train_nep_sharded(
                     m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 if mmf is not None and batch["has_m"]:
-                    m_diff = (result["mforces"] - batch["mforces"]) * mmf
-                    sum_sq_m = (m_diff ** 2).sum()
-                    loss = loss + cur_pref_m * sum_sq_m * ws / (3.0 * cg[3])
-                    m_lm = sum_sq_m / 3.0
+                    masked_m_diff = m_diff * mmf
+                    sum_sq_m = masked_m_diff.square().sum()
+                    loss = loss + (
+                        cur_pref_m * sum_sq_m * ws / (m_dof * cg[3])
+                    )
+                    m_lm = sum_sq_m / m_dof
 
                 if tmf is not None and batch["has_tau"]:
                     t_diff = (result["tau"] - batch["tau"]) * tmf
-                    sum_sq_t = (t_diff ** 2).sum()
-                    loss = loss + cur_pref_tau * sum_sq_t * ws / (3.0 * cg[4])
-                    m_lt = sum_sq_t / 3.0
+                    sum_sq_t = t_diff.square().sum()
+                    tau_dof = 2 if raw_model.spin_mode == 3 else 3
+                    loss = loss + (
+                        cur_pref_tau * sum_sq_t * ws / (tau_dof * cg[4])
+                    )
+                    m_lt = sum_sq_t / tau_dof
 
                 if response_batches:
-                    response_idx = response_batches[
-                        batch_index % len(response_batches)]
-                    response_batch = response_store.collate(response_idx)
-                    response_batch["need_mforce"] = True
-                    response_batch["need_tau"] = False
-                    # Use the raw model for the replicated branch.  The
-                    # ordinary DDP forward has already armed the reducer; its
-                    # parameter hooks therefore all-reduce the summed
-                    # ordinary+response gradient in the single backward.
-                    response_result = raw_model.compute_properties_cached(
-                        response_batch, need_forces=False,
-                        need_virial=False, backend=train_backend,
-                        create_graph=True)
-                    curve_loss = generator_curve_loss(
-                        response_result["mforces"],
-                        response_batch["mforces"],
-                        response_batch["spin_tangent"],
-                        response_batch["struct_idx"],
-                        response_batch["response_group_ids"],
-                        response_batch["response_coordinates"],
-                        response_batch["num_structures"],
-                        normalization_scale=(
-                            response_store.generator_curve_scale))
-                    loss = loss + GENERATOR_CURVE_WEIGHT * curve_loss
+                    for response_idx, response_weight in response_batches[
+                            batch_index]:
+                        response_batch = response_store.collate(response_idx)
+                        response_batch["need_mforce"] = True
+                        response_batch["need_tau"] = False
+                        # Use raw_model for the replicated branch. The ordinary
+                        # DDP forward already armed the reducer, whose hooks
+                        # all-reduce the summed ordinary+response gradient.
+                        response_result = raw_model.compute_properties_cached(
+                            response_batch, need_forces=False,
+                            need_virial=False, backend=train_backend,
+                            create_graph=True)
+                        curve_loss = generator_curve_loss(
+                            response_result["mforces"],
+                            response_batch["mforces"],
+                            response_batch["spin_tangent"],
+                            response_batch["struct_idx"],
+                            response_batch["response_group_ids"],
+                            response_batch["response_coordinates"],
+                            response_batch["num_structures"],
+                            normalization_scale=(
+                                response_store.generator_curve_scale))
+                        loss = loss + (
+                            GENERATOR_CURVE_WEIGHT * response_weight
+                            * curve_loss
+                        )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # Apply the same complete-gradient curriculum on every rank
-                # after DDP reduction and before clipping/AdamW.
+                # spin2 applies its historical gradient gate after DDP
+                # reduction; spin3 gates only the realized displacement.
                 raw_model.apply_spin_curriculum_gradients()
                 curriculum_rows = raw_model.capture_spin_curriculum_rows()
                 if max_grad_norm > 0:
+                    curriculum_clip_rows = prepare_spin3_curriculum_clip(
+                        raw_model
+                    )
                     gn_t = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_grad_norm)
+                    restore_spin3_curriculum_clip(
+                        raw_model, curriculum_clip_rows, gn_t, max_grad_norm
+                    )
                 else:
                     gn_t = torch.sqrt(sum(
                         p.grad.norm() ** 2 for p in raw_model.parameters()

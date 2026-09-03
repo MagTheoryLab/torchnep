@@ -19,8 +19,9 @@ A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (
 - 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
 - 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
 - 🧲 **O/C magnetic potentials** — order-nested, radially compressed spin
-  descriptors with conservative magnetic forces and torques. Versioned
-  `nep4_spin2` models require an O/C-aware downstream reader
+  descriptors with conservative magnetic forces and torques. The recommended
+  `nep4_spin3` format adds angle-resolved fourth-order exchange;
+  `nep4_spin2` remains available as the frozen historical format
 
 ---
 
@@ -86,7 +87,12 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 - `spin:R:3`, `spins:R:3`, `moment:R:3`, or `moments:R:3` — atomic
   magnetic moment vector.
 - `mforce:R:3`, `mforces:R:3`, or `magnetic_force:R:3` — magnetic
-  force reference. Torque is derived as `spin x mforce`.
+  force reference, using the convention \(m=-\partial E/\partial S\).
+  `spin_mforce_mode full` requires both longitudinal and transverse
+  components. For fixed-magnitude constrained-DFT fields, use
+  `spin_mforce_mode transverse`; zero-moment sites are omitted from that
+  loss. Torque is derived as \(\tau=S\times m\), not predicted by a
+  separate head.
 - `spin_tangent:R:3` or `response_tangent:R:3` — the controlled rotation
   tangent `dS/dtheta`. Together with rotation response metadata and magnetic
   forces, this supervises both the group mean and centered shape of
@@ -108,23 +114,29 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `neuron` | `30` | Neurons in the (single) hidden layer |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
-| `spin_mode` | `0` | Set to `2` for the versioned O/C magnetic model |
+| `spin_mode` | `0` | Set to `3` for the recommended O/C model; `2` selects the frozen historical format |
 | `spin_order` | `3` | Magnetic correlation order O (`1`–`3`) |
 | `spin_compress` | `2` | Shared magnetic radial rank C (`1`–`9` with the fixed B8 basis) |
 | `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
 | `spin_cutoff` | `6` | Magnetic neighbor cutoff (Å) |
 | `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
 | `spin_curriculum` | `1` for O3 | Use the O2-to-O3 training curriculum (`0` or `1`); it does not change the exported potential or inference cost |
+| `spin_mforce_mode` | required for spin3 | Magnetic-force contract: `full` or fixed-magnitude `transverse`; it must be explicit to prevent a silent label-convention mismatch |
 | `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
 | `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
 
-For O/C spin models set `spin_mode 2`. The production default is O3-C2:
+For new O/C spin models set `spin_mode 3`. The production default is
+O3-C2-L2-SOC:
 `spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
 `spin_soc 1`. Fresh O3 training enables the O2-to-O3 curriculum by default;
 set `spin_curriculum 0` to train the complete O3 model from the first epoch.
 The switch changes training only and is not written into the exported model.
+`nep4_spin3` has 55 magnetic coordinates with exact O1/O2/O3 prefix
+dimensions 9/43/55. The historical `nep4_spin2` 49-dimensional layout and
+training defaults are unchanged.
 See
-[the production design and response-data contract](example/oc_spin/README.md) and
+[the frozen spin3 descriptor contract](example/oc_spin/NEP4_SPIN3.md),
+[the production design and response-data contract](example/oc_spin/README.md), and
 [the complete example](example/oc_spin/nep.in).
 
 ### Training hyperparameters
@@ -139,7 +151,7 @@ See
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
 | `lambda_m` | `1.0` | Magnetic-force loss weight |
-| `lambda_tau` | `0.0` | Spin-torque loss weight |
+| `lambda_tau` | `0.0` | Extra \(|S|^2\)-weighted transverse magnetic-force loss; spin3 torque RMSE uses its two intrinsic components |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
@@ -336,7 +348,7 @@ train_nep(
 
 `finetune_from` accepts:
 - `nep.txt` — structural GPUMD text models or versioned TorchNEP
-  `nep4_spin2` models, with full semantic architecture validation
+  `nep4_spin2`/`nep4_spin3` models, with full semantic architecture validation
 - `checkpoint.pt` — full checkpoint (weights are extracted automatically)
 
 If the new dataset contains fewer element types than the original model, `slim_types=True` removes the unused types **before training begins**, shrinking the model and speeding up training.
@@ -414,13 +426,15 @@ parts = atoms.calc.get_components()
 print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 ```
 
-For `nep4_spin2`, attach an `(N,3)` `spins` array before evaluation;
+For `nep4_spin2` or `nep4_spin3`, attach an `(N,3)` `spins` array before
+evaluation;
 `atoms.calc.results["mforces"]` and `atoms.calc.results["tau"]` are then
 available. Spin models can also use `zbl` and the same NEP/ZBL component-split
 helper; because ZBL is spin-independent, it contributes no magnetic force or
-torque. TorchNEP exports this combination as `nep4_spin2_zbl`; the current
-GPUMD and NEPAdapters spin readers still accept only `nep4_spin2`, so that text
-model needs a downstream reader/parity update before deployment there.
+torque. TorchNEP exports the new combination as `nep4_spin3_zbl`. Current
+GPUMD and NEPAdapters spin readers still accept only `nep4_spin2`; a spin3
+text model therefore needs a downstream reader and full derivative-parity
+update before deployment there.
 
 ### Full-dataset prediction
 

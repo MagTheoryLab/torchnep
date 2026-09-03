@@ -24,6 +24,7 @@
 /study
 /4body*
 /descriptor_experiment/
+/diagnostics/
 # Local-only scratch: multi-card repro scripts, temp configs, run outputs.
 /scratch/
 # Local-only benchmarks (compile / autograd vs analytical speed tests).
@@ -34,3 +35,10 @@
 /learn/
 /test_stream/
 /Torch*/
+# APFS Git matching is case-insensitive; keep the source package available for
+# new tracked modules while still ignoring root-level Torch* scratch trees.
+!/torchnep/
+!/torchnep/**
+# Local interpreter/build caches can be recreated and must not enter reviews.
+__pycache__/
+/tmp/

@@ -186,6 +186,14 @@ def test_response_benchmark_has_distinct_standard_and_generator_recipes(
     assert config["lambda_m"] == 0.1
     assert config["stage2_pref_m"] == 3.0
 
+    spin3_path = tmp_path / "nep-spin3.in"
+    write_response_benchmark_config(
+        spin3_path, 20, 0.1, 3.0, spin_mode=3
+    )
+    spin3 = parse_nep_in(spin3_path)
+    assert spin3["spin_mode"] == 3
+    assert spin3["spin_mforce_mode"] == "full"
+
 
 def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
     path = tmp_path / "nep.in"

@@ -14,6 +14,8 @@ constexpr int B = 9;
 constexpr int BankWidth = 85;
 constexpr int AuxWidth = 8;
 constexpr int EdgeAnchorWidth = 6;
+constexpr int V3Width = 16;
+constexpr int V3AngularWidth = 6;
 constexpr int ChannelStride = 38;
 constexpr int M = 0;
 constexpr int P = 3;
@@ -273,9 +275,25 @@ __device__ void forward_edge(
 }
 
 template <typename S>
+__device__ void forward_v3_extra(
+    const EdgeState<S>& state, S* extra) {
+  for (int k = 0; k < V3Width; ++k) extra[k] = S(0);
+  for (int c = 0; c < C; ++c) {
+    const int base = 8 * c;
+    const S amplitude = state.weight[c] * state.dot;
+    for (int d = 0; d < 3; ++d) {
+      extra[base + d] = amplitude * state.rhat[d];
+    }
+    for (int k = 0; k < 5; ++k) {
+      extra[base + 3 + k] = amplitude * state.qrr[k];
+    }
+  }
+}
+
+template <typename S>
 __device__ void reverse_edge(
     const EdgeState<S>& state, const S* coefficient,
-    const S* grad_bank, const S* grad_aux,
+    const S* grad_bank, const S* grad_aux, const S* grad_v3,
     S* grad_rij, S* grad_si, S* grad_sj, S* grad_coefficient) {
   S grad_weight[C] = {S(0), S(0)};
   S grad_rhat[3] = {S(0), S(0), S(0)};
@@ -377,6 +395,23 @@ __device__ void reverse_edge(
   for (int d = 0; d < 3; ++d) grad_rhat[d] += grad_aux[2 + d];
   S omega_pull[3] = {grad_aux[5], grad_aux[6], grad_aux[7]};
   add_cross_pull(state.si, state.sj, omega_pull, grad_si, grad_sj);
+  if (grad_v3 != nullptr) {
+    for (int c = 0; c < C; ++c) {
+      const int base = 8 * c;
+      const S first_contract = dot3(grad_v3 + base, state.rhat);
+      S second_contract = S(0);
+      for (int k = 0; k < 5; ++k) {
+        second_contract += grad_v3[base + 3 + k] * state.qrr[k];
+        grad_q[k] += state.weight[c] * state.dot
+            * grad_v3[base + 3 + k];
+      }
+      grad_weight[c] += state.dot * (first_contract + second_contract);
+      grad_dot += state.weight[c] * (first_contract + second_contract);
+      for (int d = 0; d < 3; ++d) {
+        grad_rhat[d] += state.weight[c] * state.dot * grad_v3[base + d];
+      }
+    }
+  }
   S qr_left[3] = {S(0), S(0), S(0)};
   S qr_right[3] = {S(0), S(0), S(0)};
   add_stf5_pull(
@@ -815,7 +850,9 @@ __global__ void bank_backward_kernel(
   scalar_t local_rij[3], local_si[3], local_sj[3], local_coeff[C * B];
   reverse_edge(
       state, coeff, grad_bank + i * BankWidth,
-      grad_aux + edge * AuxWidth, local_rij, local_si, local_sj, local_coeff);
+      grad_aux + edge * AuxWidth,
+      static_cast<const scalar_t*>(nullptr),
+      local_rij, local_si, local_sj, local_coeff);
   for (int d = 0; d < 3; ++d) {
     grad_rij[3 * edge + d] = local_rij[d];
     atomicAdd(grad_spins + 3 * i + d, local_si[d]);
@@ -882,6 +919,7 @@ __global__ void bank_double_backward_kernel(
   Dual<scalar_t> local_coeff[C * B];
   reverse_edge(
       state, coeff, go_bank, go_aux,
+      static_cast<const Dual<scalar_t>*>(nullptr),
       local_rij, local_si, local_sj, local_coeff);
   for (int d = 0; d < 3; ++d) {
     grad2_rij[3 * edge + d] = local_rij[d].d;
@@ -891,6 +929,267 @@ __global__ void bank_double_backward_kernel(
   for (int k = 0; k < C * B; ++k) {
     atomicAdd(
         grad2_coefficient + coefficient_offset + k, local_coeff[k].d);
+  }
+}
+
+template <typename scalar_t>
+__global__ void bank_v3_forward_kernel(
+    const scalar_t* rij, const int64_t* pair_i, const int64_t* pair_j,
+    const scalar_t* spins, const int64_t* atom_types,
+    const scalar_t* coefficient, const bool* dof_active,
+    const bool* env_active, int64_t edges, int64_t types,
+    double cutoff, double eps, scalar_t* bank, scalar_t* extra,
+    scalar_t* aux) {
+  const int64_t edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edges) return;
+  const int64_t i = pair_i[edge];
+  const int64_t j = pair_j[edge];
+  const int64_t ti = atom_types[i];
+  const int64_t tj = atom_types[j];
+  const scalar_t* coeff = coefficient + ((ti * types + tj) * C * B);
+  EdgeState<scalar_t> state;
+  make_state(
+      rij + 3 * edge, spins + 3 * i, spins + 3 * j, coeff,
+      dof_active[ti] && env_active[tj], cutoff, eps, &state);
+  scalar_t local_bank[BankWidth], local_extra[V3Width], local_aux[AuxWidth];
+  forward_edge(state, local_bank, local_aux);
+  forward_v3_extra(state, local_extra);
+  for (int k = 0; k < BankWidth; ++k) {
+    atomicAdd(bank + i * BankWidth + k, local_bank[k]);
+  }
+  for (int k = 0; k < V3Width; ++k) {
+    atomicAdd(extra + i * V3Width + k, local_extra[k]);
+  }
+  for (int k = 0; k < AuxWidth; ++k) {
+    aux[edge * AuxWidth + k] = local_aux[k];
+  }
+}
+
+template <typename scalar_t>
+__global__ void bank_v3_backward_kernel(
+    const scalar_t* grad_bank, const scalar_t* grad_extra,
+    const scalar_t* grad_aux, const scalar_t* rij,
+    const int64_t* pair_i, const int64_t* pair_j, const scalar_t* spins,
+    const int64_t* atom_types, const scalar_t* coefficient,
+    const bool* dof_active, const bool* env_active,
+    int64_t edges, int64_t types, double cutoff, double eps,
+    scalar_t* grad_rij, scalar_t* grad_spins,
+    scalar_t* grad_coefficient) {
+  const int64_t edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edges) return;
+  const int64_t i = pair_i[edge];
+  const int64_t j = pair_j[edge];
+  const int64_t ti = atom_types[i];
+  const int64_t tj = atom_types[j];
+  const int64_t coefficient_offset = (ti * types + tj) * C * B;
+  const scalar_t* coeff = coefficient + coefficient_offset;
+  EdgeState<scalar_t> state;
+  make_state(
+      rij + 3 * edge, spins + 3 * i, spins + 3 * j, coeff,
+      dof_active[ti] && env_active[tj], cutoff, eps, &state);
+  scalar_t local_rij[3], local_si[3], local_sj[3], local_coeff[C * B];
+  reverse_edge(
+      state, coeff, grad_bank + i * BankWidth,
+      grad_aux + edge * AuxWidth, grad_extra + i * V3Width,
+      local_rij, local_si, local_sj, local_coeff);
+  for (int d = 0; d < 3; ++d) {
+    grad_rij[3 * edge + d] = local_rij[d];
+    atomicAdd(grad_spins + 3 * i + d, local_si[d]);
+    atomicAdd(grad_spins + 3 * j + d, local_sj[d]);
+  }
+  for (int k = 0; k < C * B; ++k) {
+    atomicAdd(grad_coefficient + coefficient_offset + k, local_coeff[k]);
+  }
+}
+
+template <typename scalar_t>
+__global__ void bank_v3_double_backward_kernel(
+    const scalar_t* grad_bank, const scalar_t* grad_extra,
+    const scalar_t* grad_aux, const scalar_t* rij,
+    const int64_t* pair_i, const int64_t* pair_j, const scalar_t* spins,
+    const int64_t* atom_types, const scalar_t* coefficient,
+    const bool* dof_active, const bool* env_active,
+    const scalar_t* h_rij, const scalar_t* h_spins,
+    const scalar_t* h_coefficient, int64_t edges, int64_t types,
+    double cutoff, double eps, scalar_t* grad2_bank,
+    scalar_t* grad2_extra, scalar_t* grad2_aux,
+    scalar_t* grad2_rij, scalar_t* grad2_spins,
+    scalar_t* grad2_coefficient) {
+  const int64_t edge = blockIdx.x * blockDim.x + threadIdx.x;
+  if (edge >= edges) return;
+  const int64_t i = pair_i[edge];
+  const int64_t j = pair_j[edge];
+  const int64_t ti = atom_types[i];
+  const int64_t tj = atom_types[j];
+  const int64_t coefficient_offset = (ti * types + tj) * C * B;
+  Dual<scalar_t> rr[3], si[3], sj[3], coeff[C * B];
+  for (int d = 0; d < 3; ++d) {
+    rr[d] = {rij[3 * edge + d], h_rij[3 * edge + d]};
+    si[d] = {spins[3 * i + d], h_spins[3 * i + d]};
+    sj[d] = {spins[3 * j + d], h_spins[3 * j + d]};
+  }
+  for (int k = 0; k < C * B; ++k) {
+    coeff[k] = {
+        coefficient[coefficient_offset + k],
+        h_coefficient[coefficient_offset + k]};
+  }
+  EdgeState<Dual<scalar_t>> state;
+  make_state(
+      rr, si, sj, coeff, dof_active[ti] && env_active[tj],
+      cutoff, eps, &state);
+  Dual<scalar_t> local_bank[BankWidth], local_extra[V3Width];
+  Dual<scalar_t> local_aux[AuxWidth];
+  forward_edge(state, local_bank, local_aux);
+  forward_v3_extra(state, local_extra);
+  for (int k = 0; k < BankWidth; ++k) {
+    atomicAdd(grad2_bank + i * BankWidth + k, local_bank[k].d);
+  }
+  for (int k = 0; k < V3Width; ++k) {
+    atomicAdd(grad2_extra + i * V3Width + k, local_extra[k].d);
+  }
+  for (int k = 0; k < AuxWidth; ++k) {
+    grad2_aux[edge * AuxWidth + k] = local_aux[k].d;
+  }
+
+  Dual<scalar_t> go_bank[BankWidth], go_extra[V3Width], go_aux[AuxWidth];
+  for (int k = 0; k < BankWidth; ++k) {
+    go_bank[k] = {grad_bank[i * BankWidth + k], scalar_t(0)};
+  }
+  for (int k = 0; k < V3Width; ++k) {
+    go_extra[k] = {grad_extra[i * V3Width + k], scalar_t(0)};
+  }
+  for (int k = 0; k < AuxWidth; ++k) {
+    go_aux[k] = {grad_aux[edge * AuxWidth + k], scalar_t(0)};
+  }
+  Dual<scalar_t> local_rij[3], local_si[3], local_sj[3];
+  Dual<scalar_t> local_coeff[C * B];
+  reverse_edge(
+      state, coeff, go_bank, go_aux, go_extra,
+      local_rij, local_si, local_sj, local_coeff);
+  for (int d = 0; d < 3; ++d) {
+    grad2_rij[3 * edge + d] = local_rij[d].d;
+    atomicAdd(grad2_spins + 3 * i + d, local_si[d].d);
+    atomicAdd(grad2_spins + 3 * j + d, local_sj[d].d);
+  }
+  for (int k = 0; k < C * B; ++k) {
+    atomicAdd(
+        grad2_coefficient + coefficient_offset + k, local_coeff[k].d);
+  }
+}
+
+template <typename scalar_t>
+__global__ void angular_center_v3_forward_kernel(
+    const scalar_t* moment, const scalar_t* same, int64_t atoms,
+    scalar_t* output) {
+  const int64_t atom = blockIdx.x * blockDim.x + threadIdx.x;
+  if (atom >= atoms) return;
+  const scalar_t* local = moment + atom * V3Width;
+  const scalar_t* diagonal = same + atom * 3;
+  scalar_t* result = output + atom * V3AngularWidth;
+  for (int pair = 0; pair < 3; ++pair) {
+    const int left = pair == 2 ? 1 : 0;
+    const int right = pair == 0 ? 0 : 1;
+    scalar_t rank1 = scalar_t(0);
+    scalar_t rank2 = scalar_t(0);
+    for (int d = 0; d < 3; ++d) {
+      rank1 += local[8 * left + d] * local[8 * right + d];
+    }
+    for (int k = 0; k < 5; ++k) {
+      rank2 += local[8 * left + 3 + k] *
+          local[8 * right + 3 + k];
+    }
+    result[pair] = rank1 - diagonal[pair];
+    result[3 + pair] = scalar_t(1.5) * rank2 - diagonal[pair];
+  }
+}
+
+template <typename scalar_t>
+__global__ void angular_center_v3_backward_kernel(
+    const scalar_t* grad_output, const scalar_t* moment, int64_t atoms,
+    scalar_t* grad_moment, scalar_t* grad_same) {
+  const int64_t atom = blockIdx.x * blockDim.x + threadIdx.x;
+  if (atom >= atoms) return;
+  const scalar_t* local = moment + atom * V3Width;
+  const scalar_t* pull = grad_output + atom * V3AngularWidth;
+  scalar_t* grad_local = grad_moment + atom * V3Width;
+  scalar_t* grad_diagonal = grad_same + atom * 3;
+  for (int k = 0; k < V3Width; ++k) grad_local[k] = scalar_t(0);
+  for (int pair = 0; pair < 3; ++pair) {
+    const int left = pair == 2 ? 1 : 0;
+    const int right = pair == 0 ? 0 : 1;
+    const scalar_t rank1_pull = pull[pair];
+    const scalar_t rank2_pull = scalar_t(1.5) * pull[3 + pair];
+    for (int d = 0; d < 3; ++d) {
+      const int ld = 8 * left + d;
+      const int rd = 8 * right + d;
+      if (left == right) {
+        grad_local[ld] += scalar_t(2) * rank1_pull * local[ld];
+      } else {
+        grad_local[ld] += rank1_pull * local[rd];
+        grad_local[rd] += rank1_pull * local[ld];
+      }
+    }
+    for (int k = 0; k < 5; ++k) {
+      const int lk = 8 * left + 3 + k;
+      const int rk = 8 * right + 3 + k;
+      if (left == right) {
+        grad_local[lk] += scalar_t(2) * rank2_pull * local[lk];
+      } else {
+        grad_local[lk] += rank2_pull * local[rk];
+        grad_local[rk] += rank2_pull * local[lk];
+      }
+    }
+    grad_diagonal[pair] = -(pull[pair] + pull[3 + pair]);
+  }
+}
+
+template <typename scalar_t>
+__global__ void angular_center_v3_double_backward_kernel(
+    const scalar_t* grad_output, const scalar_t* moment,
+    const scalar_t* h_moment, const scalar_t* h_same, int64_t atoms,
+    scalar_t* grad2_output, scalar_t* grad2_moment) {
+  const int64_t atom = blockIdx.x * blockDim.x + threadIdx.x;
+  if (atom >= atoms) return;
+  const scalar_t* local = moment + atom * V3Width;
+  const scalar_t* direction = h_moment + atom * V3Width;
+  const scalar_t* diagonal_direction = h_same + atom * 3;
+  const scalar_t* pull = grad_output + atom * V3AngularWidth;
+  scalar_t* grad_pull = grad2_output + atom * V3AngularWidth;
+  scalar_t* grad_local = grad2_moment + atom * V3Width;
+  for (int k = 0; k < V3Width; ++k) grad_local[k] = scalar_t(0);
+  for (int pair = 0; pair < 3; ++pair) {
+    const int left = pair == 2 ? 1 : 0;
+    const int right = pair == 0 ? 0 : 1;
+    scalar_t rank1_direction = scalar_t(0);
+    scalar_t rank2_direction = scalar_t(0);
+    for (int d = 0; d < 3; ++d) {
+      const int ld = 8 * left + d;
+      const int rd = 8 * right + d;
+      rank1_direction += direction[ld] * local[rd] +
+          local[ld] * direction[rd];
+      if (left == right) {
+        grad_local[ld] += scalar_t(2) * pull[pair] * direction[ld];
+      } else {
+        grad_local[ld] += pull[pair] * direction[rd];
+        grad_local[rd] += pull[pair] * direction[ld];
+      }
+    }
+    for (int k = 0; k < 5; ++k) {
+      const int lk = 8 * left + 3 + k;
+      const int rk = 8 * right + 3 + k;
+      rank2_direction += direction[lk] * local[rk] +
+          local[lk] * direction[rk];
+      const scalar_t scaled_pull = scalar_t(1.5) * pull[3 + pair];
+      if (left == right) {
+        grad_local[lk] += scalar_t(2) * scaled_pull * direction[lk];
+      } else {
+        grad_local[lk] += scaled_pull * direction[rk];
+        grad_local[rk] += scaled_pull * direction[lk];
+      }
+    }
+    grad_pull[pair] = rank1_direction - diagonal_direction[pair];
+    grad_pull[3 + pair] =
+        scalar_t(1.5) * rank2_direction - diagonal_direction[pair];
   }
 }
 
@@ -952,6 +1251,20 @@ void check_edge_anchor_inputs(
   TORCH_CHECK(bank.scalar_type() == auxiliary.scalar_type() &&
               bank.scalar_type() == mix.scalar_type(),
               "edge-anchor floating tensors must share dtype");
+}
+
+void check_angular_center_v3_inputs(
+    const torch::Tensor& moment, const torch::Tensor& same) {
+  TORCH_CHECK(moment.is_cuda() && same.is_cuda(),
+              "spin3 angular-center tensors must be CUDA tensors");
+  TORCH_CHECK(moment.is_contiguous() && same.is_contiguous(),
+              "spin3 angular-center tensors must be contiguous");
+  TORCH_CHECK(moment.dim() == 2 && moment.size(1) == V3Width,
+              "spin3 moment must be [atoms,16]");
+  TORCH_CHECK(same.dim() == 2 && same.size(0) == moment.size(0) &&
+              same.size(1) == 3, "spin3 same-edge block must be [atoms,3]");
+  TORCH_CHECK(moment.scalar_type() == same.scalar_type(),
+              "spin3 angular-center tensors must share dtype");
 }
 
 }  // namespace
@@ -1078,6 +1391,243 @@ std::vector<torch::Tensor> density_bank_double_backward(
   return {grad2_bank, grad2_aux, grad2_rij, grad2_spins, grad2_coefficient};
 }
 
+std::vector<torch::Tensor> density_bank_v3_forward(
+    torch::Tensor rij, torch::Tensor pair_i, torch::Tensor pair_j,
+    torch::Tensor spins, torch::Tensor atom_types, torch::Tensor coefficient,
+    torch::Tensor dof_active, torch::Tensor env_active,
+    double cutoff, double eps) {
+  check_inputs(rij, pair_i, pair_j, spins, atom_types, coefficient,
+               dof_active, env_active);
+  c10::cuda::CUDAGuard guard(rij.device());
+  auto bank = torch::zeros({spins.size(0), BankWidth}, rij.options());
+  auto extra = torch::zeros({spins.size(0), V3Width}, rij.options());
+  auto aux = torch::empty({rij.size(0), AuxWidth}, rij.options());
+  const int threads = 128;
+  const int blocks = static_cast<int>((rij.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        rij.scalar_type(), "density_bank_v3_forward", [&] {
+      bank_v3_forward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          rij.data_ptr<scalar_t>(), pair_i.data_ptr<int64_t>(),
+          pair_j.data_ptr<int64_t>(), spins.data_ptr<scalar_t>(),
+          atom_types.data_ptr<int64_t>(), coefficient.data_ptr<scalar_t>(),
+          dof_active.data_ptr<bool>(), env_active.data_ptr<bool>(),
+          rij.size(0), coefficient.size(1), cutoff, eps,
+          bank.data_ptr<scalar_t>(), extra.data_ptr<scalar_t>(),
+          aux.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {bank, extra, aux};
+}
+
+std::vector<torch::Tensor> density_bank_v3_backward(
+    torch::Tensor grad_bank, torch::Tensor grad_extra,
+    torch::Tensor grad_aux, torch::Tensor rij, torch::Tensor pair_i,
+    torch::Tensor pair_j, torch::Tensor spins, torch::Tensor atom_types,
+    torch::Tensor coefficient, torch::Tensor dof_active,
+    torch::Tensor env_active, double cutoff, double eps) {
+  check_inputs(rij, pair_i, pair_j, spins, atom_types, coefficient,
+               dof_active, env_active);
+  TORCH_CHECK(
+      grad_bank.is_cuda() && grad_extra.is_cuda() && grad_aux.is_cuda()
+          && grad_bank.is_contiguous() && grad_extra.is_contiguous()
+          && grad_aux.is_contiguous()
+          && grad_bank.dim() == 2 && grad_bank.size(0) == spins.size(0)
+          && grad_bank.size(1) == BankWidth
+          && grad_extra.dim() == 2 && grad_extra.size(0) == spins.size(0)
+          && grad_extra.size(1) == V3Width
+          && grad_aux.dim() == 2 && grad_aux.size(0) == rij.size(0)
+          && grad_aux.size(1) == AuxWidth
+          && grad_bank.scalar_type() == rij.scalar_type()
+          && grad_extra.scalar_type() == rij.scalar_type()
+          && grad_aux.scalar_type() == rij.scalar_type(),
+      "v3 bank cotangents must be contiguous CUDA shape/dtype matches");
+  c10::cuda::CUDAGuard guard(rij.device());
+  auto grad_rij = torch::empty_like(rij);
+  auto grad_spins = torch::zeros_like(spins);
+  auto grad_coefficient = torch::zeros_like(coefficient);
+  const int threads = 128;
+  const int blocks = static_cast<int>((rij.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        rij.scalar_type(), "density_bank_v3_backward", [&] {
+      bank_v3_backward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          grad_bank.data_ptr<scalar_t>(), grad_extra.data_ptr<scalar_t>(),
+          grad_aux.data_ptr<scalar_t>(), rij.data_ptr<scalar_t>(),
+          pair_i.data_ptr<int64_t>(), pair_j.data_ptr<int64_t>(),
+          spins.data_ptr<scalar_t>(), atom_types.data_ptr<int64_t>(),
+          coefficient.data_ptr<scalar_t>(), dof_active.data_ptr<bool>(),
+          env_active.data_ptr<bool>(), rij.size(0), coefficient.size(1),
+          cutoff, eps, grad_rij.data_ptr<scalar_t>(),
+          grad_spins.data_ptr<scalar_t>(),
+          grad_coefficient.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {grad_rij, grad_spins, grad_coefficient};
+}
+
+std::vector<torch::Tensor> density_bank_v3_double_backward(
+    torch::Tensor grad_bank, torch::Tensor grad_extra,
+    torch::Tensor grad_aux, torch::Tensor rij, torch::Tensor pair_i,
+    torch::Tensor pair_j, torch::Tensor spins, torch::Tensor atom_types,
+    torch::Tensor coefficient, torch::Tensor dof_active,
+    torch::Tensor env_active, torch::Tensor h_rij,
+    torch::Tensor h_spins, torch::Tensor h_coefficient,
+    double cutoff, double eps) {
+  check_inputs(rij, pair_i, pair_j, spins, atom_types, coefficient,
+               dof_active, env_active);
+  TORCH_CHECK(
+      grad_bank.is_cuda() && grad_extra.is_cuda() && grad_aux.is_cuda()
+          && grad_bank.is_contiguous() && grad_extra.is_contiguous()
+          && grad_aux.is_contiguous()
+          && grad_bank.dim() == 2 && grad_bank.size(0) == spins.size(0)
+          && grad_bank.size(1) == BankWidth
+          && grad_extra.dim() == 2 && grad_extra.size(0) == spins.size(0)
+          && grad_extra.size(1) == V3Width
+          && grad_aux.dim() == 2 && grad_aux.size(0) == rij.size(0)
+          && grad_aux.size(1) == AuxWidth
+          && grad_bank.scalar_type() == rij.scalar_type()
+          && grad_extra.scalar_type() == rij.scalar_type()
+          && grad_aux.scalar_type() == rij.scalar_type(),
+      "v3 bank cotangents must be contiguous CUDA shape/dtype matches");
+  TORCH_CHECK(
+      h_rij.is_cuda() && h_spins.is_cuda() && h_coefficient.is_cuda()
+          && h_rij.is_contiguous() && h_spins.is_contiguous()
+          && h_coefficient.is_contiguous()
+          && h_rij.sizes() == rij.sizes()
+          && h_spins.sizes() == spins.sizes()
+          && h_coefficient.sizes() == coefficient.sizes()
+          && h_rij.scalar_type() == rij.scalar_type()
+          && h_spins.scalar_type() == rij.scalar_type()
+          && h_coefficient.scalar_type() == rij.scalar_type(),
+      "v3 double-backward tangents must be contiguous CUDA shape matches");
+  c10::cuda::CUDAGuard guard(rij.device());
+  auto grad2_bank = torch::zeros_like(grad_bank);
+  auto grad2_extra = torch::zeros_like(grad_extra);
+  auto grad2_aux = torch::empty_like(grad_aux);
+  auto grad2_rij = torch::empty_like(rij);
+  auto grad2_spins = torch::zeros_like(spins);
+  auto grad2_coefficient = torch::zeros_like(coefficient);
+  const int threads = 128;
+  const int blocks = static_cast<int>((rij.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        rij.scalar_type(), "density_bank_v3_double_backward", [&] {
+      bank_v3_double_backward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          grad_bank.data_ptr<scalar_t>(), grad_extra.data_ptr<scalar_t>(),
+          grad_aux.data_ptr<scalar_t>(), rij.data_ptr<scalar_t>(),
+          pair_i.data_ptr<int64_t>(), pair_j.data_ptr<int64_t>(),
+          spins.data_ptr<scalar_t>(), atom_types.data_ptr<int64_t>(),
+          coefficient.data_ptr<scalar_t>(), dof_active.data_ptr<bool>(),
+          env_active.data_ptr<bool>(), h_rij.data_ptr<scalar_t>(),
+          h_spins.data_ptr<scalar_t>(), h_coefficient.data_ptr<scalar_t>(),
+          rij.size(0), coefficient.size(1), cutoff, eps,
+          grad2_bank.data_ptr<scalar_t>(), grad2_extra.data_ptr<scalar_t>(),
+          grad2_aux.data_ptr<scalar_t>(), grad2_rij.data_ptr<scalar_t>(),
+          grad2_spins.data_ptr<scalar_t>(),
+          grad2_coefficient.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {
+      grad2_bank, grad2_extra, grad2_aux, grad2_rij,
+      grad2_spins, grad2_coefficient};
+}
+
+torch::Tensor angular_center_v3_forward(
+    torch::Tensor moment, torch::Tensor same) {
+  check_angular_center_v3_inputs(moment, same);
+  c10::cuda::CUDAGuard guard(moment.device());
+  auto output = torch::empty(
+      {moment.size(0), V3AngularWidth}, moment.options());
+  const int threads = 128;
+  const int blocks = static_cast<int>(
+      (moment.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        moment.scalar_type(), "angular_center_v3_forward", [&] {
+      angular_center_v3_forward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          moment.data_ptr<scalar_t>(), same.data_ptr<scalar_t>(),
+          moment.size(0), output.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return output;
+}
+
+std::vector<torch::Tensor> angular_center_v3_backward(
+    torch::Tensor grad_output, torch::Tensor moment, torch::Tensor same) {
+  check_angular_center_v3_inputs(moment, same);
+  TORCH_CHECK(
+      grad_output.is_cuda() && grad_output.is_contiguous() &&
+      grad_output.dim() == 2 && grad_output.size(0) == moment.size(0) &&
+      grad_output.size(1) == V3AngularWidth &&
+      grad_output.scalar_type() == moment.scalar_type(),
+      "spin3 angular-center cotangent must be contiguous CUDA [atoms,6]");
+  c10::cuda::CUDAGuard guard(moment.device());
+  auto grad_moment = torch::empty_like(moment);
+  auto grad_same = torch::empty_like(same);
+  const int threads = 128;
+  const int blocks = static_cast<int>(
+      (moment.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        moment.scalar_type(), "angular_center_v3_backward", [&] {
+      angular_center_v3_backward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          grad_output.data_ptr<scalar_t>(), moment.data_ptr<scalar_t>(),
+          moment.size(0), grad_moment.data_ptr<scalar_t>(),
+          grad_same.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {grad_moment, grad_same};
+}
+
+std::vector<torch::Tensor> angular_center_v3_double_backward(
+    torch::Tensor grad_output, torch::Tensor moment, torch::Tensor same,
+    torch::Tensor h_moment, torch::Tensor h_same) {
+  check_angular_center_v3_inputs(moment, same);
+  TORCH_CHECK(
+      grad_output.is_cuda() && h_moment.is_cuda() && h_same.is_cuda() &&
+      grad_output.is_contiguous() && h_moment.is_contiguous() &&
+      h_same.is_contiguous() &&
+      grad_output.dim() == 2 && grad_output.size(0) == moment.size(0) &&
+      grad_output.size(1) == V3AngularWidth &&
+      h_moment.sizes() == moment.sizes() && h_same.sizes() == same.sizes(),
+      "spin3 angular-center double-backward tensors have invalid shapes");
+  TORCH_CHECK(
+      grad_output.scalar_type() == moment.scalar_type() &&
+      h_moment.scalar_type() == moment.scalar_type() &&
+      h_same.scalar_type() == moment.scalar_type(),
+      "spin3 angular-center double-backward tensors must share dtype");
+  c10::cuda::CUDAGuard guard(moment.device());
+  auto grad2_output = torch::empty_like(grad_output);
+  auto grad2_moment = torch::empty_like(moment);
+  const int threads = 128;
+  const int blocks = static_cast<int>(
+      (moment.size(0) + threads - 1) / threads);
+  if (blocks) {
+    AT_DISPATCH_FLOATING_TYPES(
+        moment.scalar_type(), "angular_center_v3_double_backward", [&] {
+      angular_center_v3_double_backward_kernel<scalar_t><<<
+          blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+          grad_output.data_ptr<scalar_t>(), moment.data_ptr<scalar_t>(),
+          h_moment.data_ptr<scalar_t>(), h_same.data_ptr<scalar_t>(),
+          moment.size(0), grad2_output.data_ptr<scalar_t>(),
+          grad2_moment.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {grad2_output, grad2_moment};
+}
+
 torch::Tensor edge_anchor_sector_forward(
     torch::Tensor bank, torch::Tensor auxiliary, torch::Tensor pair_i,
     torch::Tensor mix) {
@@ -1185,6 +1735,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def(
       "double_backward", &density_bank_double_backward,
       "O3-C2 primitive bank analytic directional HVP (CUDA)");
+  module.def(
+      "forward_v3", &density_bank_v3_forward,
+      "O3-C2 spin3 primitive bank (CUDA)");
+  module.def(
+      "backward_v3", &density_bank_v3_backward,
+      "O3-C2 spin3 primitive bank VJP (CUDA)");
+  module.def(
+      "double_backward_v3", &density_bank_v3_double_backward,
+      "O3-C2 spin3 primitive bank analytic directional HVP (CUDA)");
+  module.def(
+      "angular_center_v3_forward", &angular_center_v3_forward,
+      "O3-C2 spin3 angular-center contraction (CUDA)");
+  module.def(
+      "angular_center_v3_backward", &angular_center_v3_backward,
+      "O3-C2 spin3 angular-center contraction VJP (CUDA)");
+  module.def(
+      "angular_center_v3_double_backward",
+      &angular_center_v3_double_backward,
+      "O3-C2 spin3 angular-center contraction directional HVP (CUDA)");
   module.def(
       "edge_anchor_forward", &edge_anchor_sector_forward,
       "O3-C2 edge-anchored sectors (CUDA)");

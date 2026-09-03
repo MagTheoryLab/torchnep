@@ -18,8 +18,10 @@ import subprocess
 import sys
 
 import numpy as np
+import torch
 
 from torchnep import train_nep
+from torchnep.nep import NEPCalculator
 
 
 def _write_case(tmp_path):
@@ -245,3 +247,66 @@ def test_two_rank_oc_training_smoke(tmp_path):
     log = (output / "output.log").read_text()
     assert "neutral-group-balanced-mean-plus-centered" in log
     assert "one replicated complete group per ordinary optimizer step" in log
+
+
+def test_two_rank_spin3_q_scaler_excludes_padding(tmp_path):
+    """The DDP-only duplicate frame must not change spin3 RMS scaling."""
+    if os.environ.get("TORCHNEP_TEST_DDP") != "1":
+        import pytest
+        pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
+
+    config, xyz, _ = _write_case(tmp_path)
+    config.write_text(
+        config.read_text()
+        .replace(
+            "spin_mode 2\n",
+            "spin_mode 3\nspin_mforce_mode full\nspin_curriculum 0\n",
+        )
+    )
+    single = tmp_path / "single-spin3"
+    train_nep(
+        str(config), str(xyz), output_dir=str(single), device="cpu",
+        precision="float64", restart=False, prediction_interval=0,
+        run_seed=7,
+    )
+
+    sharded = tmp_path / "sharded-spin3"
+    driver = tmp_path / "run_spin3_ddp.py"
+    driver.write_text(
+        "import sys\n"
+        "from torchnep import train_nep_sharded\n"
+        "train_nep_sharded(\n"
+        "    sys.argv[1], sys.argv[2], output_dir=sys.argv[3],\n"
+        "    precision='float64', restart=False, prediction_interval=0,\n"
+        "    run_seed=7,\n"
+        ")\n"
+    )
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = (
+        repo_root + os.pathsep + env["PYTHONPATH"]
+        if env.get("PYTHONPATH") else repo_root
+    )
+    env["OMP_NUM_THREADS"] = "1"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        master_port = str(sock.getsockname()[1])
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "torch.distributed.run",
+            "--nnodes=1", "--node_rank=0", "--nproc_per_node=2",
+            "--master_addr=127.0.0.1", f"--master_port={master_port}",
+            str(driver), str(config), str(xyz), str(sharded),
+        ],
+        cwd=tmp_path, env=env, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout
+
+    q_single = NEPCalculator(
+        single / "nep_final.txt", dtype=torch.float64
+    ).q_scaler
+    q_sharded = NEPCalculator(
+        sharded / "nep_final.txt", dtype=torch.float64
+    ).q_scaler
+    torch.testing.assert_close(q_sharded, q_single, rtol=2.0e-13, atol=2.0e-13)

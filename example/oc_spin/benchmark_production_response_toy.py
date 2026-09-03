@@ -193,9 +193,12 @@ def _write_xyz(path, frames, with_tangent):
     path.write_text("\n".join(lines) + "\n")
 
 
-def _write_config(path, epochs, lambda_m, stage2_lambda_m):
+def _write_config(path, epochs, lambda_m, stage2_lambda_m, spin_mode=2):
     if lambda_m < 0.0 or stage2_lambda_m < 0.0:
         raise ValueError("magnetic-force weights must be nonnegative")
+    mforce_contract = (
+        "spin_mforce_mode full\n" if spin_mode == 3 else ""
+    )
     path.write_text(
         "type 1 Fe\n"
         "cutoff 4.0 4.0\n"
@@ -203,12 +206,13 @@ def _write_config(path, epochs, lambda_m, stage2_lambda_m):
         "basis_size 8 8\n"
         "l_max 4 2 0\n"
         "neuron 16\n"
-        "spin_mode 2\n"
+        f"spin_mode {spin_mode}\n"
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_order 3\n"
         "spin_soc 1\n"
         "spin_cutoff 4.0\n"
+        f"{mforce_contract}"
         "lambda_e 1.0\n"
         "lambda_f 0.0\n"
         "lambda_v 0.0\n"
@@ -625,6 +629,7 @@ def main():
         help="Internal benchmark seam; this is not a nep.in parameter.",
     )
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--spin-mode", type=int, choices=(2, 3), default=2)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--evaluate-only", action="store_true",
@@ -647,9 +652,11 @@ def main():
         if result_path.is_file():
             stored = json.loads(result_path.read_text())
             if stored.get("variant") != args.variant \
-                    or int(stored.get("seed", -1)) != args.seed:
+                    or int(stored.get("seed", -1)) != args.seed \
+                    or int(stored.get("spin_mode", 2)) != args.spin_mode:
                 raise ValueError(
-                    "evaluate-only variant/seed does not match result.json"
+                    "evaluate-only variant/seed/spin-mode does not match "
+                    "result.json"
                 )
             recipe = stored.get("recipe", recipe)
         if not (model_dir / "nep_best.txt").is_file():
@@ -660,7 +667,8 @@ def main():
         _write_xyz(train_file, train, with_tangent)
         _write_xyz(valid_file, valid, with_tangent)
         _write_config(
-            config_file, args.epochs, args.lambda_m, args.stage2_lambda_m
+            config_file, args.epochs, args.lambda_m, args.stage2_lambda_m,
+            spin_mode=args.spin_mode,
         )
         _train_with_internal_generator_weight(
             recipe,
@@ -672,6 +680,7 @@ def main():
         )
     result = {
         "variant": args.variant, "seed": args.seed, "epochs": args.epochs,
+        "spin_mode": args.spin_mode,
         "recipe": recipe,
         "metrics": _evaluate(
             model_dir / "nep_best.txt", blind, valid, args.device
