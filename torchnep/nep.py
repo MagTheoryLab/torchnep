@@ -31,6 +31,7 @@ from .neighbor import build_neighbor_list, CellList
 from . import ops
 from .spin_schema import (
     make_spin_descriptor,
+    normalize_spin_cutoff,
     spin_projection_parameters,
     spin_projection_size,
 )
@@ -130,6 +131,7 @@ class NEPCalculator:
         self.spin_basis_size = [8, 0]
         self.spin_l_max = [2, 0, 0]
         self.spin_cutoff = None
+        spin_cutoff_values = None
         self.energy_baseline = torch.zeros(
             self.num_types, dtype=self.dtype, device=self.device)
         self.spin_dof_type_active = torch.ones(
@@ -189,12 +191,9 @@ class NEPCalculator:
                         else values[:3]
                     )
                 elif key == "spin_cutoff":
-                    values = [float(value) for value in tokens[1:]]
-                    self.spin_cutoff = (
-                        [values[0], values[0]]
-                        if len(values) == 1
-                        else values[:2]
-                    )
+                    spin_cutoff_values = [
+                        float(value) for value in tokens[1:]
+                    ]
                 elif key == "spin_order":
                     self.spin_order = int(tokens[1])
                 elif key == "spin_soc":
@@ -299,8 +298,27 @@ class NEPCalculator:
         self.rc_radial = float(parts[1])
         self.rc_angular = float(parts[2])
         idx += 1
-        if self.spin_cutoff is None:
+        if self.spin_mode:
+            self.spin_cutoff_by_type = normalize_spin_cutoff(
+                ([self.rc_radial]
+                 if spin_cutoff_values is None else spin_cutoff_values),
+                self.num_types,
+            )
+            spin_cutoff_max = max(self.spin_cutoff_by_type)
+            self.spin_cutoff = [spin_cutoff_max, spin_cutoff_max]
+        else:
+            self.spin_cutoff_by_type = [self.rc_radial] * self.num_types
             self.spin_cutoff = [self.rc_radial, self.rc_angular]
+        spin_cutoff_type = torch.tensor(
+            self.spin_cutoff_by_type, dtype=self.dtype, device=self.device
+        )
+        self.spin_cutoff_pair = 0.5 * (
+            spin_cutoff_type[:, None] + spin_cutoff_type[None, :]
+        )
+        self.spin_has_typewise_cutoff = any(
+            value != self.spin_cutoff_by_type[0]
+            for value in self.spin_cutoff_by_type[1:]
+        )
 
         # n_max, basis_size, l_max
         parts = lines[idx].split()
@@ -455,6 +473,18 @@ class NEPCalculator:
         self._c5b  = torch.tensor(C5B,  dtype=self.dtype, device=self.device)
         self._c4b2 = torch.tensor(C4B2, dtype=self.dtype, device=self.device)
 
+    def _spin_descriptor_coordinates(
+        self, rij, pair_i, pair_j, atom_types
+    ):
+        """Use structural-NEP pair cutoffs with the scalar-cutoff kernel."""
+        if not self.spin_has_typewise_cutoff or pair_i.numel() == 0:
+            return rij
+        pair_cutoff = self.spin_cutoff_pair[
+            atom_types.index_select(0, pair_i),
+            atom_types.index_select(0, pair_j),
+        ].to(rij)
+        return rij * (self.spin_cutoff[0] / pair_cutoff).unsqueeze(-1)
+
     def compute(
         self,
         species: list,
@@ -527,7 +557,11 @@ class NEPCalculator:
         pi_rad, pj_rad = pair_i[rad_mask], pair_j[rad_mask]
         pi_ang, pj_ang = pair_i[ang_mask], pair_j[ang_mask]
         if self.spin_mode:
-            spin_mask = dij < self.spin_cutoff[0]
+            spin_pair_cutoff = self.spin_cutoff_pair[
+                atom_types.index_select(0, pair_i),
+                atom_types.index_select(0, pair_j),
+            ]
+            spin_mask = dij < spin_pair_cutoff
             rij_spin = rij[spin_mask].detach().requires_grad_(True)
             pi_spin, pj_spin = pair_i[spin_mask], pair_j[spin_mask]
 
@@ -546,8 +580,12 @@ class NEPCalculator:
             has_q_134=self.has_q_134,
         )
         if self.spin_mode:
+            descriptor_rij_spin = self._spin_descriptor_coordinates(
+                rij_spin, pi_spin, pj_spin, atom_types
+            )
             q_spin = self.spin_descriptor(
-                rij_spin, pi_spin, pj_spin, spin_tensor, N, atom_types,
+                descriptor_rij_spin, pi_spin, pj_spin,
+                spin_tensor, N, atom_types,
                 self.c_spin, None,
                 self.spin_dof_type_active, self.spin_env_type_active,
             )
@@ -800,10 +838,15 @@ class NEPCalculator:
                 has_q_123=self.has_q_123, has_q_233=self.has_q_233,
                 has_q_134=self.has_q_134,
             )
+            pair_i_spin = batch.get("pair_i_spin", batch["pair_i_rad"])
+            pair_j_spin = batch.get("pair_j_spin", batch["pair_j_rad"])
+            descriptor_rij_spin = self._spin_descriptor_coordinates(
+                rij_spin, pair_i_spin, pair_j_spin, batch["atom_types"]
+            )
             q_spin = self.spin_descriptor(
-                rij_spin,
-                batch.get("pair_i_spin", batch["pair_i_rad"]),
-                batch.get("pair_j_spin", batch["pair_j_rad"]),
+                descriptor_rij_spin,
+                pair_i_spin,
+                pair_j_spin,
                 spins, N, batch["atom_types"], self.c_spin, None,
                 self.spin_dof_type_active, self.spin_env_type_active,
             )

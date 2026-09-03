@@ -32,6 +32,7 @@ from .constants import (
 from . import ops
 from .spin_schema import (
     make_spin_descriptor,
+    normalize_spin_cutoff,
     spin_projection_parameters,
     spin_projection_size,
     spin_checkpoint_lines,
@@ -99,7 +100,7 @@ class NEPModel(nn.Module):
         spin_only_keys = {
             "spin_compress", "spin_basis_size", "spin_l_max",
             "spin_order", "spin_soc", "spin_cutoff", "spin_dof_type",
-            "spin_env_type", "spin_curriculum",
+            "spin_cutoff_by_type", "spin_env_type", "spin_curriculum",
         }
         explicit_keys = config.get("_explicit")
         supplied_spin_keys = (
@@ -157,16 +158,43 @@ class NEPModel(nn.Module):
                 f"basis B={self.spin_basis_size[0]}"
             )
         self.spin_l_max = _spin_int_list("spin_l_max", [2, 0, 0], 3)
-        spin_cutoff = list(config.get(
+        legacy_spin_cutoff = list(config.get(
             "spin_cutoff",
             ([6.0, 6.0] if self.spin_mode in (2, 3)
              else [self.rc_radial, self.rc_angular]),
         ))
-        if len(spin_cutoff) != 2:
-            raise ValueError("spin_cutoff requires two values")
-        self.spin_cutoff = [float(value) for value in spin_cutoff]
-        if min(self.spin_cutoff) <= 0:
-            raise ValueError("spin_cutoff values must be > 0")
+        if self.spin_mode in (2, 3):
+            raw_spin_cutoff = config.get(
+                "spin_cutoff_by_type", [legacy_spin_cutoff[0]]
+            )
+            self.spin_cutoff_by_type = normalize_spin_cutoff(
+                raw_spin_cutoff, self.num_types
+            )
+            spin_cutoff_max = max(self.spin_cutoff_by_type)
+            self.spin_cutoff = [spin_cutoff_max, spin_cutoff_max]
+        else:
+            if len(legacy_spin_cutoff) != 2:
+                raise ValueError("spin_cutoff requires two values")
+            self.spin_cutoff = [float(value) for value in legacy_spin_cutoff]
+            if min(self.spin_cutoff) <= 0.0:
+                raise ValueError("spin_cutoff values must be > 0")
+            self.spin_cutoff_by_type = [
+                self.spin_cutoff[0]
+            ] * self.num_types
+        spin_cutoff_type = torch.tensor(
+            self.spin_cutoff_by_type, dtype=torch.float64
+        )
+        self.register_buffer(
+            "spin_cutoff_pair",
+            0.5 * (
+                spin_cutoff_type[:, None] + spin_cutoff_type[None, :]
+            ),
+            persistent=False,
+        )
+        self.spin_has_typewise_cutoff = any(
+            value != self.spin_cutoff_by_type[0]
+            for value in self.spin_cutoff_by_type[1:]
+        )
 
         def _active_types(key, default=None):
             names = config.get(key)
@@ -309,6 +337,10 @@ class NEPModel(nn.Module):
         ) if self.l_max_3b > 0 else None
         self.c_param_spin = None
         if self.spin_mode:
+            # Structural NEP uses c_param_{2,3}[center, neighbor, n, k].
+            # Spin uses the same ordered-pair contraction before constructing
+            # any tensor density.  The leading singleton is the established
+            # serialized family axis; descriptor width remains spin_compress.
             self.c_param_spin = nn.Parameter(torch.empty(
                 1, nt, nt, self.spin_compress,
                 self.spin_basis_size[0] + 1))
@@ -382,7 +414,11 @@ class NEPModel(nn.Module):
                 "compress": self.spin_compress,
                 "l_max": self.spin_l_max[0],
                 "basis_size": self.spin_basis_size[0],
-                "cutoff": self.spin_cutoff[0],
+                "cutoff": (
+                    list(self.spin_cutoff_by_type)
+                    if self.spin_has_typewise_cutoff
+                    else self.spin_cutoff[0]
+                ),
                 "soc": self.spin_soc,
                 "dof_type": [
                     name for index, name in enumerate(self.type_names)
@@ -550,6 +586,28 @@ class NEPModel(nn.Module):
             device=self.energy_baseline.device,
         ))
 
+    def _spin_descriptor_coordinates(
+        self, rij, pair_i, pair_j, atom_types
+    ):
+        """Map pairwise cutoffs onto the existing scalar-cutoff kernel.
+
+        Structural NEP evaluates each edge with
+        ``rc_ij = (rc_i + rc_j) / 2``.  Scaling an edge by
+        ``rc_max / rc_ij`` makes the scalar-cutoff radial basis exactly the
+        corresponding pair-cutoff basis while preserving its unit direction.
+        Autograd applies the same constant scale to the force pullback, so the
+        optimized CUDA descriptor kernels need no duplicate typewise path.
+        """
+        if not self.spin_has_typewise_cutoff or pair_i.numel() == 0:
+            return rij
+        center_type = atom_types.index_select(0, pair_i)
+        neighbor_type = atom_types.index_select(0, pair_j)
+        pair_cutoff = self.spin_cutoff_pair[
+            center_type, neighbor_type
+        ].to(rij)
+        scale = self.spin_cutoff[0] / pair_cutoff
+        return rij * scale.unsqueeze(-1)
+
     def compute_descriptors(self, rij_rad, rij_ang, pi_rad, pj_rad,
                             pi_ang, pj_ang, atom_types, N,
                             backend: str = "loop", spins=None,
@@ -576,8 +634,11 @@ class NEPModel(nn.Module):
             raise ValueError("spin_mode requires per-atom spins")
         if rij_spin is None:
             rij_spin, pi_spin, pj_spin = rij_rad, pi_rad, pj_rad
+        descriptor_rij_spin = self._spin_descriptor_coordinates(
+            rij_spin, pi_spin, pj_spin, atom_types
+        )
         q_spin = self.spin_descriptor(
-            rij_spin, pi_spin, pj_spin, spins, N, atom_types,
+            descriptor_rij_spin, pi_spin, pj_spin, spins, N, atom_types,
             self.c_param_spin, None,
             self.spin_dof_type_active, self.spin_env_type_active,
         )
@@ -1169,13 +1230,17 @@ class NEPModel(nn.Module):
                         f"{actual} != {expected}"
                     )
             cutoff = spin_metadata.get("spin_cutoff")
-            if (not cutoff or not np.isclose(
-                    float(cutoff[0]), self.spin_cutoff[0],
+            file_spin_cutoff = (
+                None if not cutoff
+                else normalize_spin_cutoff(cutoff, self.num_types)
+            )
+            if (file_spin_cutoff is None or not np.allclose(
+                    file_spin_cutoff, self.spin_cutoff_by_type,
                     rtol=0.0, atol=1.0e-12)):
-                actual = None if not cutoff else cutoff[0]
+                actual = file_spin_cutoff
                 raise ValueError(
                     "spin_cutoff does not match target config: "
-                    f"{actual} != {self.spin_cutoff[0]}"
+                    f"{actual} != {self.spin_cutoff_by_type}"
                 )
             expected_dof = [
                 name for index, name in enumerate(self.type_names)
@@ -1493,6 +1558,9 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
             "spin_basis_size": list(model.spin_basis_size),
             "spin_l_max": list(model.spin_l_max),
             "spin_cutoff": list(model.spin_cutoff),
+            "spin_cutoff_by_type": [
+                model.spin_cutoff_by_type[index] for index in keep_idx
+            ],
             "spin_order": model.spin_order,
             "spin_soc": model.spin_soc,
             "spin_curriculum": model.spin_curriculum,

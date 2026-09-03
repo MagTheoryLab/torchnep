@@ -118,7 +118,7 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_order` | `3` | Magnetic correlation order O (`1`–`3`) |
 | `spin_compress` | `2` | Shared magnetic radial rank C (`1`–`9` with the fixed B8 basis) |
 | `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
-| `spin_cutoff` | `6` | Magnetic neighbor cutoff (Å) |
+| `spin_cutoff` | `6` | Magnetic cutoff (Å): one global value, or one value per element in `type` order; pair cutoff is their arithmetic mean |
 | `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
 | `spin_curriculum` | `1` for O3 | Use the O2-to-O3 training curriculum (`0` or `1`); it does not change the exported potential or inference cost |
 | `spin_mforce_mode` | required for spin3 | Magnetic-force contract: `full` or fixed-magnitude `transverse`; it must be explicit to prevent a silent label-convention mismatch |
@@ -129,6 +129,9 @@ For new O/C spin models set `spin_mode 3`. The production default is
 O3-C2-L2-SOC:
 `spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
 `spin_soc 1`. Fresh O3 training enables the O2-to-O3 curriculum by default;
+for typewise cutoffs, for example `type 2 Fe Ge`, use
+`spin_cutoff 5.5 6.5`, giving Fe--Ge cutoff 6.0 Å by the same pair-average
+rule as structural NEP.
 set `spin_curriculum 0` to train the complete O3 model from the first epoch.
 The switch changes training only and is not written into the exported model.
 `nep4_spin3` has 55 magnetic coordinates with exact O1/O2/O3 prefix

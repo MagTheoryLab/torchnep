@@ -117,6 +117,84 @@ def test_spin3_parser_and_fixed_production_dimensions(tmp_path):
         resolve_gpumd_qscaler(3, True)
 
 
+def test_spin3_descriptor_width_is_independent_of_element_count():
+    dimensions = []
+    type_names = ["Fe", "Ge", "Ni", "Co"]
+    for num_types in (1, 2, 4):
+        config = _config()
+        config.update({
+            "num_types": num_types,
+            "type_names": type_names[:num_types],
+            "spin_dof_type": type_names[:num_types],
+            "spin_env_type": type_names[:num_types],
+        })
+        model = NEPModel(config)
+        dimensions.append((model.spin_dim, model.dim))
+        assert model.c_param_spin.shape == (
+            1,
+            num_types,
+            num_types,
+            model.spin_compress,
+            model.spin_basis_size[0] + 1,
+        )
+        assert len(model.fitting_nets) == num_types
+
+    assert dimensions == [dimensions[0]] * 3
+
+
+def test_spin3_ordered_pair_mixing_breaks_a_type_blind_collision():
+    descriptor = MagneticPolynomialDescriptorV3(
+        spin_compress=2,
+        spin_l_max=1,
+        spin_order=2,
+        spin_soc=False,
+    ).to(dtype=DTYPE)
+    rij = torch.tensor(
+        [[1.25, 0.0, 0.0], [1.25, 0.0, 0.0]], dtype=DTYPE
+    )
+    pair_i = torch.tensor([0, 0], dtype=torch.long)
+    pair_j = torch.tensor([1, 2], dtype=torch.long)
+    atom_types = torch.tensor([0, 0, 1], dtype=torch.long)
+    spins_a = torch.tensor(
+        [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=DTYPE,
+    )
+    spins_b = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        dtype=DTYPE,
+    )
+    tied = torch.zeros(1, 2, 2, 2, 9, dtype=DTYPE)
+    tied[..., 0, 0] = 1.0
+    tied[..., 1, 1] = 1.0
+
+    def evaluate(spins, coefficient):
+        return descriptor(
+            rij,
+            pair_i,
+            pair_j,
+            spins,
+            3,
+            atom_types,
+            coefficient,
+        )[0]
+
+    # With one shared pair table, exchanging the two equal-geometry neighbor
+    # spins is an exact descriptor collision.
+    torch.testing.assert_close(
+        evaluate(spins_a, tied),
+        evaluate(spins_b, tied),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    resolved = tied.clone()
+    resolved[:, 0, 1] *= 1.7
+    assert not torch.allclose(
+        evaluate(spins_a, resolved),
+        evaluate(spins_b, resolved),
+    )
+
+
 def test_spin3_mforce_contract_is_versioned_and_validated(tmp_path):
     missing = tmp_path / "missing.nep.in"
     missing.write_text("type 1 Fe\nspin_mode 3\n")

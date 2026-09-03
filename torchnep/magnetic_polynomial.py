@@ -24,6 +24,25 @@ inference, serialization and future generated CUDA implementations.
 The descriptor is a symmetry-respecting local approximation to a DFT energy
 surface.  It is not a fixed spin Hamiltonian and it does not claim exact DFT
 equivalence at finite cutoff, radial rank, angular rank or contraction level.
+
+Chemical resolution follows the same ordered center--neighbor contraction as
+the structural NEP density.  Before any spin tensor is accumulated, each edge
+uses
+
+    g_c^{IJ}(r_ij) = sum_k c_spin^{IJ}_{ck} f_k(r_ij),
+
+where ``I`` and ``J`` are the center and neighbor element types.  Every spin
+sector is generated from this one element-resolved radial density; element
+labels are therefore not appended as separate descriptor channels.  The
+descriptor width depends on the fixed radial rank ``spin_compress`` and is
+independent of the number of elements, while the learned coefficient table
+retains the full ordered-pair resolution used by structural NEP.
+
+The cutoff follows the structural typewise rule as well.  A cutoff radius is
+stored for each element and an ``I--J`` edge uses their arithmetic mean.  The
+model maps that pair radius onto this descriptor's scalar-cutoff coordinate,
+which leaves directions unchanged and gives exactly the same normalized
+radial basis while reusing the validated CPU/CUDA contraction kernels.
 """
 
 from __future__ import annotations
@@ -504,6 +523,13 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         atom_types,
         coefficient,
     ):
+        """Build the shared NEP-style element-resolved spin radial density.
+
+        ``coefficient[I,J,c,k]`` contracts the fixed radial basis ``k`` into
+        ``spin_compress`` channels ``c`` for the ordered center--neighbor pair
+        ``(I,J)``.  The optional leading singleton is retained by the model
+        format; it is not a second hand-selected spin family.
+        """
         inside = distance < self.cutoff_radial
         radial = ops.chebyshev_basis(
             distance.clamp(max=self.cutoff_radial),

@@ -18,6 +18,27 @@ from typing import List
 import torch
 
 
+def normalize_spin_cutoff(values, num_types: int) -> List[float]:
+    """Return one positive spin cutoff per declared element type.
+
+    A single value is the legacy global cutoff and is broadcast.  Otherwise
+    the values follow the element order on the ``type`` line.  As in current
+    structural NEP, the cutoff of an element pair is the arithmetic mean of
+    its two per-type values.
+    """
+    cutoffs = [float(value) for value in values]
+    if len(cutoffs) == 1:
+        cutoffs *= int(num_types)
+    elif len(cutoffs) != int(num_types):
+        raise ValueError(
+            "spin_cutoff requires either one value or one value per "
+            f"element type ({num_types})"
+        )
+    if not cutoffs or min(cutoffs) <= 0.0:
+        raise ValueError("spin_cutoff values must be > 0")
+    return cutoffs
+
+
 def make_spin_descriptor(spin_mode: int, **kwargs):
     """Construct the descriptor implementation selected by the file format."""
     if spin_mode == 2:
@@ -53,12 +74,16 @@ def spin_checkpoint_lines(model) -> List[str]:
     )
     if model.spin_mode not in (2, 3):
         raise ValueError("spin checkpoint metadata requires spin_mode 2 or 3")
+    cutoff_values = list(model.spin_cutoff_by_type)
+    if all(value == cutoff_values[0] for value in cutoff_values[1:]):
+        cutoff_values = cutoff_values[:1]
+    cutoff_text = " ".join(str(value) for value in cutoff_values)
     lines = [
         f"spin_baseline {baseline}",
         f"spin_basis_size {model.spin_basis_size[0]}",
         f"spin_l_max {model.spin_l_max[0]}",
         f"spin_compress {model.spin_compress}",
-        f"spin_cutoff {model.spin_cutoff[0]}",
+        f"spin_cutoff {cutoff_text}",
         f"spin_order {model.spin_order}",
         f"spin_soc {model.spin_soc}",
         f"spin_projection_size {spin_projection_size(model)}",

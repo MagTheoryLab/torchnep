@@ -196,8 +196,14 @@ def format_config_summary(config: dict) -> List[str]:
                      f"{config['spin_order']}")
         lines.append(f"  {tag('spin_soc'):10}  spin_soc     "
                      f"{config['spin_soc']}")
+        spin_cutoffs = config.get(
+            "spin_cutoff_by_type", [config["spin_cutoff"][0]]
+        )
+        if all(value == spin_cutoffs[0] for value in spin_cutoffs[1:]):
+            spin_cutoffs = spin_cutoffs[:1]
+        spin_cutoff_text = " ".join(str(value) for value in spin_cutoffs)
         lines.append(f"  {tag('spin_cutoff'):10}  spin_cutoff "
-                     f"{config['spin_cutoff'][0]}")
+                     f"{spin_cutoff_text}")
         lines.append(f"  {tag('spin_curriculum'):10}  spin_curriculum "
                      f"{int(config['spin_curriculum'])}")
         if config.get("spin_mode") == 3:
@@ -772,7 +778,8 @@ def iter_collated(data_store, index_lists):
 
 def _preprocess_one_frame(args):
     """Worker: build neighbor lists for a single frame. Picklable for mp.Pool."""
-    frame, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype = args
+    (frame, rc_rad, rc_ang, rc_spin_by_type, max_rc,
+     type_names, dtype) = args
     positions = frame["positions"].astype(dtype)
     cell = frame["cell"].astype(dtype)
     atom_types = np.array([type_names.index(s) for s in frame["species"]],
@@ -790,8 +797,13 @@ def _preprocess_one_frame(args):
         "pair_i_ang": pair_i[ang_mask], "pair_j_ang": pair_j[ang_mask],
         "rij_ang": rij[ang_mask].astype(dtype),
     }
-    if rc_spin is not None:
-        spin_mask = dij < rc_spin
+    if rc_spin_by_type is not None:
+        spin_cutoff_type = np.asarray(rc_spin_by_type, dtype=dtype)
+        spin_cutoff_pair = 0.5 * (
+            spin_cutoff_type[atom_types[pair_i]]
+            + spin_cutoff_type[atom_types[pair_j]]
+        )
+        spin_mask = dij < spin_cutoff_pair
         s.update({
             "pair_i_spin": pair_i[spin_mask],
             "pair_j_spin": pair_j[spin_mask],
@@ -876,16 +888,21 @@ def preprocess_structures(frames, config, dtype=np.float32, n_workers=None,
     """
     rc_rad = config["cutoff_radial"]
     rc_ang = config["cutoff_angular"]
-    rc_spin = (
-        float(config.get("spin_cutoff", [rc_rad, rc_ang])[0])
-        if config.get("spin_mode", 0) else None)
+    rc_spin_by_type = (
+        list(config.get(
+            "spin_cutoff_by_type",
+            [float(config.get("spin_cutoff", [rc_rad, rc_ang])[0])]
+            * len(config["type_names"]),
+        ))
+        if config.get("spin_mode", 0) else None
+    )
     type_names = config["type_names"]
     max_rc = max(
         rc_rad, rc_ang,
-        rc_spin if rc_spin is not None else 0.0,
+        max(rc_spin_by_type) if rc_spin_by_type is not None else 0.0,
     )
     args = [
-        (f, rc_rad, rc_ang, rc_spin, max_rc, type_names, dtype)
+        (f, rc_rad, rc_ang, rc_spin_by_type, max_rc, type_names, dtype)
         for f in frames
     ]
 
@@ -1249,8 +1266,12 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
             has_q_134=model.has_q_134,
         )
         if model.spin_descriptor is not None:
-            q_spin = model.spin_descriptor(
+            rij_spin = model._spin_descriptor_coordinates(
                 batch["rij_spin"], batch["pair_i_spin"],
+                batch["pair_j_spin"], batch["atom_types"],
+            )
+            q_spin = model.spin_descriptor(
+                rij_spin, batch["pair_i_spin"],
                 batch["pair_j_spin"], batch["spins"], batch["N"],
                 batch["atom_types"], c_spin, None,
                 model.spin_dof_type_active,

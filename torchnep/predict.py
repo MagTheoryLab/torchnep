@@ -411,7 +411,8 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
                  "cutoff_angular": calc.rc_angular,
                  "type_names": calc.type_names,
                  "spin_mode": calc.spin_mode,
-                 "spin_cutoff": calc.spin_cutoff}
+                 "spin_cutoff": calc.spin_cutoff,
+                 "spin_cutoff_by_type": calc.spin_cutoff_by_type}
     os.makedirs(output_dir, exist_ok=True)
     fh = {name: open(os.path.join(output_dir, name), "w")
           for name in ("energy_train.out", "force_train.out",

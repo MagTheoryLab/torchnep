@@ -22,6 +22,8 @@ import re
 import numpy as np
 from typing import Dict, List
 
+from .spin_schema import normalize_spin_cutoff
+
 
 def _parse_properties_schema(comment: str):
     """Parse the extended-XYZ ``Properties=...`` field.
@@ -431,9 +433,9 @@ def parse_nep_in(filename: str) -> Dict:
                     )
                 params["spin_mforce_mode"] = value
             elif key == "spin_cutoff":
-                if len(parts) != 2:
-                    raise ValueError("spin_cutoff requires one value")
-                params["spin_cutoff"] = [float(parts[1]), float(parts[1])]
+                if len(parts) < 2:
+                    raise ValueError("spin_cutoff requires at least one value")
+                params["spin_cutoff"] = [float(value) for value in parts[1:]]
             elif key in ("spin_dof_type", "spin_env_type"):
                 params[key] = parts[1:]
             elif key == "spin_type":
@@ -566,14 +568,24 @@ def parse_nep_in(filename: str) -> Dict:
         params.setdefault("spin_soc", 0)
         params.setdefault("spin_curriculum", False)
         params.setdefault("spin_mforce_mode", "full")
-    params.setdefault(
-        "spin_cutoff",
-        (
-            [6.0, 6.0]
-            if params["spin_mode"] in (2, 3)
-            else [params["cutoff_radial"], params["cutoff_angular"]]
-        ),
-    )
+    if params["spin_mode"] in (2, 3):
+        params.setdefault("spin_cutoff", [6.0])
+        params["spin_cutoff_by_type"] = normalize_spin_cutoff(
+            params["spin_cutoff"], params["num_types"]
+        )
+        spin_cutoff_max = max(params["spin_cutoff_by_type"])
+        # Retain the historical two-slot runtime field.  The spin descriptor
+        # has one radial cutoff; both entries carry the candidate-list max.
+        params["spin_cutoff"] = [spin_cutoff_max, spin_cutoff_max]
+    else:
+        # Preserve the non-spin config shape; this feature must not alter the
+        # structural radial/angular cutoff contract.
+        params["spin_cutoff"] = [
+            params["cutoff_radial"], params["cutoff_angular"]
+        ]
+        params["spin_cutoff_by_type"] = [
+            params["cutoff_radial"]
+        ] * params["num_types"]
     params.setdefault("spin_dof_type", None)
     params.setdefault("spin_env_type", None)
 
