@@ -23,11 +23,12 @@ from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 import torch
 
+from .virial import VIRIAL6_INDICES
+
 
 _GRAPH_ENV = "TORCHNEP_OC_CUDA_TRAIN_GRAPH_CACHE"
 _GRAPH_CACHE_SIZE_ENV = "TORCHNEP_OC_CUDA_GRAPH_CACHE_SIZE"
 _COMPILE_TAIL_ENV = "TORCHNEP_OC_CUDA_COMPILE_TAIL"
-_VIRIAL_6 = [0, 1, 2, 4, 5, 8]
 _INPUT_KEYS = (
     "rij_rad", "rij_ang", "pair_i_rad", "pair_j_rad",
     "pair_i_ang", "pair_j_ang", "atom_types", "struct_idx",
@@ -208,7 +209,7 @@ def _joint_loss_from_result(
         virial_components = batch.get("virial_components")
         if virial_components is None:
             virial_components = torch.tensor(
-                _VIRIAL_6, dtype=torch.long, device=e_delta.device
+                VIRIAL6_INDICES, dtype=torch.long, device=e_delta.device
             )
         v_delta = (
             v_system.index_select(1, virial_components)
@@ -351,7 +352,7 @@ class OCCudaGraphTrainCache:
             "need_mforce": bool(need_mforce),
             "need_tau": bool(need_tau),
             "virial_components": torch.tensor(
-                _VIRIAL_6, dtype=torch.long,
+                VIRIAL6_INDICES, dtype=torch.long,
                 device=batch["rij_rad"].device,
             ),
         })

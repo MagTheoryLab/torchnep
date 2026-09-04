@@ -559,19 +559,26 @@ class NEPModel(nn.Module):
             )
 
             # The magnetic block cannot be centered: q_spin=0 must remain the
-            # exact zero-spin limit.  Normalize by the largest of RMS, range,
-            # and a unit floor.  RMS normalizes a large fixed-moment offset;
-            # range protects against sparse tails; the floor prevents nearly
-            # null symmetry channels from being amplified into tanh.  This
-            # form is deliberately one fused max/max/reciprocal chain and
-            # needs neither a mean nor a branch per channel.
+            # exact zero-spin limit.  RMS normalizes a large fixed-moment
+            # offset and range protects against sparse tails.  Only channels
+            # unresolved at the dtype's relative precision keep unit scale;
+            # an absolute unit floor would suppress physically small SOC
+            # channels before they reach the ANN.
             spin_slice = slice(self.struct_dim, None)
             spin_rms = q_rms[spin_slice]
-            spin_span = torch.maximum(
-                torch.maximum(spin_rms, diff[spin_slice]),
-                torch.ones_like(spin_rms),
+            spin_span = torch.maximum(spin_rms, diff[spin_slice])
+            spin_peak = torch.maximum(
+                q_min[spin_slice].abs(), q_max[spin_slice].abs()
             )
-            scaler[spin_slice] = spin_span.reciprocal()
+            resolution = 64.0 * torch.finfo(diff.dtype).eps * torch.maximum(
+                spin_peak, torch.ones_like(spin_peak)
+            )
+            unresolved = spin_span <= resolution
+            scaler[spin_slice] = torch.where(
+                unresolved,
+                torch.ones_like(spin_span),
+                spin_span.clamp_min(torch.finfo(diff.dtype).tiny).reciprocal(),
+            )
         else:
             scaler = torch.clamp(diff, min=1e-10).reciprocal()
         self.q_scaler.copy_(scaler)

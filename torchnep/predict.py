@@ -30,6 +30,8 @@ import time
 import torch
 import numpy as np
 
+from .virial import virial9_to_6_numpy
+
 from .nep import NEPCalculator
 from . import ops
 
@@ -63,27 +65,14 @@ def _stress_from_virial(virial_pa, nat_col, vol_col, keep_missing):
     return stress
 
 
-def _virial9_to_6(v9):
+def _virial9_to_6(v9, spin_mode=0):
     r"""Re-order length-9 row-major virial (xx,xy,xz,yx,yy,yz,zx,zy,zz) into
     the GPUMD 6-vector (xx,yy,zz,xy,yz,zx).
 
-    Picks single-triangular components to match GPUMD's per-atom virial
-    convention (src/main_nep/nep.cu: s_virial_xy = -r[0]*f[1], s_virial_yz
-    = -r[1]*f[2], s_virial_zx = -r[2]*f[0]). GPUMD does not average with
-    the symmetric partner — it stores only one entry of each off-diagonal
-    pair during force accumulation. Per-FRAME totals are still symmetric
-    because the sum \Sigma -r_\alpha f_\beta over directed pairs equals
-    \Sigma -r_\beta f_\alpha by Newton's 3rd law, so this choice is
-    numerically equivalent to averaging at the per-frame output level but
-    gives cheaper bit-identical match with GPUMD outputs."""
-    out = np.empty((v9.shape[0], 6), dtype=v9.dtype)
-    out[:, 0] = v9[:, 0]   # xx = -r_x f_x
-    out[:, 1] = v9[:, 4]   # yy = -r_y f_y
-    out[:, 2] = v9[:, 8]   # zz = -r_z f_z
-    out[:, 3] = v9[:, 1]   # xy = -r_x f_y
-    out[:, 4] = v9[:, 5]   # yz = -r_y f_z
-    out[:, 5] = v9[:, 6]   # zx = -r_z f_x
-    return out
+    Spin2 and nonmagnetic models retain GPUMD's single-triangular convention.
+    Spin3 exposes the symmetric strain derivative used by DFT labels while
+    retaining the full raw9 tensor inside the model."""
+    return virial9_to_6_numpy(v9, spin_mode)
 
 
 class _Progress:
@@ -148,7 +137,7 @@ def _chunk_bounds(natoms, chunk_atoms, max_frames):
     return bounds
 
 
-def _chunk_arrays(structures, np_dtype):
+def _chunk_arrays(structures, np_dtype, spin_mode=0):
     """Concatenate one chunk of preprocessed structures into flat host arrays."""
     natoms_arr = np.asarray([s["natoms"] for s in structures], dtype=np.int64)
     volumes_arr = np.asarray([s.get("volume", 0.0) for s in structures],
@@ -184,8 +173,8 @@ def _chunk_arrays(structures, np_dtype):
             forces_ref[nat_cum[i]:nat_cum[i + 1]] = np.asarray(f).reshape(-1, 3)
     c["forces_ref"] = forces_ref
     # Per-atom reference virial, GPUMD 6-vector (xx yy zz xy yz zx). The
-    # off-diagonal pick matches _virial9_to_6 so both columns share one
-    # definition; frames without a virial carry the -1e6 sentinel.
+    # projection matches _virial9_to_6 so both columns share one definition;
+    # frames without a virial carry the -1e6 sentinel.
     virial_ref = np.full((n_struct, 6), _MISSING_VIRIAL, dtype=np.float64)
     for i, s in enumerate(structures):
         v = s.get("virial")
@@ -194,8 +183,9 @@ def _chunk_arrays(structures, np_dtype):
         v = np.asarray(v).flatten()
         inv_n = 1.0 / float(s["natoms"])
         if v.size == 9:
-            virial_ref[i] = [v[0] * inv_n, v[4] * inv_n, v[8] * inv_n,
-                             v[1] * inv_n, v[5] * inv_n, v[6] * inv_n]
+            virial_ref[i] = (
+                _virial9_to_6(v[None, :], spin_mode)[0] * inv_n
+            )
         elif v.size >= 6:
             virial_ref[i] = v[:6] * inv_n
     c["virial_ref"] = virial_ref
@@ -365,7 +355,9 @@ def _predict_chunk(calc, chunk, batch_size, device, dt, backend,
                     0, struct_idx.unsqueeze(-1).expand(-1, 9), result["virial"])
                 nat_slice = natoms_arr[start:end].astype(np.float64)
                 e_pred[start:end] = result["Etot"].cpu().numpy() / nat_slice
-                v_pred[start:end] = _virial9_to_6(v_per_frame.cpu().numpy()) / nat_slice[:, None]
+                v_pred[start:end] = _virial9_to_6(
+                    v_per_frame.cpu().numpy(), calc.spin_mode
+                ) / nat_slice[:, None]
                 f_pred[a_lo:a_hi] = result["forces"].cpu().numpy()
                 if has_spin:
                     m_pred[a_lo:a_hi] = result["mforces"].cpu().numpy()
@@ -444,7 +436,7 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
         t0 = time.time()
         structures = preprocess_structures(frames, pp_config, np_dtype, pool=pool)
         del frames
-        chunk = _chunk_arrays(structures, np_dtype)
+        chunk = _chunk_arrays(structures, np_dtype, calc.spin_mode)
         del structures
         tm["neighbors"] += time.time() - t0
         if batch_size is None:
@@ -848,7 +840,9 @@ def predict_from_store(model, data_store, output_dir: str,
             v_per.scatter_add_(0,
                 batch["struct_idx"].unsqueeze(-1).expand(-1, 9), r["virial"])
             v9 = v_per.cpu().numpy()
-            v_pred[start:end] = _virial9_to_6(v9) / nat_slice[:, None]
+            v_pred[start:end] = _virial9_to_6(
+                v9, model.spin_mode
+            ) / nat_slice[:, None]
 
             a_lo = int(nat_cum[start]); a_hi = int(nat_cum[end])
             f_pred[a_lo:a_hi] = r["forces"].cpu().numpy()
@@ -886,15 +880,9 @@ def predict_from_store(model, data_store, output_dir: str,
         if data_store.has_virial_flag[i]:
             v9 = data_store.virial[i].cpu().numpy().flatten()  # length-9
             n = float(nat_arr[i])
-            # Single-triangular pick to match GPUMD (see _virial9_to_6).
-            virial_ref[i] = [
-                v9[0] / n,   # xx
-                v9[4] / n,   # yy
-                v9[8] / n,   # zz
-                v9[1] / n,   # xy
-                v9[5] / n,   # yz
-                v9[6] / n,   # zx
-            ]
+            virial_ref[i] = _virial9_to_6(
+                v9[None, :], model.spin_mode
+            )[0] / n
 
     os.makedirs(output_dir, exist_ok=True)
     t_write = time.time()
@@ -976,7 +964,8 @@ def _compute_local_predictions(model, data_store, batch_size):
             v_per = torch.zeros(B, 9, dtype=dtype, device=dev)
             v_per.scatter_add_(
                 0, batch["struct_idx"].unsqueeze(-1).expand(-1, 9), r["virial"])
-            v_pred[start:end] = (_virial9_to_6(v_per.cpu().numpy())
+            v_pred[start:end] = (_virial9_to_6(
+                v_per.cpu().numpy(), model.spin_mode)
                                  / nat_slice[:, None])
 
             a_lo, a_hi = int(nat_cum[start]), int(nat_cum[end])
@@ -1014,8 +1003,9 @@ def _compute_local_predictions(model, data_store, batch_size):
         if data_store.has_virial_flag[i]:
             v9 = data_store.virial[i].cpu().numpy().flatten()
             n = float(nat_arr[i])
-            virial_ref[i] = [v9[0] / n, v9[4] / n, v9[8] / n,
-                             v9[1] / n, v9[5] / n, v9[6] / n]
+            virial_ref[i] = _virial9_to_6(
+                v9[None, :], model.spin_mode
+            )[0] / n
 
     vol_arr = data_store.volumes.detach().cpu().numpy().astype(np.float64)
     result = {

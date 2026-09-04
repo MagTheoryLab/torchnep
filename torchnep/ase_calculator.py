@@ -49,6 +49,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised only sans ase
     ) from exc
 
 from .nep import NEPCalculator as _NEPCore
+from .virial import virial9_to_6_numpy
 
 
 def _resolve_dtype(dtype):
@@ -210,7 +211,7 @@ class NEP(Calculator):
 
         if periodic:
             self.results["stress"] = self._stress_from_virial(
-                res["virial"], atoms.get_volume())
+                res["virial"], atoms.get_volume(), self.nep.spin_mode)
 
     def get_magnetic_forces(self, atoms=None):
         """Return magnetic forces ``-dE/dspin`` as an ``(N, 3)`` array."""
@@ -227,10 +228,17 @@ class NEP(Calculator):
         return self.get_property("tau", atoms)
 
     @staticmethod
-    def _stress_from_virial(virial, volume):
+    def _stress_from_virial(virial, volume, spin_mode=0):
         # Per-atom virial is (N, 9) row-major; W_ab = Σ rij_a * F_b.
         # ASE stress σ = -W / V (Voigt order xx, yy, zz, yz, xz, xy).
-        w = virial.detach().cpu().numpy().sum(0).reshape(3, 3)
+        raw9 = virial.detach().cpu().numpy().sum(0)
+        if spin_mode == 3:
+            # DFT/ASE stress is the derivative with respect to symmetric
+            # strain. Keep raw9 in the model, but expose its symmetric six
+            # components here without materializing a transpose.
+            w6 = virial9_to_6_numpy(raw9[None, :], spin_mode)[0]
+            return -w6[[0, 1, 2, 4, 5, 3]] / volume
+        w = raw9.reshape(3, 3)
         return full_3x3_to_voigt_6_stress(-w / volume)
 
     def get_energy_components(self, atoms=None):
@@ -277,6 +285,6 @@ class NEP(Calculator):
                      "forces": res["forces" + esuffix].detach().cpu().numpy()}
             if periodic:
                 block["stress"] = self._stress_from_virial(
-                    res["virial" + esuffix], vol)
+                    res["virial" + esuffix], vol, self.nep.spin_mode)
             out[name] = block
         return out

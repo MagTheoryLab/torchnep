@@ -198,6 +198,19 @@ def test_non_periodic_has_no_stress():
     assert "stress" not in atoms.calc.results
 
 
+def test_spin3_ase_stress_uses_symmetric_strain_projection():
+    raw9 = torch.tensor([[
+        1.0, 2.0, 3.0,
+        4.0, 5.0, 6.0,
+        7.0, 8.0, 9.0,
+    ]], dtype=torch.float64)
+    stress = NEP._stress_from_virial(raw9, volume=2.0, spin_mode=3)
+    # ASE Voigt order is xx, yy, zz, yz, xz, xy.
+    np.testing.assert_array_equal(
+        stress, -np.array([1.0, 5.0, 9.0, 7.0, 5.0, 3.0]) / 2.0
+    )
+
+
 def test_non_periodic_vacuum_uses_largest_spin_cutoff():
     calc = NEP.__new__(NEP)
     calc.nep = SimpleNamespace(

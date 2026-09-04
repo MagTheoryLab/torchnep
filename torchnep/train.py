@@ -43,6 +43,7 @@ from typing import List, Dict, Optional
 from torch.optim.swa_utils import AveragedModel
 
 from .model import NEPModel, slim_model, gpumd_init_parameters
+from .virial import virial6_for_labels as virial6_for_loss
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices, build_neighbor_list_np)
 from . import ops
@@ -1133,38 +1134,6 @@ def validate_resume_data_lineage(saved, current, require_versioned=False):
             "training/validation data content or split changed since the "
             "checkpoint was saved; start a new run or fine-tune instead. "
             f"saved={saved}, current={current}")
-
-
-# The 6 unique components of the symmetric virial, picked from the row-major
-# 3x3 (length-9) layout in GPUMD order: xx, yy, zz, xy, yz, zx. The virial loss
-# must use these 6 — averaging over all 9 would weight the (symmetric)
-# off-diagonal pairs twice relative to the diagonal. Matches GPUMD's
-# 6-component virial RMSE (lambda_shear=1 by default).
-_VIRIAL_6 = [0, 4, 8, 1, 5, 6]
-
-
-def virial6_for_loss(virial: torch.Tensor, spin_mode: int) -> torch.Tensor:
-    """Return ``xx yy zz xy yz zx`` for the training loss.
-
-    A spin-orbit model's position-only virial may have a physical
-    antisymmetric spin-lattice part, while stress labels constrain symmetric
-    strain.  spin3 therefore compares the symmetric tensor.  The direct six
-    contractions below avoid materializing a 3x3 transpose; spin2 keeps its
-    historical component selection unchanged.
-    """
-    if virial.shape[-1] != 9:
-        raise ValueError("virial loss expects a row-major 9-component tensor")
-    if spin_mode != 3:
-        return virial[..., _VIRIAL_6]
-    half = virial.new_tensor(0.5)
-    return torch.stack((
-        virial[..., 0],
-        virial[..., 4],
-        virial[..., 8],
-        half * (virial[..., 1] + virial[..., 3]),
-        half * (virial[..., 5] + virial[..., 7]),
-        half * (virial[..., 6] + virial[..., 2]),
-    ), dim=-1)
 
 
 def magnetic_force_residual(

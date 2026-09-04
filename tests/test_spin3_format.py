@@ -7,6 +7,7 @@
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -30,6 +31,7 @@ from torchnep.train import (
     spin_curriculum_end,
     virial6_for_loss,
 )
+from torchnep.virial import virial9_to_6_numpy
 
 
 DTYPE = torch.float64
@@ -593,15 +595,19 @@ def test_spin3_rms_range_scaler_is_zero_preserving_and_bounded():
     q_min[start + 3] = 0.0
     q_max[start + 3] = 20.0
     q_rms[start + 3] = 1.0e-4
+    q_min[start + 4] = q_max[start + 4] = 0.0
+    q_rms[start + 4] = 0.0
     model.set_q_scaler(q_min, q_max, q_rms)
     assert model.q_scaler[0].item() == pytest.approx(0.5)
     assert model.q_scaler[start].item() == pytest.approx(0.05)
     assert model.q_scaler[start + 1].item() == pytest.approx(0.1)
-    assert model.q_scaler[start + 2].item() == pytest.approx(1.0)
+    assert model.q_scaler[start + 2].item() == pytest.approx(1.0e12)
     assert model.q_scaler[start + 3].item() == pytest.approx(0.05)
+    assert model.q_scaler[start + 4].item() == pytest.approx(1.0)
     assert (q_max[start + 3] * model.q_scaler[start + 3]).item() \
         == pytest.approx(1.0)
-    assert model.q_scaler[start + 2].item() <= 1.0
+    assert (q_max[start + 2] * model.q_scaler[start + 2]).item() \
+        == pytest.approx(1.0)
     zero_spin = torch.zeros(3, model.spin_dim, dtype=DTYPE)
     torch.testing.assert_close(
         zero_spin * model.q_scaler[start:], zero_spin
@@ -694,6 +700,20 @@ def test_spin3_virial_loss_uses_low_cost_symmetric_contraction():
     )
     assert not torch.equal(
         virial6_for_loss(changed, 2), virial6_for_loss(virial, 2)
+    )
+
+
+def test_spin3_prediction_virial_matches_label_projection():
+    virial = np.array([
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    ])
+    np.testing.assert_array_equal(
+        virial9_to_6_numpy(virial, 2),
+        np.array([[1.0, 5.0, 9.0, 2.0, 6.0, 7.0]]),
+    )
+    np.testing.assert_array_equal(
+        virial9_to_6_numpy(virial, 3),
+        np.array([[1.0, 5.0, 9.0, 3.0, 7.0, 5.0]]),
     )
 
 
