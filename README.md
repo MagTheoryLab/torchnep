@@ -73,8 +73,9 @@ enforced, and violations raise on load.
 - `response_group`, `response_probe`, `response_coordinate`, and
   `response_branch` — optional controlled-response metadata. Validation
   splitting keeps every `response_group` intact. For
-  `response_probe=rotation`, three or more distinct coordinates plus
-  `spin_tangent` activate the internal Stage-2 generator-curve objective.
+  `response_probe=rotation`, three or more distinct coordinates, converged DFT
+  spins, and magnetic-force labels activate the internal Stage-2
+  generator-curve objective. The trainer derives the path tangent internally.
 
 ### Per-atom columns
 
@@ -93,8 +94,9 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
   `spin_mforce_mode transverse`; zero-moment sites are omitted from that
   loss. Torque is derived as \(\tau=S\times m\), not predicted by a
   separate head.
-- `spin_tangent:R:3` or `response_tangent:R:3` — the controlled rotation
-  tangent `dS/dtheta`. Together with rotation response metadata and magnetic
+- `spin_tangent` is not an input label. For `response_probe=rotation`, the
+  trainer derives `dS/dtheta` from the converged DFT spins in each complete
+  group. Together with magnetic
   forces, this supervises both the group mean and centered shape of
   `sum_i mforce_i dot dS_i/dtheta`; no explicit J or D label is required.
 

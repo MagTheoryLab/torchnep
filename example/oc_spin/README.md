@@ -74,15 +74,15 @@ head；`lambda_tau` 只是额外的 \(|S|^2\) 横向误差权重。
 - response_probe：rotation、chirality、strain 或 volume；
 - response_coordinate：角度、应变或体积坐标；
 - response_branch：reference、plus 或 minus。
-- 每原子的 spin_tangent：该扫描点的 dS/dtheta，写入 extxyz 的
-  Properties 列。
+- 每帧使用 DFT 约束收敛后的 `spin:R:3`；训练器按组和坐标自动计算
+  `dS/dtheta`，无需在 extxyz 中提供 `spin_tangent`。
 
 使用 valid_ratio 时，训练器按 response_group 整组划分，避免同一
 扫描轨迹同时进入训练和验证。最终验收还应保留完全未参与训练的
 基础结构或晶胞扫描。
 
 这些结构不要求额外提供 J 或 D 标签。对 rotation 组，三个以上不同
-response_coordinate、MF 和 spin_tangent 会在 Stage 2 自动启用稳健的
+response_coordinate、最终 DFT spin 和 MF 会在 Stage 2 自动启用稳健的
 磁力生成元曲线监督：每帧直接计算
 sum_i MF_i dot dS_i/dtheta，同时拟合组均值和中心化形状。这既保留
 常数响应分量，又避开能量二阶差分的 h^-2 噪声放大；训练仍只使用

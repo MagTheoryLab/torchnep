@@ -129,9 +129,12 @@ def _parse_frame_block(block, energy_key="energy"):
         "mforce", "mforces", "force_mag", "forces_mag",
         "magnetic_force", "magnetic_forces",
     ), "mforces")
-    _read_vector(
-        ("spin_tangent", "response_tangent"), "spin_tangent"
-    )
+    tangent_fields = {"spin_tangent", "response_tangent"}.intersection(schema)
+    if tangent_fields:
+        field = sorted(tangent_fields)[0]
+        raise ValueError(
+            f"{field} is not an input label; the trainer derives dS/dtheta "
+            "from each final DFT spin path")
     # Torque is a derived target, not an additional dataset requirement.
     # Keep the convention used by the spin model: tau = spin x mforce.
     if "spins" in frame and "mforces" in frame:

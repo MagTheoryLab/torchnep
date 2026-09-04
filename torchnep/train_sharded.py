@@ -740,10 +740,11 @@ def train_nep_sharded(
         response_frames = []
     else:
         response_frames = (
-            select_generator_curve_frames(frames)
+            select_generator_curve_frames(frames, config.get("spin_dof_type"))
             if config.get("spin_mode", 0) in (2, 3) else [])
     valid_response_frames = (
-        select_generator_curve_frames(valid_frames)
+        select_generator_curve_frames(
+            valid_frames, config.get("spin_dof_type"))
         if config.get("spin_mode", 0) in (2, 3) and valid_frames is not None
         else []
     )

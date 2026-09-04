@@ -115,24 +115,16 @@ def _mark_rotation_scan(path, group, repeat_single=False):
             f"response_group={group} response_probe=rotation "
             f"response_coordinate={coordinate} Properties=",
         )
-        header = header.replace(
-            "mforce:R:3", "mforce:R:3:spin_tangent:R:3")
         rendered.extend([block[0], header])
         for atom, line in enumerate(block[2:]):
             fields = line.split()
-            tangent = [0.0, 0.0, 0.0]
             if atom == 1:
                 fields[7:10] = [
                     f"{np.cos(coordinate):.16e}",
                     f"{np.sin(coordinate):.16e}",
                     "0.0",
                 ]
-                tangent = [
-                    -np.sin(coordinate), np.cos(coordinate), 0.0,
-                ]
-            rendered.append(
-                " ".join(fields + [f"{value:.16e}" for value in tangent])
-            )
+            rendered.append(" ".join(fields))
     path.write_text("\n".join(rendered) + "\n")
 
 

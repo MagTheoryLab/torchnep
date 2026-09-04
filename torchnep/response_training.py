@@ -30,14 +30,18 @@ GENERATOR_CURVE_SCHEMA = \
     "neutral-group-balanced-mean-plus-centered-mforce-generator-v3"
 
 
-def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
+def select_generator_curve_frames(
+    frames: Sequence[Dict], active_species=None
+) -> List[Dict]:
     """Return validated rotation-scan frames in deterministic group order.
 
     A participating frame declares ``response_probe=rotation`` and must have
-    a response group, a numeric angular coordinate, magnetic-force labels,
-    and one per-atom ``spin_tangent = dS/dtheta`` vector.  Groups need at
-    least three distinct coordinates.  Non-rotation frames are ignored.
+    a response group, a numeric angular coordinate, converged DFT spins, and
+    magnetic-force labels.  ``dS/dtheta`` is derived from the complete group;
+    it is not a user-provided label.  Groups need at least three distinct
+    coordinates.  Non-rotation frames are ignored.
     """
+    active = None if active_species is None else set(active_species)
     candidates = defaultdict(list)
     for index, frame in enumerate(frames):
         if frame.get("response_probe") != "rotation":
@@ -50,19 +54,12 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
 
     groups = {}
     for group, indexed_members in candidates.items():
-        tangent_flags = [
-            "spin_tangent" in frame for _, frame in indexed_members
-        ]
-        # Backward-compatible metadata-only scans remain available for
-        # group-disjoint splitting and external acceptance analysis.
-        if not any(tangent_flags):
-            continue
-        if not all(tangent_flags):
-            raise ValueError(
-                f"rotation response_group {group!r} has spin_tangent on "
-                "only part of the scan")
         groups[group] = []
         for index, frame in indexed_members:
+            if "spin_tangent" in frame:
+                raise ValueError(
+                    "spin_tangent is not an input label; the trainer derives "
+                    "dS/dtheta from each final DFT spin path")
             missing = [
                 key for key in (
                     "response_coordinate", "mforces", "spins", "species",
@@ -85,19 +82,11 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
                 raise ValueError(
                     "rotation response_coordinate must be finite, got "
                     f"{coordinate!r} at frame {index}")
-            tangent = np.asarray(frame["spin_tangent"])
-            if tangent.shape != (frame["natoms"], 3):
-                raise ValueError(
-                    f"spin_tangent at frame {index} must have shape "
-                    f"({frame['natoms']}, 3), got {tangent.shape}")
             mforces = np.asarray(frame["mforces"])
             if mforces.shape != (frame["natoms"], 3):
                 raise ValueError(
                     f"mforces at frame {index} must have shape "
                     f"({frame['natoms']}, 3), got {mforces.shape}")
-            if not np.isfinite(tangent).all():
-                raise ValueError(
-                    f"spin_tangent at frame {index} contains NaN or Inf")
             if not np.isfinite(mforces).all():
                 raise ValueError(
                     f"mforces at frame {index} contains NaN or Inf")
@@ -125,18 +114,6 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
                 raise ValueError(
                     f"rotation response frame {index} has nonfinite "
                     "spin or geometry values")
-            spin_norm = np.linalg.norm(spins, axis=1)
-            tangent_norm = np.linalg.norm(tangent, axis=1)
-            dot = np.einsum("ij,ij->i", spins, tangent)
-            tolerance = 1.0e-7 * np.maximum(
-                spin_norm * tangent_norm, 1.0)
-            if np.any(np.abs(dot) > tolerance):
-                raise ValueError(
-                    f"spin_tangent at frame {index} is not orthogonal to "
-                    "the fixed-magnitude rotation spin")
-            if np.any((spin_norm < 1.0e-12) & (tangent_norm > 1.0e-12)):
-                raise ValueError(
-                    f"spin_tangent at frame {index} rotates a zero spin")
             groups[group].append(frame)
 
     selected = []
@@ -155,8 +132,6 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
         reference = members[0]
         reference_positions = np.asarray(reference["positions"])
         reference_cell = np.asarray(reference["cell"])
-        reference_magnitudes = np.linalg.norm(
-            np.asarray(reference["spins"]), axis=1)
         for frame in members[1:]:
             if frame["natoms"] != reference["natoms"] or \
                     tuple(frame["species"]) != tuple(reference["species"]):
@@ -171,27 +146,35 @@ def select_generator_curve_frames(frames: Sequence[Dict]) -> List[Dict]:
                 raise ValueError(
                     f"rotation response_group {group!r} changes geometry; "
                     "put each strained geometry in a separate group")
-            if not np.allclose(
-                    np.linalg.norm(frame["spins"], axis=1),
-                    reference_magnitudes, rtol=1.0e-8, atol=1.0e-10):
-                raise ValueError(
-                    f"rotation response_group {group!r} changes spin "
-                    "magnitudes")
         if all(np.allclose(
                 frame["spins"], reference["spins"],
                 rtol=0.0, atol=1.0e-12) for frame in members[1:]):
             raise ValueError(
                 f"rotation response_group {group!r} contains no spin "
                 "rotation across coordinates")
-        tangent_power = sum(
-            float(np.square(np.asarray(frame["spin_tangent"])).sum())
-            for frame in members
-        )
+        coordinate_array = np.asarray([
+            float(frame["response_coordinate"]) for frame in members
+        ], dtype=np.float64)
+        spin_path = np.asarray([
+            np.asarray(frame["spins"], dtype=np.float64) for frame in members
+        ])
+        tangents = np.gradient(
+            spin_path, coordinate_array, axis=0, edge_order=2)
+        tangent_power = float(np.square(tangents).sum())
         if tangent_power == 0.0:
             raise ValueError(
                 f"rotation response_group {group!r} has an all-zero "
-                "spin_tangent generator")
-        selected.extend(members)
+                "spin-path generator")
+        for frame, tangent in zip(members, tangents):
+            derived = dict(frame)
+            if active is not None:
+                tangent = tangent.copy()
+                inactive = [
+                    species not in active for species in frame["species"]
+                ]
+                tangent[inactive] = 0.0
+            derived["spin_tangent"] = tangent
+            selected.append(derived)
     return selected
 
 
