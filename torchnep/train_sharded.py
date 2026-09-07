@@ -172,7 +172,7 @@ from .train import (
     spin_curriculum_end,
     prepare_spin3_curriculum_clip, restore_spin3_curriculum_clip,
     refresh_order3_q_scaler, reset_order3_optimizer_state,
-    magnetic_force_residual, virial6_for_loss,
+    virial6_for_loss,
     grouped_validation_indices, validate_spin_frames,
     validate_response_group_disjoint, build_data_lineage,
     validate_resume_data_lineage,
@@ -519,7 +519,6 @@ def train_nep_sharded(
     pref_v             = config["lambda_v"]
     pref_m             = config["lambda_m"]
     pref_tau           = config["lambda_tau"]
-    mforce_mode        = config["spin_mforce_mode"]
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")
     stage2_lr          = config["stage2_lr"]
@@ -1242,8 +1241,7 @@ def train_nep_sharded(
             store, eval_bs, raw_model,
             raw_model.compute_properties, _shim._compute_cached,
             use_autograd_forces, train_backend,
-            need_forces, need_virial, need_mforce, need_tau, dtype, dev,
-            mforce_mode)
+            need_forces, need_virial, need_mforce, need_tau, dtype, dev)
         sums_t = torch.tensor(sums, device=dev, dtype=torch.float64)
         dist.all_reduce(sums_t)
         (s_le, s_lf, s_lv, s_ls, s_lm, s_lt,
@@ -1314,7 +1312,6 @@ def train_nep_sharded(
             if response_enabled else 0.0),
     }
     if raw_model.spin_mode == 3:
-        cur_loss_weights["spin_mforce_mode"] = mforce_mode
         cur_loss_weights["generator_curve_step_balance"] = (
             "exact-per-epoch" if response_enabled else None
         )
@@ -1722,14 +1719,10 @@ def train_nep_sharded(
                     raw_model.spin_dof_type_active[batch["atom_types"]]
                     if has_mforces or has_tau else None)
                 if has_mforces:
-                    m_diff, m_dof, m_defined = magnetic_force_residual(
-                        result["mforces"], batch["mforces"],
-                        batch["spins"], mforce_mode,
-                    )
-                    m_mask = batch["mforce_mask"] & active & m_defined
+                    m_diff = result["mforces"] - batch["mforces"]
+                    m_mask = batch["mforce_mask"] & active
                 else:
                     m_diff = None
-                    m_dof = 3
                     m_mask = None
                 t_mask = batch["tau_mask"] & active if has_tau else None
                 emf = batch["energy_mask"].to(dtype)
@@ -1825,9 +1818,9 @@ def train_nep_sharded(
                     masked_m_diff = m_diff * mmf
                     sum_sq_m = masked_m_diff.square().sum()
                     loss = loss + (
-                        cur_pref_m * sum_sq_m * ws / (m_dof * cg[3])
+                        cur_pref_m * sum_sq_m * ws / (3 * cg[3])
                     )
-                    m_lm = sum_sq_m / m_dof
+                    m_lm = sum_sq_m / 3
 
                 if tmf is not None and batch["has_tau"]:
                     t_diff = (result["tau"] - batch["tau"]) * tmf

@@ -424,17 +424,6 @@ def parse_nep_in(filename: str) -> Dict:
                 if value not in (0, 1):
                     raise ValueError("spin_curriculum must be 0 or 1")
                 params["spin_curriculum"] = bool(value)
-            elif key == "spin_mforce_mode":
-                if len(parts) != 2:
-                    raise ValueError(
-                        "spin_mforce_mode requires one value: 0 (full) or 1 (transverse)"
-                    )
-                value = parts[1]
-                if value not in ("0", "1"):
-                    raise ValueError(
-                        "spin_mforce_mode must be 0 (full) or 1 (transverse)"
-                    )
-                params["spin_mforce_mode"] = {"0": "full", "1": "transverse"}[value]
             elif key == "spin_cutoff":
                 if len(parts) < 2:
                     raise ValueError("spin_cutoff requires at least one value")
@@ -512,7 +501,7 @@ def parse_nep_in(filename: str) -> Dict:
         raise ValueError("spin_mode must be 0, 2, or 3")
     spin_only_keys = {
         "spin_compress", "spin_l_max", "spin_order", "spin_soc",
-        "spin_curriculum", "spin_mforce_mode",
+        "spin_curriculum",
         "spin_cutoff", "spin_dof_type", "spin_env_type",
     }
     ignored_spin_keys = sorted(explicit & spin_only_keys)
@@ -562,7 +551,6 @@ def parse_nep_in(filename: str) -> Dict:
         params.setdefault("spin_order", 3)
         params.setdefault("spin_soc", 1)
         params.setdefault("spin_curriculum", params["spin_order"] == 3)
-        params.setdefault("spin_mforce_mode", "full")
     else:
         params.setdefault("spin_compress", 2)
         params.setdefault("spin_basis_size", [8, 0])
@@ -570,7 +558,6 @@ def parse_nep_in(filename: str) -> Dict:
         params.setdefault("spin_order", 1)
         params.setdefault("spin_soc", 0)
         params.setdefault("spin_curriculum", False)
-        params.setdefault("spin_mforce_mode", "full")
     if params["spin_mode"] in (2, 3):
         params.setdefault("spin_cutoff", [6.0])
         params["spin_cutoff_by_type"] = normalize_spin_cutoff(
@@ -606,12 +593,6 @@ def parse_nep_in(filename: str) -> Dict:
             raise ValueError("spin_soc must be 0 or 1")
         if params["spin_curriculum"] and params["spin_order"] != 3:
             raise ValueError("spin_curriculum requires spin_order 3")
-        if ("spin_mforce_mode" in explicit
-                and params["spin_mode"] != 3):
-            raise ValueError(
-                "spin_mforce_mode is a spin_mode 3 training contract; "
-                "spin_mode 2 retains full three-component magnetic-force loss"
-            )
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)

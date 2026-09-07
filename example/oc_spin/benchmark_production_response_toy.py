@@ -196,9 +196,6 @@ def _write_xyz(path, frames, with_tangent):
 def _write_config(path, epochs, lambda_m, stage2_lambda_m, spin_mode=2):
     if lambda_m < 0.0 or stage2_lambda_m < 0.0:
         raise ValueError("magnetic-force weights must be nonnegative")
-    mforce_contract = (
-        "spin_mforce_mode 0\n" if spin_mode == 3 else ""
-    )
     path.write_text(
         "type 1 Fe\n"
         "cutoff 4.0 4.0\n"
@@ -212,7 +209,6 @@ def _write_config(path, epochs, lambda_m, stage2_lambda_m, spin_mode=2):
         "spin_order 3\n"
         "spin_soc 1\n"
         "spin_cutoff 4.0\n"
-        f"{mforce_contract}"
         "lambda_e 1.0\n"
         "lambda_f 0.0\n"
         "lambda_v 0.0\n"

@@ -124,16 +124,12 @@ s_q=\left[\max\left(
 
 ## 训练量的定义
 
-- `spin_mforce_mode` 使用 `0=full`、`1=transverse`，默认 `0`。
-  横向约束场数据应设置为 `1`。
-- `spin_mforce_mode 0` 拟合完整的
+- `mforce` 拟合完整的
   \(\boldsymbol m=-\partial E/\partial\boldsymbol S\)，包括纵向
-  分量。标签必须采用同一约定。
-- `spin_mforce_mode 1` 只在 spin3 可用，拟合
-  \(\boldsymbol m_\perp=\boldsymbol m-
-  (\boldsymbol m\cdot\boldsymbol S)\boldsymbol S/
-  |\boldsymbol S|^2\)，按两个内禀自由度报告 RMSE；它适合只提供
-  横向约束场的定磁矩 DFT 数据。零磁矩点不定义方向，不计入该项。
+  分量，按三个分量报告 RMSE。标签必须采用同一约定。
+- 只提供横向约束场的定磁矩 DFT 数据可设 `lambda_m 0`、
+  `lambda_tau > 0`，通过自动派生的 torque 监督横向响应。
+  第二阶段对应设置 `stage2_lambda_m 0`、`stage2_lambda_tau > 0`。
 - \(\boldsymbol\tau=\boldsymbol S\times\boldsymbol m\) 不是独立
   预测。`lambda_tau` 只会按 \(|\boldsymbol S|^2\) 额外加权磁力
   残差的横向部分；spin3 的 torque RMSE 按两个内禀自由度归一。

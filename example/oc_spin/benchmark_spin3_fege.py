@@ -53,14 +53,10 @@ def _config_text(
     batch_size: int,
     lr: float,
     spin_l_max: int,
-    mforce_mode: str,
     lambda_e: float,
     lambda_f: float,
     lambda_m: float,
 ) -> str:
-    mforce_line = (
-        f"spin_mforce_mode {dict(full=0, transverse=1)[mforce_mode]}\n" if mode == 3 else ""
-    )
     return f"""type 2 Fe Ge
 cutoff 6 5
 n_max 4 4
@@ -75,7 +71,7 @@ spin_compress 2
 spin_order 3
 spin_soc 1
 spin_curriculum 0
-{mforce_line}spin_dof_type Fe Ge
+spin_dof_type Fe Ge
 spin_env_type Fe Ge
 
 epoch {epochs}
@@ -213,8 +209,6 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[11])
     parser.add_argument("--modes", type=int, nargs="+", default=[2, 3])
     parser.add_argument("--spin-l-max", type=int, choices=(0, 1, 2), default=2)
-    parser.add_argument("--mforce-mode", choices=("full", "transverse"),
-                        default="full")
     parser.add_argument("--lambda-e", type=float, default=1.0)
     parser.add_argument("--lambda-f", type=float, default=1.0)
     parser.add_argument("--lambda-m", type=float, default=1.0)
@@ -226,10 +220,6 @@ def main():
         raise RuntimeError("the FeGe gate requires a CUDA device")
     if any(mode not in (2, 3) for mode in args.modes):
         raise ValueError("--modes accepts only 2 and 3")
-    if args.mforce_mode != "full" and 2 in args.modes:
-        raise ValueError(
-            "transverse magnetic-force training is a spin_mode 3 contract"
-        )
     args.output.mkdir(parents=True, exist_ok=True)
     dtype = torch.float64 if args.precision == "float64" else torch.float32
     report = {
@@ -244,7 +234,6 @@ def main():
         "batch_size": args.batch_size,
         "lr": args.lr,
         "spin_l_max": args.spin_l_max,
-        "mforce_mode": args.mforce_mode,
         "loss_weights": {
             "energy": args.lambda_e,
             "force": args.lambda_f,
@@ -261,7 +250,7 @@ def main():
             config_path = run_dir / "nep.in"
             config_path.write_text(_config_text(
                 mode, args.epochs, args.batch_size, args.lr, args.spin_l_max,
-                args.mforce_mode, args.lambda_e, args.lambda_f, args.lambda_m,
+                args.lambda_e, args.lambda_f, args.lambda_m,
             ))
             row = {
                 "mode": mode,

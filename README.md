@@ -89,11 +89,11 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
   magnetic moment vector.
 - `mforce:R:3`, `mforces:R:3`, or `magnetic_force:R:3` — magnetic
   force reference, using the convention \(m=-\partial E/\partial S\).
-  `spin_mforce_mode 0` requires both longitudinal and transverse
-  components. For fixed-magnitude constrained-DFT fields, use
-  `spin_mforce_mode 1`; zero-moment sites are omitted from that
-  loss. Torque is derived as \(\tau=S\times m\), not predicted by a
-  separate head.
+  Magnetic-force loss fits all three components, including the longitudinal
+  component. For fixed-magnitude constrained-DFT fields, set `lambda_m 0`
+  and `lambda_tau` to a positive value to train only on the derived torque
+  \(\tau=S\times m\). For Stage 2, use `stage2_lambda_m 0` and a positive
+  `stage2_lambda_tau`. Torque is derived, not predicted by a separate head.
 - `spin_tangent` is not an input label. For `response_probe=rotation`, the
   trainer derives `dS/dtheta` from the converged DFT spins in each complete
   group. Together with magnetic
@@ -123,7 +123,6 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_cutoff` | `6` | Magnetic cutoff (Å): one global value, or one value per element in `type` order; pair cutoff is their arithmetic mean |
 | `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
 | `spin_curriculum` | `1` for O3 | Use the O2-to-O3 training curriculum (`0` or `1`); it does not change the exported potential or inference cost |
-| `spin_mforce_mode` | `0` | Magnetic-force contract for spin3: `0` = full, `1` = fixed-magnitude transverse |
 | `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
 | `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
 

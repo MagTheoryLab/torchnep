@@ -190,7 +190,6 @@ def test_response_benchmark_has_distinct_standard_and_generator_recipes(
     )
     spin3 = parse_nep_in(spin3_path)
     assert spin3["spin_mode"] == 3
-    assert spin3["spin_mforce_mode"] == "full"
 
 
 def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):

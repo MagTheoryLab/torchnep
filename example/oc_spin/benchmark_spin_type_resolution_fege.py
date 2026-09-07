@@ -201,7 +201,7 @@ def main():
             config_path = run_dir / "nep.in"
             config_path.write_text(
                 _config_text(3, args.epochs, args.batch_size, args.lr, 2,
-                             "full", 1.0, 1.0, 1.0)
+                             1.0, 1.0, 1.0)
             )
             with _spin_pair_resolution(resolved=resolved):
                 row = {

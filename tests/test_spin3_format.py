@@ -23,7 +23,6 @@ from torchnep.nep import NEPCalculator
 from torchnep.response_training import balanced_group_step_batches
 from torchnep.spin_schema import resolve_gpumd_qscaler
 from torchnep.train import (
-    magnetic_force_residual,
     prepare_spin3_curriculum_clip,
     refresh_order3_q_scaler,
     reset_order3_optimizer_state,
@@ -105,7 +104,6 @@ def test_spin3_parser_and_fixed_production_dimensions(tmp_path):
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_soc 1\n"
-        "spin_mforce_mode 1\n"
     )
     config = parse_nep_in(path)
     model = NEPModel(config)
@@ -113,7 +111,6 @@ def test_spin3_parser_and_fixed_production_dimensions(tmp_path):
     assert model.spin_descriptor_kind == "magnetic_polynomial_v3"
     assert model.spin_descriptor.order_dims == {1: 9, 2: 43, 3: 55}
     assert model.spin_dim == 55
-    assert config["spin_mforce_mode"] == "transverse"
     assert resolve_gpumd_qscaler(3, None) is False
     with pytest.raises(ValueError, match="spin_mode 3"):
         resolve_gpumd_qscaler(3, True)
@@ -195,42 +192,6 @@ def test_spin3_ordered_pair_mixing_breaks_a_type_blind_collision():
         evaluate(spins_a, resolved),
         evaluate(spins_b, resolved),
     )
-
-
-def test_spin3_mforce_contract_is_versioned_and_validated(tmp_path):
-    missing = tmp_path / "missing.nep.in"
-    missing.write_text("type 1 Fe\nspin_mode 3\n")
-    assert parse_nep_in(missing)["spin_mforce_mode"] == "full"
-
-    invalid = tmp_path / "invalid.nep.in"
-    invalid.write_text("type 1 Fe\nspin_mode 3\nspin_mforce_mode tangent\n")
-    with pytest.raises(ValueError, match="full.*transverse"):
-        parse_nep_in(invalid)
-
-    spin2 = tmp_path / "spin2.nep.in"
-    spin2.write_text("type 1 Fe\nspin_mode 2\nspin_mforce_mode 1\n")
-    with pytest.raises(ValueError, match="spin_mode 3 training contract"):
-        parse_nep_in(spin2)
-
-
-@pytest.mark.parametrize("value, expected", [("0", "full"), ("1", "transverse")])
-def test_spin3_mforce_numeric_input_and_summary(tmp_path, value, expected):
-    from torchnep.train import format_config_summary
-
-    path = tmp_path / "nep.in"
-    path.write_text(f"type 1 Fe\nspin_mode 3\nspin_mforce_mode {value}\n")
-    config = parse_nep_in(path)
-    assert config["spin_mforce_mode"] == expected
-    assert any(f"spin_mforce_mode {value}" in line
-               for line in format_config_summary(config))
-
-
-@pytest.mark.parametrize("value", ["2", "-1", "full", "transverse", "", "0 1"])
-def test_spin3_mforce_rejects_invalid_input(tmp_path, value):
-    path = tmp_path / "nep.in"
-    path.write_text(f"type 1 Fe\nspin_mode 3\nspin_mforce_mode {value}\n")
-    with pytest.raises(ValueError, match="0 .*full.*1 .*transverse"):
-        parse_nep_in(path)
 
 
 def test_spin3_o3c2_schema_is_frozen():
@@ -736,32 +697,6 @@ def test_spin3_prediction_virial_matches_label_projection():
     )
 
 
-def test_spin3_transverse_mforce_contract_and_intrinsic_dof():
-    prediction = torch.tensor(
-        [[3.0, 4.0, 5.0], [1.0, 2.0, 3.0]], dtype=DTYPE
-    )
-    reference = torch.zeros_like(prediction)
-    spins = torch.tensor(
-        [[0.0, 0.0, 2.0], [0.0, 0.0, 0.0]], dtype=DTYPE
-    )
-    full, full_dof, full_defined = magnetic_force_residual(
-        prediction, reference, spins, "full"
-    )
-    torch.testing.assert_close(full, prediction)
-    assert full_dof == 3
-    assert full_defined.tolist() == [True, True]
-
-    transverse, transverse_dof, transverse_defined = magnetic_force_residual(
-        prediction, reference, spins, "transverse"
-    )
-    torch.testing.assert_close(
-        transverse[0], torch.tensor([3.0, 4.0, 0.0], dtype=DTYPE)
-    )
-    torch.testing.assert_close(transverse[1], torch.zeros(3, dtype=DTYPE))
-    assert transverse_dof == 2
-    assert transverse_defined.tolist() == [True, False]
-
-
 @pytest.mark.parametrize("num_steps", (2, 5))
 def test_spin3_response_groups_are_exactly_balanced_per_epoch(num_steps):
     group_ids = [0, 0, 1, 1, 2, 2]
@@ -808,3 +743,40 @@ def test_nep4_spin3_round_trip(tmp_path):
     assert calculator.spin_mode == 3
     assert calculator.spin_dim == 55
     assert calculator.spin_descriptor_kind == "magnetic_polynomial_v3"
+
+
+@pytest.mark.parametrize("longitudinal", [5.0, 50.0])
+def test_spin3_mforce_and_tau_loss_distinguish_longitudinal_response(
+        monkeypatch, longitudinal):
+    from types import SimpleNamespace
+    from torchnep import train as training
+
+    model = torch.nn.Module()
+    model.spin_descriptor = None
+    model.spin_mode = 3
+    model.spin_dof_type_active = torch.tensor([True])
+    spins = torch.tensor([[0., 0., 2.], [0., 0., 0.]], dtype=DTYPE)
+    prediction = torch.tensor(
+        [[3., 4., longitudinal], [1., 2., 3.]], dtype=DTYPE)
+    batch = {
+        "energy_mask": torch.tensor([False]),
+        "atom_types": torch.tensor([0, 0]),
+        "mforces": torch.zeros_like(prediction),
+        "tau": torch.zeros_like(prediction),
+        "mforce_mask": torch.tensor([True, True]),
+        "tau_mask": torch.tensor([True, True]),
+    }
+    monkeypatch.setattr(training, "iter_collated", lambda *args: iter([batch]))
+
+    def compute(batch, **kwargs):
+        return {"mforces": prediction,
+                "tau": torch.linalg.cross(spins, prediction)}
+
+    sums = training._accumulate_true_loss_sums(
+        SimpleNamespace(n=1), 1, model, None, compute, False, "loop",
+        False, False, True, True, DTYPE, torch.device("cpu"))
+    # Full magnetic force includes longitudinal and zero-spin-site errors.
+    assert sums[4] == pytest.approx((25 + longitudinal ** 2 + 14) / 3)
+    # Torque is insensitive to the longitudinal component, with two DOF.
+    assert sums[5] == pytest.approx(50.0)
+    assert sums[9:11] == (2, 2)

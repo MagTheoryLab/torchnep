@@ -207,10 +207,6 @@ def format_config_summary(config: dict) -> List[str]:
                      f"{spin_cutoff_text}")
         lines.append(f"  {tag('spin_curriculum'):10}  spin_curriculum "
                      f"{int(config['spin_curriculum'])}")
-        if config.get("spin_mode") == 3:
-            lines.append(f"  {tag('spin_mforce_mode'):10}  "
-                         "spin_mforce_mode "
-                         f"{int(config.get('spin_mforce_mode', 'full') == 'transverse')}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
@@ -1136,43 +1132,6 @@ def validate_resume_data_lineage(saved, current, require_versioned=False):
             f"saved={saved}, current={current}")
 
 
-def magnetic_force_residual(
-    prediction: torch.Tensor,
-    reference: torch.Tensor,
-    spins: torch.Tensor,
-    mode: str,
-):
-    """Return the configured magnetic-force residual and intrinsic DOF.
-
-    ``full`` supervises ``-dE/dS`` in all three Cartesian directions.
-    ``transverse`` removes the component parallel to ``S`` and has two
-    intrinsic components.  Zero-moment sites carry no orientation and hence
-    contribute a zero residual in transverse mode.
-    """
-    residual = prediction - reference
-    if mode == "full":
-        return residual, 3, torch.ones(
-            residual.shape[:-1], dtype=torch.bool, device=residual.device
-        )
-    if mode != "transverse":
-        raise ValueError(
-            "spin_mforce_mode must be 'full' or 'transverse'"
-        )
-    spin_square = spins.square().sum(dim=-1, keepdim=True)
-    resolved = spin_square > (
-        64.0 * torch.finfo(spins.dtype).eps
-    )
-    longitudinal = (
-        (residual * spins).sum(dim=-1, keepdim=True)
-        / spin_square.clamp_min(torch.finfo(spins.dtype).tiny)
-    ) * spins
-    return (
-        torch.where(resolved, residual - longitudinal, 0.0),
-        2,
-        resolved.squeeze(-1),
-    )
-
-
 @torch.no_grad()
 def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
                      gpumd_init=False, return_rms=False):
@@ -1645,7 +1604,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                                compute_props, compute_props_cached,
                                use_autograd_forces, backend,
                                has_forces, has_virial, has_mforce, has_tau,
-                               dtype, dev, mforce_mode="full"):
+                               dtype, dev):
     """Frozen-weight squared-error sums over the LOCAL data_store.
 
     Mirrors the training-epoch accumulation exactly (same masks, same
@@ -1745,14 +1704,11 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                 if has_mforce and "mforces" in result:
                     active = raw_model.spin_dof_type_active[
                         batch["atom_types"]]
-                    m_diff, m_dof, defined = magnetic_force_residual(
-                        result["mforces"], batch["mforces"],
-                        batch["spins"], mforce_mode,
-                    )
-                    m_mask = batch["mforce_mask"] & active & defined
+                    m_diff = result["mforces"] - batch["mforces"]
+                    m_mask = batch["mforce_mask"] & active
                     if m_mask.any():
                         sum_lm += (
-                            m_diff[m_mask].square().sum(dim=1) / m_dof
+                            m_diff[m_mask].square().sum(dim=1) / 3
                         ).sum().item()
                         n_m += int(m_mask.sum().item())
 
@@ -1778,8 +1734,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
 def _evaluate_true_loss(data_store, batch_size, raw_model,
                         compute_props, compute_props_cached,
                         use_autograd_forces, backend,
-                        pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev,
-                        mforce_mode="full"):
+                        pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
     """Weighted loss + RMSEs of the CURRENT (frozen) weights, full dataset.
 
     Single-GPU wrapper around ``_accumulate_true_loss_sums`` — used to
@@ -1803,7 +1758,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
         data_store, batch_size, raw_model,
         compute_props, compute_props_cached,
         use_autograd_forces, backend, has_forces, has_virial,
-        has_mforce, has_tau, dtype, dev, mforce_mode)
+        has_mforce, has_tau, dtype, dev)
     (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
      n_e, n_f, n_v, n_m, n_t, sum_e_resid) = sums
     # Exact optimal b1 for these frozen weights, solved from this same pass.
@@ -1828,8 +1783,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
 def _evaluate_valid_loss(valid_store, batch_size, raw_model,
                          compute_props, compute_props_cached,
                          use_autograd_forces, backend,
-                         pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev,
-                         mforce_mode="full"):
+                         pref_e, pref_f, pref_v, pref_m, pref_tau, dtype, dev):
     """Weighted loss + RMSEs of the frozen weights on the VALIDATION set.
 
     Unlike ``_evaluate_true_loss`` this never touches ``b1``: the energy
@@ -1851,7 +1805,7 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
         valid_store, batch_size, raw_model,
         compute_props, compute_props_cached,
         use_autograd_forces, backend, has_forces, has_virial,
-        has_mforce, has_tau, dtype, dev, mforce_mode)
+        has_mforce, has_tau, dtype, dev)
     (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
      n_e, n_f, n_v, n_m, n_t, _) = sums
     mse_e = sum_le / max(n_e, 1)
@@ -2220,7 +2174,6 @@ def train_nep(
     pref_v             = config["lambda_v"]
     pref_m             = config["lambda_m"]
     pref_tau           = config["lambda_tau"]
-    mforce_mode        = config["spin_mforce_mode"]
     # Optional stage-2 block
     stage2             = config["stage2"]
     start_stage2       = config.get("start_stage2")  # may be None -> auto 0.5*num_epochs
@@ -2767,7 +2720,6 @@ def train_nep(
             if response_enabled else 0.0),
     }
     if raw_model.spin_mode == 3:
-        cur_loss_weights["spin_mforce_mode"] = mforce_mode
         cur_loss_weights["generator_curve_step_balance"] = (
             "exact-per-epoch" if response_enabled else None
         )
@@ -3302,22 +3254,18 @@ def train_nep(
                     m_ls = ((dv * scale) ** 2).sum() / 6.0
 
                 if has_mforces and batch["has_m"]:
-                    dm, m_dof, m_defined = magnetic_force_residual(
-                        result["mforces"], batch["mforces"],
-                        batch["spins"], mforce_mode,
-                    )
+                    dm = result["mforces"] - batch["mforces"]
                     m_mask = (
                         batch["mforce_mask"]
                         & raw_model.spin_dof_type_active[
-                            batch["atom_types"]]
-                        & m_defined)
+                            batch["atom_types"]])
                     mmf = m_mask.to(dtype).unsqueeze(-1)
                     nm_b = mmf.sum()
                     dm = dm * mmf
                     loss = loss + cur_pref_m * (
                         dm.square().sum()
-                        / (m_dof * nm_b.clamp_min(1.0)))
-                    m_lm = dm.square().sum() / m_dof
+                        / (3 * nm_b.clamp_min(1.0)))
+                    m_lm = dm.square().sum() / 3
 
                 if has_tau and batch["has_tau"]:
                     t_mask = (
@@ -3495,7 +3443,7 @@ def train_nep(
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
                     cur_pref_e, cur_pref_f, cur_pref_v,
-                    cur_pref_m, cur_pref_tau, dtype, dev, mforce_mode)
+                    cur_pref_m, cur_pref_tau, dtype, dev)
                 rmse_s_gpa = rmse_s * EV_PER_A3_TO_GPa
 
             response_metric = None
@@ -3520,7 +3468,7 @@ def train_nep(
                         compute_props, compute_props_cached,
                         use_autograd_forces, train_backend,
                         cur_pref_e, cur_pref_f, cur_pref_v,
-                        cur_pref_m, cur_pref_tau, dtype, dev, mforce_mode)
+                        cur_pref_m, cur_pref_tau, dtype, dev)
                 if in_stage2 and valid_response_store is not None:
                     valid_response_metric = evaluate_generator_curves(
                         valid_response_store, eval_batch_size, raw_model,
@@ -3677,7 +3625,7 @@ def train_nep(
                     compute_props, compute_props_cached,
                     use_autograd_forces, train_backend,
                     cur_pref_e, cur_pref_f, cur_pref_v,
-                    cur_pref_m, cur_pref_tau, dtype, dev, mforce_mode)
+                    cur_pref_m, cur_pref_tau, dtype, dev)
                 if t_loss < best_true_loss:
                     best_true_loss = t_loss
                     _save_best()
