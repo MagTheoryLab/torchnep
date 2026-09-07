@@ -252,7 +252,7 @@ def test_two_rank_spin3_q_scaler_excludes_padding(tmp_path):
         config.read_text()
         .replace(
             "spin_mode 2\n",
-            "spin_mode 3\nspin_mforce_mode full\nspin_curriculum 0\n",
+            "spin_mode 3\nspin_mforce_mode 0\nspin_curriculum 0\n",
         )
     )
     single = tmp_path / "single-spin3"

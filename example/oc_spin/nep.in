@@ -12,7 +12,7 @@ spin_compress 2
 spin_order 3
 spin_soc 1
 spin_curriculum 1
-spin_mforce_mode full
+spin_mforce_mode 0
 spin_dof_type Fe Ge
 spin_env_type Fe Ge
 

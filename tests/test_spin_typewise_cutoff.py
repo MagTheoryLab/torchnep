@@ -30,7 +30,7 @@ def _write_input(path, cutoffs="4 6"):
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_soc 1\n"
-        "spin_mforce_mode full\n"
+        "spin_mforce_mode 0\n"
         f"spin_cutoff {cutoffs}\n"
     )
 
@@ -71,7 +71,7 @@ def test_spin_typewise_cutoff_rejects_partial_type_list(tmp_path):
     path.write_text(
         "type 3 Fe Ge Ni\n"
         "spin_mode 3\n"
-        "spin_mforce_mode full\n"
+        "spin_mforce_mode 0\n"
         "spin_cutoff 4 6\n"
     )
     with pytest.raises(ValueError, match=r"one value per element type \(3\)"):

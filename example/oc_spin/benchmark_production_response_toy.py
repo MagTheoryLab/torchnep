@@ -197,7 +197,7 @@ def _write_config(path, epochs, lambda_m, stage2_lambda_m, spin_mode=2):
     if lambda_m < 0.0 or stage2_lambda_m < 0.0:
         raise ValueError("magnetic-force weights must be nonnegative")
     mforce_contract = (
-        "spin_mforce_mode full\n" if spin_mode == 3 else ""
+        "spin_mforce_mode 0\n" if spin_mode == 3 else ""
     )
     path.write_text(
         "type 1 Fe\n"

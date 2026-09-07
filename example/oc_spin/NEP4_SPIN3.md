@@ -124,12 +124,12 @@ s_q=\left[\max\left(
 
 ## 训练量的定义
 
-- `spin_mforce_mode` 必须在 spin3 训练输入中显式选择，避免把横向约束场
-  静默解释成完整导数。
-- `spin_mforce_mode full` 拟合完整的
+- `spin_mforce_mode` 使用 `0=full`、`1=transverse`，默认 `0`。
+  横向约束场数据应设置为 `1`。
+- `spin_mforce_mode 0` 拟合完整的
   \(\boldsymbol m=-\partial E/\partial\boldsymbol S\)，包括纵向
   分量。标签必须采用同一约定。
-- `spin_mforce_mode transverse` 只在 spin3 可用，拟合
+- `spin_mforce_mode 1` 只在 spin3 可用，拟合
   \(\boldsymbol m_\perp=\boldsymbol m-
   (\boldsymbol m\cdot\boldsymbol S)\boldsymbol S/
   |\boldsymbol S|^2\)，按两个内禀自由度报告 RMSE；它适合只提供

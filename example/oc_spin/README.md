@@ -49,8 +49,8 @@ spin3 的结构块使用带相对分辨率保护的 range scaler；磁块使用�
 把 `tanh` 推入饱和区，近零对称通道也不会被放大。训练入口应保持
 `use_gpumd_qscaler=False`；全一径向系数不适用于该描述符。
 
-磁力标签的纵向约定必须显式选择：`spin_mforce_mode full` 拟合完整
-\(-\partial E/\partial S\)，`transverse` 用于只定义横向约束场的
+磁力标签的纵向约定默认使用 `0=full`：`spin_mforce_mode 0` 拟合完整
+\(-\partial E/\partial S\)，`spin_mforce_mode 1`（transverse）用于只定义横向约束场的
 定磁矩数据，并按两个内禀自由度统计。\(\tau=S\times m\) 不是独立
 head；`lambda_tau` 只是额外的 \(|S|^2\) 横向误差权重。
 

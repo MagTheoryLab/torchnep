@@ -210,7 +210,7 @@ def format_config_summary(config: dict) -> List[str]:
         if config.get("spin_mode") == 3:
             lines.append(f"  {tag('spin_mforce_mode'):10}  "
                          "spin_mforce_mode "
-                         f"{config.get('spin_mforce_mode', 'full')}")
+                         f"{int(config.get('spin_mforce_mode', 'full') == 'transverse')}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")

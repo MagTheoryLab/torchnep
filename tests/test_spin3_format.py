@@ -105,7 +105,7 @@ def test_spin3_parser_and_fixed_production_dimensions(tmp_path):
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_soc 1\n"
-        "spin_mforce_mode transverse\n"
+        "spin_mforce_mode 1\n"
     )
     config = parse_nep_in(path)
     model = NEPModel(config)
@@ -200,8 +200,7 @@ def test_spin3_ordered_pair_mixing_breaks_a_type_blind_collision():
 def test_spin3_mforce_contract_is_versioned_and_validated(tmp_path):
     missing = tmp_path / "missing.nep.in"
     missing.write_text("type 1 Fe\nspin_mode 3\n")
-    with pytest.raises(ValueError, match="explicit spin_mforce_mode"):
-        parse_nep_in(missing)
+    assert parse_nep_in(missing)["spin_mforce_mode"] == "full"
 
     invalid = tmp_path / "invalid.nep.in"
     invalid.write_text("type 1 Fe\nspin_mode 3\nspin_mforce_mode tangent\n")
@@ -209,9 +208,29 @@ def test_spin3_mforce_contract_is_versioned_and_validated(tmp_path):
         parse_nep_in(invalid)
 
     spin2 = tmp_path / "spin2.nep.in"
-    spin2.write_text("type 1 Fe\nspin_mode 2\nspin_mforce_mode transverse\n")
+    spin2.write_text("type 1 Fe\nspin_mode 2\nspin_mforce_mode 1\n")
     with pytest.raises(ValueError, match="spin_mode 3 training contract"):
         parse_nep_in(spin2)
+
+
+@pytest.mark.parametrize("value, expected", [("0", "full"), ("1", "transverse")])
+def test_spin3_mforce_numeric_input_and_summary(tmp_path, value, expected):
+    from torchnep.train import format_config_summary
+
+    path = tmp_path / "nep.in"
+    path.write_text(f"type 1 Fe\nspin_mode 3\nspin_mforce_mode {value}\n")
+    config = parse_nep_in(path)
+    assert config["spin_mforce_mode"] == expected
+    assert any(f"spin_mforce_mode {value}" in line
+               for line in format_config_summary(config))
+
+
+@pytest.mark.parametrize("value", ["2", "-1", "full", "transverse", "", "0 1"])
+def test_spin3_mforce_rejects_invalid_input(tmp_path, value):
+    path = tmp_path / "nep.in"
+    path.write_text(f"type 1 Fe\nspin_mode 3\nspin_mforce_mode {value}\n")
+    with pytest.raises(ValueError, match="0 .*full.*1 .*transverse"):
+        parse_nep_in(path)
 
 
 def test_spin3_o3c2_schema_is_frozen():

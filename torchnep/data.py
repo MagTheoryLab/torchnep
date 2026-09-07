@@ -427,14 +427,14 @@ def parse_nep_in(filename: str) -> Dict:
             elif key == "spin_mforce_mode":
                 if len(parts) != 2:
                     raise ValueError(
-                        "spin_mforce_mode requires one value: full or transverse"
+                        "spin_mforce_mode requires one value: 0 (full) or 1 (transverse)"
                     )
-                value = parts[1].lower()
-                if value not in ("full", "transverse"):
+                value = parts[1]
+                if value not in ("0", "1"):
                     raise ValueError(
-                        "spin_mforce_mode must be 'full' or 'transverse'"
+                        "spin_mforce_mode must be 0 (full) or 1 (transverse)"
                     )
-                params["spin_mforce_mode"] = value
+                params["spin_mforce_mode"] = {"0": "full", "1": "transverse"}[value]
             elif key == "spin_cutoff":
                 if len(parts) < 2:
                     raise ValueError("spin_cutoff requires at least one value")
@@ -611,13 +611,6 @@ def parse_nep_in(filename: str) -> Dict:
             raise ValueError(
                 "spin_mforce_mode is a spin_mode 3 training contract; "
                 "spin_mode 2 retains full three-component magnetic-force loss"
-            )
-        if (params["spin_mode"] == 3
-                and "spin_mforce_mode" not in explicit):
-            raise ValueError(
-                "spin_mode 3 requires an explicit spin_mforce_mode: "
-                "use 'full' for -dE/dS labels or 'transverse' for "
-                "fixed-magnitude constraint fields"
             )
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)

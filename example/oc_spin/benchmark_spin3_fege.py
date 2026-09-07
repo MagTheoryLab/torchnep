@@ -59,7 +59,7 @@ def _config_text(
     lambda_m: float,
 ) -> str:
     mforce_line = (
-        f"spin_mforce_mode {mforce_mode}\n" if mode == 3 else ""
+        f"spin_mforce_mode {dict(full=0, transverse=1)[mforce_mode]}\n" if mode == 3 else ""
     )
     return f"""type 2 Fe Ge
 cutoff 6 5
