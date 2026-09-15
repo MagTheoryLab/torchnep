@@ -32,6 +32,7 @@ card's memory.
 
 import contextlib
 import hashlib
+import math
 import os
 import platform
 import time
@@ -61,7 +62,6 @@ from .response_training import (
     GENERATOR_CURVE_MEAN_WEIGHT,
     GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
-    GENERATOR_CURVE_WEIGHT,
     balanced_group_step_batches,
     complete_group_batches,
     generator_curve_loss,
@@ -1067,7 +1067,7 @@ def validate_response_group_disjoint(train_frames, valid_frames):
 
 
 def build_data_lineage(data_file, valid_file, valid_ratio,
-                       energy_key="energy"):
+                       energy_key="energy", response_weight=0.0):
     """Content-address the data contract saved in a training checkpoint."""
     def _identity(path):
         digest = hashlib.sha256()
@@ -1079,13 +1079,71 @@ def build_data_lineage(data_file, valid_file, valid_ratio,
             "sha256": digest.hexdigest(),
         }
 
-    return {
+    result = {
         "schema": "torchnep-data-lineage-v1",
         "data": _identity(data_file),
         "validation": _identity(valid_file) if valid_file is not None else None,
         "valid_ratio": valid_ratio,
         "energy_key": energy_key,
     }
+    if response_weight > 0:
+        if not os.path.isfile(response_data_path(data_file)):
+            raise ValueError("lambda_spin_response > 0 requires response.xyz beside train.xyz")
+        result["response"] = _identity(response_data_path(data_file))
+    return result
+
+
+def response_data_path(data_file):
+    """The response dataset lives beside train.xyz, never in the output dir."""
+    return os.path.join(os.path.dirname(os.path.abspath(data_file)), "response.xyz")
+
+
+def load_response_dataset(config, data_file, valid_frames, energy_key="energy"):
+    """Load complete response groups without adding ordinary observations."""
+    weight = float(config.get("lambda_spin_response", 0.0))
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError("lambda_spin_response must be finite and non-negative")
+    if weight == 0:
+        return [], []
+    if config.get("spin_mode", 0) not in (2, 3):
+        raise ValueError("lambda_spin_response requires spin_mode 2 or 3")
+    path = response_data_path(data_file)
+    if not os.path.isfile(path):
+        raise ValueError("lambda_spin_response > 0 requires response.xyz beside train.xyz")
+    frames = read_xyz(path, energy_key=energy_key)
+    for index, frame in enumerate(frames):
+        required = ("energy", "forces", "spins", "mforces")
+        missing = [key for key in required if key not in frame]
+        if missing:
+            raise ValueError(
+                f"response.xyz frame {index} is missing required labels: "
+                + ", ".join(missing))
+        for key in required:
+            value = np.asarray(frame[key])
+            expected = () if key == "energy" else (frame["natoms"], 3)
+            if value.shape != expected or not np.isfinite(value).all():
+                raise ValueError(
+                    f"response.xyz frame {index}: {key} must be finite "
+                    f"with shape {expected}")
+    validate_spin_frames(frames, "response")
+    active = config.get("spin_dof_type")
+    selected = select_generator_curve_frames(frames, active)
+    if not selected or len(selected) != len(frames):
+        raise ValueError("response.xyz must contain only complete rotation response groups")
+    if valid_frames is not None:
+        validate_response_group_disjoint(selected, valid_frames)
+        # Catch identical observations with missing/renamed group metadata.
+        def geometry(frame):
+            return (tuple(frame["species"]),
+                    np.round(frame["positions"], 8).tobytes(),
+                    np.round(frame["cell"], 8).tobytes(),
+                    np.round(frame.get("spins", []), 8).tobytes())
+        heldout = {geometry(frame) for frame in valid_frames}
+        if any(geometry(frame) in heldout for frame in selected):
+            raise ValueError("response.xyz shares a structure/spin frame with validation")
+    validation = (select_generator_curve_frames(valid_frames, active)
+                  if valid_frames is not None else [])
+    return selected, validation
 
 
 def validate_resume_data_lineage(saved, current, require_versioned=False):
@@ -2227,7 +2285,8 @@ def train_nep(
     # after this point, the saved lineage remains tied to the pre-read
     # snapshot and a later resume will fail rather than bless new contents.
     initial_data_lineage = build_data_lineage(
-        data_file, valid_file, valid_ratio, energy_key)
+        data_file, valid_file, valid_ratio, energy_key,
+        config.get("lambda_spin_response", 0.0))
     frames = read_xyz(data_file, energy_key=energy_key)
     _log(f"  read {len(frames)} structures from {data_file} "
          f"(energy label: {energy_key})")
@@ -2292,16 +2351,9 @@ def train_nep(
     if valid_file is not None:
         validate_response_group_disjoint(frames, valid_frames)
 
-    response_frames = (
-        select_generator_curve_frames(frames, config.get("spin_dof_type"))
-        if config.get("spin_mode", 0) in (2, 3) else []
-    )
-    valid_response_frames = (
-        select_generator_curve_frames(
-            valid_frames, config.get("spin_dof_type"))
-        if config.get("spin_mode", 0) in (2, 3) and valid_frames is not None
-        else []
-    )
+    response_loss_weight = float(config.get("lambda_spin_response", 0.0))
+    response_frames, valid_response_frames = load_response_dataset(
+        config, data_file, valid_frames, energy_key)
     response_enabled = bool(response_frames)
     if valid_response_frames and not response_enabled:
         raise ValueError(
@@ -2708,7 +2760,7 @@ def train_nep(
         "generator_curve_schema": (
             GENERATOR_CURVE_SCHEMA if response_enabled else None),
         "generator_curve_weight": (
-            GENERATOR_CURVE_WEIGHT if response_enabled else 0.0),
+            response_loss_weight if response_enabled else 0.0),
         "generator_curve_huber_delta": (
             GENERATOR_CURVE_HUBER_DELTA if response_enabled else 0.0),
         "generator_curve_mean_weight": (
@@ -3302,7 +3354,7 @@ def train_nep(
                             normalization_scale=(
                                 response_store.generator_curve_scale))
                         loss = loss + (
-                            GENERATOR_CURVE_WEIGHT * response_weight
+                            response_loss_weight * response_weight
                             * curve_loss
                         )
 
@@ -3451,7 +3503,7 @@ def train_nep(
                 response_metric = evaluate_generator_curves(
                     response_store, eval_batch_size, raw_model,
                     train_backend)
-                avg_loss += GENERATOR_CURVE_WEIGHT * response_metric
+                avg_loss += response_loss_weight * response_metric
 
             # Validation: frozen-weight full pass every epoch (b1 already
             # train-fitted by the analytical update above; never re-fitted on
@@ -3476,7 +3528,7 @@ def train_nep(
                         normalization_scale=(
                             response_store.generator_curve_scale))
                     valid_loss += (
-                        GENERATOR_CURVE_WEIGHT * valid_response_metric)
+                        response_loss_weight * valid_response_metric)
             if _PROF and dev.type == "cuda":
                 torch.cuda.synchronize()
             _t_valid = time.perf_counter() - _t_v0

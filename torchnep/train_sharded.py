@@ -56,11 +56,9 @@ from .response_training import (
     GENERATOR_CURVE_MEAN_WEIGHT,
     GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
-    GENERATOR_CURVE_WEIGHT,
     balanced_group_step_batches,
     complete_group_batches,
     generator_curve_loss,
-    select_generator_curve_frames,
 )
 
 
@@ -175,6 +173,7 @@ from .train import (
     virial6_for_loss,
     grouped_validation_indices, validate_spin_frames,
     validate_response_group_disjoint, build_data_lineage,
+    load_response_dataset,
     validate_resume_data_lineage,
     _save_checkpoint, _load_checkpoint,
     _restore_scheduler_state,
@@ -532,7 +531,8 @@ def train_nep_sharded(
     _log("Data")
     _log("----")
     lineage_holder = [
-        build_data_lineage(data_file, valid_file, valid_ratio, energy_key)
+        build_data_lineage(data_file, valid_file, valid_ratio, energy_key,
+                           config.get("lambda_spin_response", 0.0))
         if is_main else None
     ]
     dist.broadcast_object_list(lineage_holder, src=0)
@@ -725,28 +725,15 @@ def train_nep_sharded(
             validate_spin_frames(contract_valid_frames, "validation")
     if valid_file is not None and not streamed:
         validate_response_group_disjoint(frames, valid_frames)
-    if streamed and config.get("spin_mode", 0) in (2, 3):
-        local_has_response = int(any(
-            "response_group" in frame
-            for frame in local_frames + (_stream_valid_local or [])))
-        response_flag = torch.tensor(local_has_response, device=dev)
-        dist.all_reduce(response_flag, op=dist.ReduceOp.MAX)
-        if int(response_flag):
-            raise ValueError(
-                "streamed sharded loading cannot preserve complete rotation "
-                "response groups; use a smaller dataset shard or raise "
-                "TORCHNEP_STREAM_THRESHOLD")
-        response_frames = []
-    else:
-        response_frames = (
-            select_generator_curve_frames(frames, config.get("spin_dof_type"))
-            if config.get("spin_mode", 0) in (2, 3) else [])
-    valid_response_frames = (
-        select_generator_curve_frames(
-            valid_frames, config.get("spin_dof_type"))
-        if config.get("spin_mode", 0) in (2, 3) and valid_frames is not None
-        else []
-    )
+    response_loss_weight = float(config.get("lambda_spin_response", 0.0))
+    # The small response set is replicated; ordinary data remains sharded.
+    # Check against full validation on every rank, including streamed loading.
+    response_validation = (
+        read_xyz(valid_file, energy_key=energy_key)
+        if response_loss_weight > 0 and streamed and valid_file is not None
+        else valid_frames)
+    response_frames, valid_response_frames = load_response_dataset(
+        config, data_file, response_validation, energy_key)
     response_enabled = bool(response_frames)
     if valid_response_frames and not response_enabled:
         raise ValueError(
@@ -756,7 +743,7 @@ def train_nep_sharded(
         raise ValueError(
             "rotation response groups require stage2=1; the generator-curve "
             "objective is intentionally activated only in Stage 2")
-    if response_enabled and valid_frames is not None \
+    if response_enabled and response_validation is not None \
             and not valid_response_frames:
         raise ValueError(
             "training contains rotation response groups but validation has "
@@ -908,9 +895,6 @@ def train_nep_sharded(
         structures_v = preprocess_structures(
             [valid_frames[i] for i in valid_local_global_idx],
             config, np_dtype)
-        if valid_response_frames:
-            response_structures_v = preprocess_structures(
-                valid_response_frames, config, np_dtype)
         for structure, is_real in zip(
                 structures_v, valid_local_real_flags):
             if not is_real:
@@ -919,6 +903,10 @@ def train_nep_sharded(
                 ):
                     structure.pop(label, None)
         del valid_frames
+
+    if valid_response_frames:
+        response_structures_v = preprocess_structures(
+            valid_response_frames, config, np_dtype)
 
     # Every rank has to parse the full XYZ to agree on the deterministic
     # split, but only the preprocessed local shard is needed from here on.
@@ -1300,7 +1288,7 @@ def train_nep_sharded(
         "generator_curve_schema": (
             GENERATOR_CURVE_SCHEMA if response_enabled else None),
         "generator_curve_weight": (
-            GENERATOR_CURVE_WEIGHT if response_enabled else 0.0),
+            response_loss_weight if response_enabled else 0.0),
         "generator_curve_huber_delta": (
             GENERATOR_CURVE_HUBER_DELTA if response_enabled else 0.0),
         "generator_curve_mean_weight": (
@@ -1855,7 +1843,7 @@ def train_nep_sharded(
                             normalization_scale=(
                                 response_store.generator_curve_scale))
                         loss = loss + (
-                            GENERATOR_CURVE_WEIGHT * response_weight
+                            response_loss_weight * response_weight
                             * curve_loss
                         )
 
@@ -1988,7 +1976,7 @@ def train_nep_sharded(
                 response_metric = evaluate_generator_curves(
                     response_store, eval_batch_size, raw_model,
                     train_backend)
-                avg_loss += GENERATOR_CURVE_WEIGHT * response_metric
+                avg_loss += response_loss_weight * response_metric
 
             # Validation (COLLECTIVE): each rank evaluates its valid shard
             # with frozen weights, the error sums are all-reduced, so every
@@ -2019,7 +2007,7 @@ def train_nep_sharded(
                         normalization_scale=(
                             response_store.generator_curve_scale))
                     valid_loss += (
-                        GENERATOR_CURVE_WEIGHT * valid_response_metric)
+                        response_loss_weight * valid_response_metric)
             dt = time.time() - t_epoch
 
             # With a validation set, the validation loss IS the run's loss:

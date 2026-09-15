@@ -89,6 +89,8 @@ def _write_case(tmp_path):
     )
     _mark_rotation_scan(xyz, "train-rotation")
     _mark_rotation_scan(valid, "valid-rotation", repeat_single=True)
+    (tmp_path / "response.xyz").write_text(xyz.read_text())
+    config.write_text(config.read_text() + "\nlambda_spin_response 0.1\n")
     return config, xyz, valid
 
 

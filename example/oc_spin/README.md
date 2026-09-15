@@ -58,6 +58,28 @@ spin3 的 torque RMSE 按两个内禀自由度统计；torque 不是独立 head�
 
 ## 受控响应结构
 
+在 `nep.in` 中设置 `lambda_spin_response 0.1` 启用响应训练（默认 0，
+关闭时不读取响应文件）。非零时必须在 `train.xyz` 同目录提供
+`response.xyz`，不使用 `response_file` 关键字。文件只包含完整的
+rotation 组，需有 species、位置、晶胞、spin、mforce 以及下述组和
+角度元数据。与完整磁性训练数据一致，energy、force、spin、mforce
+必须提供且数值有限，只有 virial 可省略。当前专门响应损失使用
+磁力生成元；完整提供 E/F 标签是数据契约，不表示已启用组内能量差
+或力的专门响应损失。
+
+普通数据仍按 `batch` 做 minibatch；响应按完整组独立调度，沿用
+组间等权、每 epoch 平衡和均值加中心化 Huber 目标。无需全训练集
+full-batch。即使同一帧也在 train.xyz 中，response 路径不会再加一遍
+普通 E/F/MF 损失。baseline 和描述符 scaler 仅由普通训练数据拟合。
+
+响应目标仍仅在 Stage 2 启用，要求 `stage2 1`。若使用验证集，验证
+文件需包含独立的 rotation 组供 best-model 选择；不能把训练扫描
+复制到验证集。同组或相同结构与自旋的重复帧会被拒绝。使用
+`valid_ratio` 时也需预先设计响应组的独立验证，程序不会自动拆分
+response.xyz。响应文件 SHA256 记录进 checkpoint，修改文件后不能
+静默续训。以前仅在 train.xyz 内标注组而未设显式权重的输入，现在
+不会自动启用响应训练。
+
 受控结构仍然需要，但它们属于数据辨识和科学验收协议，不属于
 描述符输入，也不是新的模型参数。
 

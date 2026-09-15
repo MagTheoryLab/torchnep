@@ -399,6 +399,11 @@ def parse_nep_in(filename: str) -> Dict:
                 params["lambda_m"] = float(parts[1])
             elif key == "lambda_tau":
                 params["lambda_tau"] = float(parts[1])
+            elif key == "lambda_spin_response":
+                value = float(parts[1])
+                if not np.isfinite(value) or value < 0:
+                    raise ValueError("lambda_spin_response must be finite and non-negative")
+                params["lambda_spin_response"] = value
             elif key in ("lambda_1", "lambda_2", "pos_noise"):
                 # Retired regularization/noise controls are accepted for old
                 # input files but intentionally ignored.
@@ -539,6 +544,7 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_v", 0.01)
     params.setdefault("lambda_m", 1.0)
     params.setdefault("lambda_tau", 0.0)
+    params.setdefault("lambda_spin_response", 0.0)
     params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)
 

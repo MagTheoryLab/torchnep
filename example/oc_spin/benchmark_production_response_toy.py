@@ -16,7 +16,6 @@ for the targeted generator reweighting.
 """
 
 import argparse
-import importlib
 import json
 from pathlib import Path
 
@@ -260,14 +259,11 @@ def _recipe(
 
 
 def _train_with_internal_generator_weight(recipe, **kwargs):
-    """Run one sealed benchmark arm without expanding the public config."""
-    train_module = importlib.import_module("torchnep.train")
-    previous = train_module.GENERATOR_CURVE_WEIGHT
-    train_module.GENERATOR_CURVE_WEIGHT = recipe["generator_weight"]
-    try:
-        train_nep(**kwargs)
-    finally:
-        train_module.GENERATOR_CURVE_WEIGHT = previous
+    """Use the same explicit response weight as production inputs."""
+    config = Path(kwargs["config_file"])
+    config.write_text(config.read_text() +
+                      f"\nlambda_spin_response {recipe['generator_weight']}\n")
+    train_nep(**kwargs)
 
 
 def _fit_curve(theta, values):
@@ -662,6 +658,9 @@ def main():
     else:
         _write_xyz(train_file, train, with_tangent)
         _write_xyz(valid_file, valid, with_tangent)
+        if with_tangent:
+            _write_xyz(train_file.parent / "response.xyz",
+                       [frame for frame in train if "group" in frame], True)
         _write_config(
             config_file, args.epochs, args.lambda_m, args.stage2_lambda_m,
             spin_mode=args.spin_mode,
