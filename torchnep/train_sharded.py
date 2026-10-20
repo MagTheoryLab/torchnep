@@ -43,6 +43,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.swa_utils import AveragedModel
 
 import torch.nn as nn
+from .joint_update import configure_joint_update, optimizer_step
 from .model import NEPModel, gpumd_init_parameters
 from .data import (read_xyz, parse_nep_in, valid_split_indices,
                    stratified_split_indices)
@@ -1180,6 +1181,9 @@ def train_nep_sharded(
     # weight_decay > 0 switches to AdamW (decoupled decay) — see train_nep.
     weight_decay = config["weight_decay"]
     optimizer = _make_optimizer(trainable_named, lr, weight_decay)
+    configure_joint_update(optimizer, config)
+    if config["joint_rank4"]:
+        _log("  joint_rank4: joint Adam displacement, rank 4, refresh <=24 steps")
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -1526,7 +1530,7 @@ def train_nep_sharded(
 
     # GPU-side non-finite-gradient guard when the fused optimizer supports
     # the AMP found_inf hook — see train_nep.
-    async_guard = (dev.type == "cuda"
+    async_guard = (not config["joint_rank4"] and dev.type == "cuda"
                    and optimizer.param_groups[0].get("fused", False)
                    and getattr(optimizer, "_step_supports_amp_scaling",
                                False))
@@ -1880,11 +1884,21 @@ def train_nep_sharded(
                     n_bad_t += bad
                     ok_f = (1.0 - bad).to(torch.float64)
                 else:
+                    if config["joint_rank4"]:
+                        # Every rank must enter (or skip) the sketch collectives.
+                        bad = (~torch.isfinite(gn_t)).to(dtype)
+                        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+                        if bool(bad):
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
                     gn = float(gn_t)
                     if not np.isfinite(gn):
                         optimizer.zero_grad(set_to_none=True)
                         continue
-                    optimizer.step()
+                    optimizer_step(
+                        optimizer, raw_model, batch,
+                        (cur_pref_e, cur_pref_f, cur_pref_v, cur_pref_m, cur_pref_tau),
+                        train_backend, schedule_state, cg)
                     ok_f = 1.0
 
                 raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)

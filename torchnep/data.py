@@ -424,6 +424,10 @@ def parse_nep_in(filename: str) -> Dict:
                 params["spin_order"] = int(parts[1])
             elif key == "spin_soc":
                 params["spin_soc"] = int(parts[1])
+            elif key == "joint_rank4":
+                if len(parts) != 2 or parts[1] not in ("0", "1"):
+                    raise ValueError("joint_rank4 must be 0 or 1")
+                params[key] = parts[1] == "1"
             elif key == "spin_curriculum":
                 value = int(parts[1])
                 if value not in (0, 1):
@@ -545,6 +549,17 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("lambda_m", 1.0)
     params.setdefault("lambda_tau", 0.0)
     params.setdefault("lambda_spin_response", 0.0)
+    params.setdefault("joint_rank4", False)
+    if params["joint_rank4"]:
+        if params.get("spin_mode", 0) != 3:
+            raise ValueError("joint_rank4 currently requires spin_mode 3")
+        if params["lambda_spin_response"] != 0:
+            raise ValueError("joint_rank4 currently supports E/F/V/MF/Tau only; lambda_spin_response must be 0")
+        for name, value in params.items():
+            if name in {prefix + label for prefix in ("lambda_", "stage2_lambda_")
+                        for label in ("e", "f", "v", "m", "tau")}:
+                if not np.isfinite(value) or value < 0:
+                    raise ValueError("joint_rank4 requires finite non-negative loss weights")
     params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)
 

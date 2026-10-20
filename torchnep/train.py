@@ -1383,6 +1383,9 @@ def _default_alloc_conf():
     os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 
+from .joint_update import configure_joint_update, optimizer_step
+
+
 def _make_optimizer(named_params, lr, weight_decay):
     """Adam (weight_decay=0) or AdamW (>0), fused for CUDA float32.
 
@@ -1484,6 +1487,9 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         "run_seed": run_seed,
         "start_stage2": start_stage2,
     }
+    joint = getattr(optimizer, "joint_rank4", None)
+    if joint is not None:
+        state["joint_rank4"] = joint.state_dict()
     if scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
     if loss_weights is not None:
@@ -1545,8 +1551,13 @@ def _load_checkpoint(path, model, optimizer, swa_model, device):
         raise ValueError(
             "checkpoint architecture does not match the current config: "
             f"{saved_signature} != {expected_signature}")
+    joint = getattr(optimizer, "joint_rank4", None)
+    if (joint is not None) != (ckpt.get("joint_rank4") is not None):
+        raise ValueError("resume requires the same joint_rank4 setting; use finetune_from to change optimizer")
     m.load_state_dict(model_state)
     optimizer.load_state_dict(ckpt["optimizer_state"])
+    if joint is not None:
+        joint.load_state_dict(ckpt["joint_rank4"])
     in_stage2 = ckpt.get("in_stage2", False)
     if swa_model is not None and ckpt.get("swa_state") is not None:
         try:
@@ -2684,6 +2695,8 @@ def train_nep(
             _log(f"  O/C CUDA train graph: disabled — {reason}")
 
     weight_decay = config["weight_decay"]
+    if oc_graph_enabled and config["joint_rank4"]:
+        raise ValueError("joint_rank4 requires the eager optimizer path; disable TORCHNEP_OC_CUDA_GRAPH")
     if oc_graph_enabled:
         optimizer_cls = (torch.optim.AdamW if weight_decay > 0
                          else torch.optim.Adam)
@@ -2692,6 +2705,10 @@ def train_nep(
             amsgrad=True, capturable=True, fused=True)
     else:
         optimizer = _make_optimizer(trainable_named, lr, weight_decay)
+
+    configure_joint_update(optimizer, config)
+    if config["joint_rank4"]:
+        _log("  joint_rank4: joint Adam displacement, rank 4, refresh <=24 steps")
 
     if stage2 and start_stage2 is None:
         start_stage2 = max(1, int(num_epochs * 0.5))
@@ -3005,7 +3022,7 @@ def train_nep(
     # skip runs GPU-side via the AMP found_inf hook (no per-step host
     # sync — the sync otherwise costs a full launch-pipeline stall every
     # step); anywhere else the classic synchronous check runs.
-    async_guard = (dev.type == "cuda"
+    async_guard = (not config["joint_rank4"] and dev.type == "cuda"
                    and optimizer.param_groups[0].get("fused", False)
                    and getattr(optimizer, "_step_supports_amp_scaling",
                                False))
@@ -3398,7 +3415,10 @@ def train_nep(
                     if not np.isfinite(gn):
                         optimizer.zero_grad(set_to_none=True)
                         continue
-                    optimizer.step()
+                    optimizer_step(
+                        optimizer, raw_model, batch,
+                        (cur_pref_e, cur_pref_f, cur_pref_v, cur_pref_m, cur_pref_tau),
+                        train_backend, schedule_state)
                     ok_f = 1.0
 
                 raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)
