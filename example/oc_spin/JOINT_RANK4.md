@@ -29,8 +29,10 @@ training RNG. Both single-device and sharded trainers use the same helper.
 Checkpoints include the sketch, its age, counters and objective token. Exact
 resume requires the same setting; use `finetune_from` when changing optimizers.
 The extra VJPs use eager autograd even when the ordinary compute is compiled.
-CUDA-graph optimizer capture and nonzero `lambda_spin_response` are currently
-rejected rather than silently approximated. E/F/V/MF/torque masks and the
+CUDA-graph optimizer capture is currently rejected rather than silently
+approximated. Nonzero `lambda_spin_response` is supported for energy, mforce
+and combined targets; see [response targets](RESPONSE_TARGETS.md).
+The sketch includes the weighted response residuals. E/F/V/MF/torque masks and the
 spin3 symmetric six-component virial convention are preserved.
 
 The motivating matched 600-epoch BFO experiment reduced full-training MF RMSE

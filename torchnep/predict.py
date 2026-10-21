@@ -454,9 +454,9 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
         t0 = time.time()
         nat = chunk["natoms"].astype(np.float64)
         e_ref_pa = chunk["energy_ref"] / nat
-        np.savetxt(fh["energy_train.out"], np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
-        np.savetxt(fh["force_train.out"], np.column_stack([f_pred, chunk["forces_ref"]]), fmt="%.10g")
-        np.savetxt(fh["virial_train.out"], np.column_stack([v_pred, chunk["virial_ref"]]), fmt="%.10g")
+        np.savetxt(fh["energy_train.out"], np.column_stack([e_pred, e_ref_pa]), fmt="%.16g")
+        np.savetxt(fh["force_train.out"], np.column_stack([f_pred, chunk["forces_ref"]]), fmt="%.16g")
+        np.savetxt(fh["virial_train.out"], np.column_stack([v_pred, chunk["virial_ref"]]), fmt="%.16g")
         # Stress (GPa) = +virial_total / V * EV_PER_A3_TO_GPa, matching GPUMD's
         # convention so stress and virial carry the same sign (see
         # _stress_from_virial). Missing references keep the -1e6 sentinel unscaled.
@@ -464,16 +464,16 @@ def _predict_frames(calc, xyz_file, offsets, natoms, output_dir, dt, np_dtype,
         np.savetxt(fh["stress_train.out"], np.column_stack([
             _stress_from_virial(v_pred, nat_col, vol_col, keep_missing=False),
             _stress_from_virial(chunk["virial_ref"], nat_col, vol_col, keep_missing=True)]),
-            fmt="%.10g")
+            fmt="%.16g")
         if d_pred is not None:
-            np.savetxt(fh["descriptor.out"], d_pred, fmt="%.10g")
+            np.savetxt(fh["descriptor.out"], d_pred, fmt="%.16g")
         if calc.spin_mode:
             np.savetxt(fh["mforce_train.out"],
                        np.column_stack([m_pred, chunk["mforces_ref"]]),
-                       fmt="%.10g")
+                       fmt="%.16g")
             np.savetxt(fh["tau_train.out"],
                        np.column_stack([tau_pred, chunk["tau_ref"]]),
-                       fmt="%.10g")
+                       fmt="%.16g")
         _accum("e", e_pred - e_ref_pa)
         _accum("f", (f_pred - chunk["forces_ref"]).ravel())
         vmask = chunk["virial_ref"][:, 0] > _MISSING_VIRIAL / 2
@@ -887,16 +887,16 @@ def predict_from_store(model, data_store, output_dir: str,
     os.makedirs(output_dir, exist_ok=True)
     t_write = time.time()
     np.savetxt(os.path.join(output_dir, f"energy_{suffix}.out"),
-               np.column_stack([e_pred, e_ref_pa]), fmt="%.10g")
+               np.column_stack([e_pred, e_ref_pa]), fmt="%.16g")
     np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
-               np.column_stack([f_pred, forces_ref]), fmt="%.10g")
+               np.column_stack([f_pred, forces_ref]), fmt="%.16g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
-               np.column_stack([v_pred, virial_ref]), fmt="%.10g")
+               np.column_stack([v_pred, virial_ref]), fmt="%.16g")
     if has_spin:
         np.savetxt(os.path.join(output_dir, f"mforce_{suffix}.out"),
-                   np.column_stack([m_pred, mforces_ref]), fmt="%.10g")
+                   np.column_stack([m_pred, mforces_ref]), fmt="%.16g")
         np.savetxt(os.path.join(output_dir, f"tau_{suffix}.out"),
-                   np.column_stack([tau_pred, tau_ref]), fmt="%.10g")
+                   np.column_stack([tau_pred, tau_ref]), fmt="%.16g")
 
     # Stress (GPa) = +virial_total / V * conversion (GPUMD sign; see
     # predict_dataset / _stress_from_virial). Missing refs keep -1e6 unscaled.
@@ -908,7 +908,7 @@ def predict_from_store(model, data_store, output_dir: str,
     stress_ref = _stress_from_virial(virial_ref, nat_col, vol_col,
                                      keep_missing=True)
     np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
-               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
+               np.column_stack([stress_pred, stress_ref]), fmt="%.16g")
 
     _log(f"  write:    {time.time() - t_write:5.1f}s   "
          f"-> {output_dir}/(energy|force|virial|stress)_{suffix}.out")
@@ -1033,16 +1033,16 @@ def _write_predictions(output_dir: str, n_total_frames: int,
     os.makedirs(output_dir, exist_ok=True)
 
     np.savetxt(os.path.join(output_dir, f"energy_{suffix}.out"),
-               np.column_stack([e_pred, e_ref]), fmt="%.10g")
+               np.column_stack([e_pred, e_ref]), fmt="%.16g")
     np.savetxt(os.path.join(output_dir, f"force_{suffix}.out"),
-               np.column_stack([f_pred, f_ref]), fmt="%.10g")
+               np.column_stack([f_pred, f_ref]), fmt="%.16g")
     np.savetxt(os.path.join(output_dir, f"virial_{suffix}.out"),
-               np.column_stack([v_pred, v_ref]), fmt="%.10g")
+               np.column_stack([v_pred, v_ref]), fmt="%.16g")
     if m_pred is not None:
         np.savetxt(os.path.join(output_dir, f"mforce_{suffix}.out"),
-                   np.column_stack([m_pred, m_ref]), fmt="%.10g")
+                   np.column_stack([m_pred, m_ref]), fmt="%.16g")
         np.savetxt(os.path.join(output_dir, f"tau_{suffix}.out"),
-                   np.column_stack([t_pred, t_ref]), fmt="%.10g")
+                   np.column_stack([t_pred, t_ref]), fmt="%.16g")
 
     # Stress (GPa), GPUMD sign (+virial/V); missing refs keep -1e6 unscaled.
     nat_col = natoms.astype(np.float64)[:, None]
@@ -1052,7 +1052,7 @@ def _write_predictions(output_dir: str, n_total_frames: int,
     stress_ref = _stress_from_virial(v_ref, nat_col, vol_col,
                                      keep_missing=True)
     np.savetxt(os.path.join(output_dir, f"stress_{suffix}.out"),
-               np.column_stack([stress_pred, stress_ref]), fmt="%.10g")
+               np.column_stack([stress_pred, stress_ref]), fmt="%.16g")
 
 
 def predict_from_store_sharded(model, data_store, local_global_idx,

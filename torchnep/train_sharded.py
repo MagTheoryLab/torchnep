@@ -60,6 +60,8 @@ from .response_training import (
     balanced_group_step_batches,
     complete_group_batches,
     generator_curve_loss,
+    configure_response_store,
+    response_from_store,
 )
 
 
@@ -496,6 +498,8 @@ def train_nep_sharded(
 
     # ---- Config (all hyperparameters from nep.in) -----------------------
     orig_config = parse_nep_in(config_file)
+    if orig_config.get("response_refine", False):
+        raise ValueError("response_refine is single-device L-BFGS; use train_nep, not DDP")
     use_gpumd_qscaler = resolve_gpumd_qscaler(
         orig_config.get("spin_mode", 0), use_gpumd_qscaler
     )
@@ -935,6 +939,7 @@ def train_nep_sharded(
         if response_structures is not None else None
     )
     del response_structures
+    configure_response_store(response_store, config)
     valid_store = None
     valid_response_store = None
     if structures_v is not None:
@@ -944,6 +949,7 @@ def train_nep_sharded(
         valid_response_store = StreamDataStore(
             response_structures_v, dev, dtype, config=config)
         del response_structures_v
+        configure_response_store(valid_response_store, config)
     if cuda_available:
         torch.cuda.synchronize()
     _log(f"  data store ready: shard in host memory, batches streamed "
@@ -1299,10 +1305,11 @@ def train_nep_sharded(
             GENERATOR_CURVE_MEAN_WEIGHT if response_enabled else 0.0),
         "generator_curve_scale_floor": (
             GENERATOR_CURVE_SCALE_FLOOR if response_enabled else 0.0),
-        "generator_curve_normalization_scale": (
-            float(response_store.generator_curve_scale.item())
-            if response_enabled else 0.0),
+        "generator_curve_normalization_policy": "group_target_rms" if response_enabled else None,
     }
+    if response_enabled and config.get("spin_response_target", "mforce") != "mforce":
+        cur_loss_weights["response_target"] = config["spin_response_target"]
+        cur_loss_weights["response_energy_scale"] = config["spin_response_energy_scale"]
     if raw_model.spin_mode == 3:
         cur_loss_weights["generator_curve_step_balance"] = (
             "exact-per-epoch" if response_enabled else None
@@ -1823,29 +1830,19 @@ def train_nep_sharded(
                     )
                     m_lt = sum_sq_t / tau_dof
 
+                joint_response = []
                 if response_batches:
                     for response_idx, response_weight in response_batches[
                             batch_index]:
                         response_batch = response_store.collate(response_idx)
-                        response_batch["need_mforce"] = True
-                        response_batch["need_tau"] = False
                         # Use raw_model for the replicated branch. The ordinary
                         # DDP forward already armed the reducer, whose hooks
                         # all-reduce the summed ordinary+response gradient.
-                        response_result = raw_model.compute_properties_cached(
-                            response_batch, need_forces=False,
-                            need_virial=False, backend=train_backend,
-                            create_graph=True)
-                        curve_loss = generator_curve_loss(
-                            response_result["mforces"],
-                            response_batch["mforces"],
-                            response_batch["spin_tangent"],
-                            response_batch["struct_idx"],
-                            response_batch["response_group_ids"],
-                            response_batch["response_coordinates"],
-                            response_batch["num_structures"],
-                            normalization_scale=(
-                                response_store.generator_curve_scale))
+                        curve_loss = response_from_store(
+                            raw_model, response_batch, response_store,
+                            train_backend).square().sum()
+                        joint_response.append((response_batch, response_store,
+                                               response_loss_weight * response_weight))
                         loss = loss + (
                             response_loss_weight * response_weight
                             * curve_loss
@@ -1898,7 +1895,8 @@ def train_nep_sharded(
                     optimizer_step(
                         optimizer, raw_model, batch,
                         (cur_pref_e, cur_pref_f, cur_pref_v, cur_pref_m, cur_pref_tau),
-                        train_backend, schedule_state, cg)
+                        train_backend, schedule_state, cg,
+                        **({"responses": joint_response} if joint_response else {}))
                     ok_f = 1.0
 
                 raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)

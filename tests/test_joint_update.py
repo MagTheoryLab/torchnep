@@ -68,7 +68,7 @@ def test_parser_default_and_rejections(tmp_path):
     assert parse_nep_in(str(path))['joint_rank4'] is False
     path.write_text(path.read_text() + 'joint_rank4 1\n')
     assert parse_nep_in(str(path))['joint_rank4'] is True
-    for extra in ['joint_rank4 2', 'lambda_spin_response 0.3', 'spin_mode 2']:
+    for extra in ['joint_rank4 2', 'spin_mode 2']:
         original = path.read_text()
         path.write_text(original + extra + '\n')
         with pytest.raises(ValueError):

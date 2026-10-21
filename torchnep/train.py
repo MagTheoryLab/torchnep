@@ -68,6 +68,9 @@ from .response_training import (
     group_balanced_generator_rms,
     normalized_group_batches,
     select_generator_curve_frames,
+    select_response_frames,
+    configure_response_store,
+    response_from_store,
 )
 
 
@@ -1127,9 +1130,11 @@ def load_response_dataset(config, data_file, valid_frames, energy_key="energy"):
                     f"with shape {expected}")
     validate_spin_frames(frames, "response")
     active = config.get("spin_dof_type")
-    selected = select_generator_curve_frames(frames, active)
+    target = config.get("spin_response_target", "mforce")
+    selected = select_response_frames(frames, active, target)
     if not selected or len(selected) != len(frames):
-        raise ValueError("response.xyz must contain only complete rotation response groups")
+        kind = "energy" if target == "energy" else "rotation"
+        raise ValueError(f"response.xyz must contain only complete {kind} response groups")
     if valid_frames is not None:
         validate_response_group_disjoint(selected, valid_frames)
         # Catch identical observations with missing/renamed group metadata.
@@ -1141,7 +1146,7 @@ def load_response_dataset(config, data_file, valid_frames, energy_key="energy"):
         heldout = {geometry(frame) for frame in valid_frames}
         if any(geometry(frame) in heldout for frame in selected):
             raise ValueError("response.xyz shares a structure/spin frame with validation")
-    validation = (select_generator_curve_frames(valid_frames, active)
+    validation = (select_response_frames(valid_frames, active, target)
                   if valid_frames is not None else [])
     return selected, validation
 
@@ -1892,7 +1897,7 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
 
 def evaluate_generator_curves(response_store, batch_size, raw_model,
                               backend, normalization_scale=None):
-    """Evaluate the frozen centered generator-curve objective."""
+    """Evaluate the selected energy/mforce response objective at fixed weights."""
     if response_store is None:
         return None
     was_training = raw_model.training
@@ -1906,18 +1911,9 @@ def evaluate_generator_curves(response_store, batch_size, raw_model,
                 response_store.response_group_ids, batch_size, seed=0)
             for indices, batch_weight in batches:
                 batch = response_store.collate(indices)
-                batch["need_mforce"] = True
-                batch["need_tau"] = False
-                result = raw_model.compute_properties_cached(
-                    batch, need_forces=False, need_virial=False,
-                    backend=backend, create_graph=False)
-                value = generator_curve_loss(
-                    result["mforces"], batch["mforces"],
-                    batch["spin_tangent"], batch["struct_idx"],
-                    batch["response_group_ids"],
-                    batch["response_coordinates"],
-                    batch["num_structures"],
-                    normalization_scale=normalization_scale)
+                value = response_from_store(
+                    raw_model, batch, response_store, backend, False,
+                    normalization_scale).square().sum()
                 weighted_sum += value.item() * batch_weight
     finally:
         if was_training:
@@ -2188,6 +2184,16 @@ def train_nep(
     _clean_warning_format()
     _default_alloc_conf()
 
+    if parse_nep_in(config_file).get("response_refine", False):
+        from .response_refine import refine_response
+        if (resume_from or recompute_q_scaler or slim_types or valid_ratio
+                or precision != "float64" or not finetune_from):
+            raise ValueError("response_refine requires finetune_from nep.txt and float64; "
+                             "no resume, scaler recomputation, type slimming or random split")
+        return refine_response(config_file, data_file, finetune_from,
+                               output_dir=output_dir, device=device,
+                               valid_file=valid_file, energy_key=energy_key)
+
     # ---- Device ----------------------------------------------------------
     if device is None:
         device = _default_device()
@@ -2381,6 +2387,8 @@ def train_nep(
             "none; provide a group-disjoint validation response scan so "
             "nep_best is selected on the response objective")
     if response_enabled:
+        _log(f"  response target: {config['spin_response_target']}; "
+             f"energy scale: {config['spin_response_energy_scale']:g} eV/atom")
         _log(f"  generator curves: {len(response_frames)} training frames"
              + (f", {len(valid_response_frames)} validation frames"
                 if valid_frames is not None else ""))
@@ -2447,6 +2455,7 @@ def train_nep(
         if response_structures is not None else None
     )
     del response_structures
+    configure_response_store(response_store, config)
     if dev.type == "cuda":
         torch.cuda.synchronize()
     _log(f"  data store ready: dataset in host memory, batches streamed "
@@ -2474,6 +2483,7 @@ def train_nep(
             valid_response_store = StreamDataStore(
                 response_structures_v, dev, dtype, config=config)
             del response_structures_v
+            configure_response_store(valid_response_store, config)
         del structures_v, valid_frames
         _log(f"  validation set ready in {time.time() - t0:.1f}s — "
              f"coverage: {valid_store.n_energy} E / "
@@ -2784,10 +2794,11 @@ def train_nep(
             GENERATOR_CURVE_MEAN_WEIGHT if response_enabled else 0.0),
         "generator_curve_scale_floor": (
             GENERATOR_CURVE_SCALE_FLOOR if response_enabled else 0.0),
-        "generator_curve_normalization_scale": (
-            float(response_store.generator_curve_scale.item())
-            if response_enabled else 0.0),
+        "generator_curve_normalization_policy": "group_target_rms" if response_enabled else None,
     }
+    if response_enabled and config.get("spin_response_target", "mforce") != "mforce":
+        cur_loss_weights["response_target"] = config["spin_response_target"]
+        cur_loss_weights["response_energy_scale"] = config["spin_response_energy_scale"]
     if raw_model.spin_mode == 3:
         cur_loss_weights["generator_curve_step_balance"] = (
             "exact-per-epoch" if response_enabled else None
@@ -3350,26 +3361,16 @@ def train_nep(
                         / (tau_dof * nt_b.clamp_min(1.0)))
                     m_lt = dtau.square().sum() / tau_dof
 
+                joint_response = []
                 if response_batches:
                     for response_idx, response_weight in response_batches[
                             batch_index]:
                         response_batch = response_store.collate(response_idx)
-                        response_batch["need_mforce"] = True
-                        response_batch["need_tau"] = False
-                        response_result = compute_props_cached(
-                            response_batch, need_forces=False,
-                            need_virial=False, backend=train_backend,
-                            create_graph=True)
-                        curve_loss = generator_curve_loss(
-                            response_result["mforces"],
-                            response_batch["mforces"],
-                            response_batch["spin_tangent"],
-                            response_batch["struct_idx"],
-                            response_batch["response_group_ids"],
-                            response_batch["response_coordinates"],
-                            response_batch["num_structures"],
-                            normalization_scale=(
-                                response_store.generator_curve_scale))
+                        curve_loss = response_from_store(
+                            raw_model, response_batch, response_store,
+                            train_backend).square().sum()
+                        joint_response.append((response_batch, response_store,
+                                               response_loss_weight * response_weight))
                         loss = loss + (
                             response_loss_weight * response_weight
                             * curve_loss
@@ -3418,7 +3419,8 @@ def train_nep(
                     optimizer_step(
                         optimizer, raw_model, batch,
                         (cur_pref_e, cur_pref_f, cur_pref_v, cur_pref_m, cur_pref_tau),
-                        train_backend, schedule_state)
+                        train_backend, schedule_state,
+                        **({"responses": joint_response} if joint_response else {}))
                     ok_f = 1.0
 
                 raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)

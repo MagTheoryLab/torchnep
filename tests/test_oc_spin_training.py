@@ -457,8 +457,11 @@ def test_rotation_curve_rejects_mixed_parent_geometry():
         select_generator_curve_frames(frames)
 
 
-def test_rotation_curve_derives_nonuniform_final_dft_spin_path():
-    coordinates = (-0.2, 0.0, 0.3)
+@pytest.mark.parametrize("spacing", (1.e-2, 1.e-3, 1.e-4))
+def test_rotation_curve_derives_nonuniform_final_dft_spin_path(spacing):
+    # Magnitude/direction differentiation is consistent, not polynomial-
+    # exact in Cartesian coordinates; check its second-order error bound.
+    coordinates = np.array([-2., 0., 3.]) * spacing
     frames = [_rotation_frame(coordinate) for coordinate in coordinates]
     for frame, coordinate in zip(frames, coordinates):
         # Retain longitudinal relaxation in the converged DFT moment path.
@@ -470,7 +473,50 @@ def test_rotation_curve_derives_nonuniform_final_dft_spin_path():
     selected = select_generator_curve_frames(frames)
     for frame, coordinate in zip(selected, coordinates):
         assert frame["spin_tangent"][0] == pytest.approx(
-            [0.5, 2.0 * coordinate, 0.0])
+            [0.5, 2.0 * coordinate, 0.0], abs=10. * spacing**2)
+
+
+def test_rotation_coarse_endpoints_preserve_physical_magnitude_derivative():
+    coordinates = np.linspace(0., np.pi, 7)
+    for slope in (0., 0.2):
+        frames = [_rotation_frame(t) for t in coordinates]
+        for frame, t in zip(frames, coordinates):
+            frame['spins'] = np.array([[(2. + slope*t)*np.cos(t),
+                                       (2. + slope*t)*np.sin(t), 0.]])
+        selected = select_generator_curve_frames(frames)
+        for frame, t in zip(selected, coordinates):
+            direction = np.array([np.cos(t), np.sin(t), 0.])
+            assert np.dot(frame['spin_tangent'][0], direction) == \
+                pytest.approx(slope, abs=2.e-14)
+
+
+def test_rotation_zero_crossing_keeps_cartesian_derivative():
+    frames = [_rotation_frame(t) for t in (-0.2, 0., 0.3)]
+    for frame in frames:
+        frame['spins'] = np.array([[frame['response_coordinate'], 0., 0.]])
+    selected = select_generator_curve_frames(frames)
+    for frame in selected:
+        np.testing.assert_allclose(frame['spin_tangent'], [[1., 0., 0.]])
+
+
+def test_rotation_duplicate_coordinate_rejected_before_differentiation():
+    frames = [_rotation_frame(t) for t in (0., .1, .1, .2)]
+    with pytest.raises(ValueError, match='duplicate'):
+        select_generator_curve_frames(frames)
+
+
+def test_rotation_tangent_covariance_and_coordinate_units():
+    frames = [_rotation_frame(t) for t in (-0.4, 0., 0.7)]
+    reference = select_generator_curve_frames(frames)
+    rotation, _ = np.linalg.qr(np.random.default_rng(7).normal(size=(3, 3)))
+    transformed = copy.deepcopy(frames)
+    for frame in transformed:
+        frame['spins'] = frame['spins'] @ rotation.T
+        frame['response_coordinate'] *= 180. / np.pi
+    result = select_generator_curve_frames(transformed)
+    for a, b in zip(reference, result):
+        np.testing.assert_allclose(b['spin_tangent'],
+            a['spin_tangent'] @ rotation.T * np.pi / 180., atol=1.e-14)
 
 
 def test_rotation_curve_masks_inactive_spin_types_after_derivation():
@@ -552,7 +598,7 @@ def test_generator_curve_is_neutral_to_sin_cos_and_sin2_targets():
         gradient_norms,
         gradient_norms[0].expand_as(gradient_norms),
         rtol=1.0e-12, atol=1.0e-12)
-    assert "neutral" in GENERATOR_CURVE_SCHEMA
+    assert "group-rms" in GENERATOR_CURVE_SCHEMA
 
 
 def test_generator_curve_zero_mean_and_zero_target_scales_stay_finite():

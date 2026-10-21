@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from .virial import virial6_for_labels as virial6_for_loss
+from .response_training import response_from_store
 
 
 def physical_residual(model, batch, weights, backend, counts=None):
@@ -165,11 +166,25 @@ def configure_joint_update(optimizer, config):
     optimizer.joint_rank4 = JointRank4(optimizer) if config.get('joint_rank4', False) else None
 
 
-def optimizer_step(optimizer, model, batch, weights, backend, schedule, counts=None):
+def optimizer_step(optimizer, model, batch, weights, backend, schedule, counts=None,
+                   responses=()):
     update = getattr(optimizer, 'joint_rank4', None)
     if update is None:
         optimizer.step()
         return
+    response_contract = tuple(
+        (getattr(store, "response_target", "mforce"),
+         getattr(store, "response_energy_scale", 1e-6), float(weight))
+        for _, store, weight in responses)
     token = (tuple(weights), float(model._spin_order3_gradient_scale),
-             bool(schedule.get('order3_scaler_refreshed', False)))
-    update.step(lambda: physical_residual(model, batch, weights, backend, counts), token)
+             bool(schedule.get('order3_scaler_refreshed', False)), response_contract)
+    def residual():
+        parts = [physical_residual(model, batch, weights, backend, counts)]
+        world = dist.get_world_size() if dist.is_initialized() else 1
+        # Replicated response branch: independent rank sketches, 1/sqrt(world)
+        # normalisation prevents multiplying its Gram contribution by world.
+        for response_batch, store, weight in responses:
+            parts.append(response_from_store(
+                model, response_batch, store, backend) * math.sqrt(weight/world))
+        return torch.cat(parts)
+    update.step(residual, token)

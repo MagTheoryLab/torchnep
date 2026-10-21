@@ -172,7 +172,12 @@ See
 | `stage2_lambda_m` | `lambda_m` | Stage 2 magnetic-force weight |
 | `stage2_lambda_tau` | `lambda_tau` | Stage 2 torque weight |
 | `weight_decay` | `1e-4` | AdamW decoupled weight decay on all trainable parameters (`b1` is solved analytically and never decays). `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
-| `joint_rank4` | `0` | Optional joint rank-4 preconditioning of the Adam displacement for `spin_mode 3`; refresh at most every 24 steps. Supports E/F/V/MF/torque, not response loss or optimizer CUDA-graph capture. See [algorithm and limits](example/oc_spin/JOINT_RANK4.md) |
+| `joint_rank4` | `0` | Optional joint rank-4 preconditioning of the Adam displacement for `spin_mode 3`; refresh at most every 24 steps. Supports E/F/V/MF/torque and grouped response losses, not optimizer CUDA-graph capture. See [algorithm and limits](example/oc_spin/JOINT_RANK4.md) |
+| `response_refine` | `0` | Opt-in frozen-descriptor L-BFGS final refinement through `train_nep(..., finetune_from=...)`; float64, single device, `joint_rank4 0`, `spin_curriculum 0`. See [response refinement](example/oc_spin/RESPONSE_TARGETS.md). |
+| `response_refine_steps` | `2000` | Maximum L-BFGS iterations (line searches can evaluate the objective multiple times). |
+| `response_preserve_scale` | `5e-5 0.003 0.003` | Prediction-drift scales for E/atom, F, MF in response refinement; not DFT error estimates. |
+| `spin_response_target` | `mforce` | Response objective: `energy` (centered per-atom energy differences), `mforce` (rotation generator), or `both`. Enabled by `lambda_spin_response`; see [input and units](example/oc_spin/RESPONSE_TARGETS.md). |
+| `spin_response_energy_scale` | `1e-6` | Positive energy-response residual scale in eV/atom; choose from target resolution and label noise. Applies to `energy`/`both`. |
 
 ### Runtime arguments
 

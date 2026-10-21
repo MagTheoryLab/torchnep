@@ -235,17 +235,18 @@ def generator_reweighting_health(
         count = int(members.size)
         if count < 1:
             continue
+        local_scale = max(float(np.sqrt(np.mean(target_generator[members]**2))), float(scale_floor))
         local = frame_operator[members]
         centering = np.eye(count) - np.ones((count, count)) / count
         rows.append(
             (centering @ local)
-            / (normalization_scale * np.sqrt(num_groups * count))
+            / (local_scale * np.sqrt(num_groups * count))
         )
         if mean_weight > 0.0:
             rows.append(
                 local.mean(axis=0, keepdims=True)
                 * np.sqrt(mean_weight / num_groups)
-                / normalization_scale
+                / local_scale
             )
     operator = np.concatenate(rows, axis=0)
     operator_health = svd_health(operator, center=False)
@@ -290,6 +291,8 @@ def generator_reweighting_health(
         "response_structures": num_structures,
         "response_groups": num_groups,
         "normalization_scale": normalization_scale,
+        "normalization_policy": "group_target_rms",
+        "group_normalization_scales": [max(float(np.sqrt(p)), float(scale_floor)) for p in group_powers],
         "generator_operator": operator_health,
         "complete_mforce_supervision": complete_mforce_supervision,
         "strict_observation_rank_gain": strict_rank_gain,
