@@ -208,8 +208,6 @@ def format_config_summary(config: dict) -> List[str]:
         spin_cutoff_text = " ".join(str(value) for value in spin_cutoffs)
         lines.append(f"  {tag('spin_cutoff'):10}  spin_cutoff "
                      f"{spin_cutoff_text}")
-        lines.append(f"  {tag('spin_curriculum'):10}  spin_curriculum "
-                     f"{int(config['spin_curriculum'])}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
@@ -1284,43 +1282,6 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
 
 
 @torch.no_grad()
-def refresh_order3_q_scaler(raw_model, q_min, q_max, q_rms):
-    """Refresh only the still-gated spin3 order-3 input columns.
-
-    The O1/O2 rows already represent a trained function and must not move.
-    O3 fitting rows are exactly zero during warm-up, so changing their input
-    scale is function-preserving.  A nonzero row fails closed.
-    """
-    if raw_model.spin_mode != 3 or not raw_model.spin_curriculum:
-        return False
-    start = raw_model.spin_order3_input_start
-    if start >= raw_model.dim:
-        return False
-    if any(bool(torch.count_nonzero(net.w0[start:]).item())
-           for net in raw_model.fitting_nets):
-        return False
-    previous = raw_model.q_scaler.clone()
-    raw_model.set_q_scaler(q_min, q_max, q_rms)
-    raw_model.q_scaler[:start].copy_(previous[:start])
-    return True
-
-
-@torch.no_grad()
-def reset_order3_optimizer_state(raw_model, optimizer):
-    """Discard Adam moments tied to the pre-refresh O3 input scale."""
-    if raw_model.spin_mode != 3:
-        return
-    start = raw_model.spin_order3_input_start
-    for net in raw_model.fitting_nets:
-        parameter = net.w0
-        state = optimizer.state.get(parameter, {})
-        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-            value = state.get(name)
-            if torch.is_tensor(value) and value.shape == parameter.shape:
-                value[start:].zero_()
-
-
-@torch.no_grad()
 def recompute_b1_shift(raw_model, data_store, batch_size, backend):
     """Set the energy offset ``b1`` to its analytical optimum (GPUMD-style).
 
@@ -1998,80 +1959,15 @@ def _compile_check(dev):
 # Unified training entry point (single GPU or torchrun DDP)
 # ---------------------------------------------------------------------------
 
-def spin_curriculum_scale(epoch: int, full_o3_epoch: int) -> float:
-    """O2 warm-up followed by a linear O3 opening before Stage 2."""
-    if full_o3_epoch < 2:
-        raise ValueError("full_o3_epoch must be at least 2")
-    warmup_end = max(1, full_o3_epoch // 2)
-    if epoch <= warmup_end:
-        return 0.0
-    if epoch >= full_o3_epoch:
-        return 1.0
-    return (epoch - warmup_end) / (full_o3_epoch - warmup_end)
 
-
-@torch.no_grad()
-def prepare_spin3_curriculum_clip(raw_model):
-    """Weight frozen/ramping O3 rows only in the clipping norm.
-
-    spin3 applies its curriculum to the realized Adam displacement, not to the
-    gradient consumed by Adam.  Nevertheless, a frozen row must not force the
-    active O1/O2 gradients through global clipping.  Temporarily scaling the
-    small O3 row slices lets the stock foreach clip compute the effective norm;
-    :func:`restore_spin3_curriculum_clip` then restores the full gradients
-    (with the same global clip coefficient) before the optimizer sees them.
-    """
-    scale = raw_model._spin_order3_gradient_scale
-    if (raw_model.spin_mode != 3 or not raw_model.spin_curriculum
-            or scale >= 1.0):
-        return None
-    start = raw_model.spin_order3_input_start
-    saved = []
-    for net in raw_model.fitting_nets:
-        gradient = net.w0.grad
-        if gradient is None:
-            saved.append(None)
-            continue
-        original = gradient[start:].clone()
-        gradient[start:].mul_(scale)
-        saved.append(original)
-    return tuple(saved)
-
-
-@torch.no_grad()
-def restore_spin3_curriculum_clip(
-    raw_model, saved_rows, effective_norm, max_norm
-):
-    """Restore full O3 gradients after effective-norm clipping."""
-    if saved_rows is None:
-        return
-    coefficient = torch.clamp(
-        effective_norm.new_tensor(float(max_norm))
-        / (effective_norm + 1.0e-6),
-        max=1.0,
-    )
-    start = raw_model.spin_order3_input_start
-    for net, original in zip(raw_model.fitting_nets, saved_rows):
-        if original is not None:
-            net.w0.grad[start:].copy_(original * coefficient)
-
-
-def spin_curriculum_end(
-    spin_mode: int,
-    num_epochs: int,
-    stage2: bool,
-    start_stage2: Optional[int],
-) -> int:
-    """Resolve the full-O3 epoch without changing spin2 schedules."""
-    if not stage2:
-        return max(2, (2 * num_epochs) // 3)
-    if start_stage2 is None:
-        raise ValueError("stage2 curriculum requires start_stage2")
-    if spin_mode != 3:
-        return start_stage2
-    # Give spin3 O3 channels a full-strength Stage-1 window before the loss,
-    # response objective and learning rate all change at the Stage-2 boundary.
-    return max(2, start_stage2 - max(1, num_epochs // 10))
+def validate_retired_curriculum_resume(schedule, epoch):
+    """Reject a legacy checkpoint whose removed update schedule is unfinished."""
+    end = schedule.get("curriculum_end")
+    enabled = bool(schedule.get("curriculum_enabled", end is not None))
+    if enabled and (end is None or epoch < end):
+        raise ValueError(
+            "unfinished spin_curriculum checkpoint cannot be resumed after removal; "
+            "use weight-only fine-tuning from its exported nep.txt instead")
 
 
 def train_nep(
@@ -2726,25 +2622,10 @@ def train_nep(
         raise ValueError(
             "start_stage2 must lie within the training run: "
             f"1 <= {start_stage2} <= {num_epochs}")
-    curriculum_enabled = (
-        raw_model.spin_curriculum and finetune_from is None
-    )
-    curriculum_end = spin_curriculum_end(
-        raw_model.spin_mode, num_epochs, stage2, start_stage2
-    )
-    if curriculum_enabled and not 2 <= curriculum_end <= num_epochs:
-        raise ValueError(
-            "spin curriculum requires its full-O3 epoch to lie in the "
-            f"training run: 2 <= {curriculum_end} <= {num_epochs}"
-        )
     schedule_state = {
         "stage2_start": start_stage2 if stage2 else None,
-        "curriculum_end": curriculum_end if curriculum_enabled else None,
-        "curriculum_enabled": curriculum_enabled,
         "use_swa": bool(stage2 and use_swa),
     }
-    if raw_model.spin_mode == 3:
-        schedule_state["order3_scaler_refreshed"] = False
 
     # SWA window: average only the tail of the run (default: the last 100
     # epochs). Averaging the whole of stage 2 drags the energy back toward
@@ -2840,10 +2721,7 @@ def train_nep(
         )
         saved_schedule = info.get("schedule_state")
         if saved_schedule is not None:
-            if raw_model.spin_mode == 3:
-                schedule_state["order3_scaler_refreshed"] = bool(
-                    saved_schedule.get("order3_scaler_refreshed", False)
-                )
+            validate_retired_curriculum_resume(saved_schedule, info["epoch"])
             saved_stage2_start = saved_schedule.get("stage2_start")
             saved_use_swa = bool(saved_schedule.get("use_swa", False))
             if info["in_stage2"]:
@@ -2863,29 +2741,10 @@ def train_nep(
                 raise ValueError(
                     "start_stage2 is earlier than the resumed epoch; resume "
                     "from checkpoint_stage1.pt or choose a future boundary")
-            saved_curriculum_end = saved_schedule.get("curriculum_end")
-            saved_curriculum_enabled = bool(saved_schedule.get(
-                "curriculum_enabled", saved_curriculum_end is not None))
-            if not saved_curriculum_enabled:
-                curriculum_enabled = False
-                schedule_state["curriculum_enabled"] = False
-                schedule_state["curriculum_end"] = None
-            elif curriculum_enabled and saved_curriculum_end is not None:
-                if info["epoch"] >= saved_curriculum_end:
-                    # Once O3 has fully opened it must never be ramped down by
-                    # extending the total epoch count on resume.
-                    curriculum_enabled = False
-                    curriculum_end = saved_curriculum_end
-                    schedule_state["curriculum_end"] = saved_curriculum_end
-                elif curriculum_end != saved_curriculum_end:
-                    raise ValueError(
-                        "resume would change an unfinished O2-to-O3 "
-                        "curriculum boundary; keep the original schedule or "
-                        "start a new run")
         elif raw_model.spin_descriptor is not None:
             raise ValueError(
                 "spin checkpoint is missing schedule_state and cannot be "
-                "resumed with production curriculum semantics")
+                "resumed with verified training schedule semantics")
         if info["best_model_text"] is not None:
             with open(os.path.join(output_dir, "nep_best.txt"), "w") as stream:
                 stream.write(info["best_model_text"])
@@ -2983,10 +2842,6 @@ def train_nep(
     # resuming from a checkpoint.
     stage2_tag = (f", Stage 2 from epoch {start_stage2} "
                   f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
-    curriculum_tag = (
-        f", O2->O3 curriculum fully open at epoch {curriculum_end}"
-        if curriculum_enabled else ""
-    )
     # In the last third of the run a candidate best is verified by a
     # frozen-weight evaluation over the full dataset before nep_best is
     # written (see the best-save block in the loop).
@@ -3002,7 +2857,7 @@ def train_nep(
              f"{early_stop} epochs")
     _log(
         f"Training: epochs {start_epoch}..{num_epochs}"
-        f"{stage2_tag}{curriculum_tag}"
+        f"{stage2_tag}"
     )
     _log("=" * 72)
 
@@ -3042,40 +2897,6 @@ def train_nep(
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
             model.train()
-            if raw_model.spin_curriculum:
-                scale = (
-                    spin_curriculum_scale(epoch, curriculum_end)
-                    if curriculum_enabled else 1.0
-                )
-                raw_model.set_spin_curriculum_scale(scale)
-                warmup_end = max(1, curriculum_end // 2)
-                if epoch in (start_epoch, warmup_end, curriculum_end):
-                    scale_name = (
-                        "step_scale" if raw_model.spin_mode == 3
-                        else "gradient_scale"
-                    )
-                    _log(
-                        f"  O3 curriculum epoch {epoch}: "
-                        f"{scale_name}={scale:.6f}"
-                    )
-                if (raw_model.spin_mode == 3 and curriculum_enabled
-                        and epoch == warmup_end + 1
-                        and not schedule_state["order3_scaler_refreshed"]):
-                    fresh_stats = compute_q_scaler(
-                        raw_model, data_store, backend=backend,
-                        batch_size=batch_size, gpumd_init=False,
-                        return_rms=True,
-                    )
-                    if not refresh_order3_q_scaler(
-                            raw_model, *fresh_stats):
-                        raise RuntimeError(
-                            "spin3 O3 q_scaler refresh lost its zero-row "
-                            "function-preserving precondition"
-                        )
-                    reset_order3_optimizer_state(raw_model, optimizer)
-                    schedule_state["order3_scaler_refreshed"] = True
-                    _log("  O3 curriculum: refreshed order-3 q_scaler and "
-                         "reset its Adam moments")
 
             # Per-epoch frame-level shuffle (i.i.d. minibatches). Seeded by
             # run_seed + epoch: distinct order every epoch, reproducible for a
@@ -3222,9 +3043,6 @@ def train_nep(
                         l1_coeff=0.0,
                         l2_coeff=0.0,
                         max_grad_norm=max_grad_norm,
-                        curriculum_scale=(
-                            raw_model._spin_order3_gradient_scale
-                        ),
                         need_forces=has_forces,
                         need_virial=has_virial,
                         need_mforce=has_mforces,
@@ -3379,19 +3197,9 @@ def train_nep(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # spin2 keeps its historical gradient gate; spin3 gates only
-                # the realized parameter displacement below.
-                raw_model.apply_spin_curriculum_gradients()
-                curriculum_rows = raw_model.capture_spin_curriculum_rows()
                 if max_grad_norm > 0:
-                    curriculum_clip_rows = prepare_spin3_curriculum_clip(
-                        raw_model
-                    )
                     gn_t = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_grad_norm)
-                    restore_spin3_curriculum_clip(
-                        raw_model, curriculum_clip_rows, gn_t, max_grad_norm
-                    )
                 else:
                     gn_t = torch.sqrt(sum(
                         p.grad.norm()**2 for p in raw_model.parameters()
@@ -3422,8 +3230,6 @@ def train_nep(
                         train_backend, schedule_state,
                         **({"responses": joint_response} if joint_response else {}))
                     ok_f = 1.0
-
-                raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)
 
                 if (in_stage2 and swa_model is not None
                         and epoch >= swa_start):
@@ -3581,9 +3387,7 @@ def train_nep(
             # start_stage2 is saved in the checkpoint so a resumed run stays
             # in stage 2 (nep.in's start_stage2 would say otherwise).
             stop_now = False
-            curriculum_ready = (
-                not curriculum_enabled or epoch >= curriculum_end)
-            if early_stop and curriculum_ready:
+            if early_stop:
                 if in_stage2 and not prev_in_stage2:
                     es_best = float("inf")
                     es_wait = 0

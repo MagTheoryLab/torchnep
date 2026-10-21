@@ -34,7 +34,6 @@ def _config(*, order=3, compress=2, spin_l=2, soc=1, spin_basis=8,
         "spin_basis_size": [spin_basis, 0],
         "spin_order": order,
         "spin_soc": soc,
-        "spin_curriculum": False,
         "spin_dof_type": (
             ["Fe", "Ge", "Ni"] if dof_types is None else dof_types
         ),
@@ -141,7 +140,7 @@ def test_o3c2_graph_step_matches_fused_eager_adam(monkeypatch, compile_tail):
     )
     actual = cache.step(
         batch, weights=weights, l1_coeff=0.0, l2_coeff=0.0,
-        max_grad_norm=0.0, curriculum_scale=1.0,
+        max_grad_norm=0.0,
         need_forces=True, need_virial=True, need_mforce=True, need_tau=True,
     )
     torch.cuda.synchronize()
@@ -205,7 +204,7 @@ def _assert_general_graph_joint_step(
     )
     actual = cache.step(
         batch, weights=weights, l1_coeff=0.0, l2_coeff=0.0,
-        max_grad_norm=0.0, curriculum_scale=1.0,
+        max_grad_norm=0.0,
         need_forces=True, need_virial=True, need_mforce=True, need_tau=True,
     )
     torch.cuda.synchronize()
@@ -338,7 +337,7 @@ def test_graph_cache_is_exact_shape_keyed_and_bounded(monkeypatch):
     )
     kwargs = dict(
         weights=(1.0, 0.7, 0.2, 0.5, 0.3), l1_coeff=0.0,
-        l2_coeff=0.0, max_grad_norm=0.0, curriculum_scale=1.0,
+        l2_coeff=0.0, max_grad_norm=0.0,
         need_forces=True, need_virial=True, need_mforce=True, need_tau=True,
     )
     first = _batch(12)
@@ -373,7 +372,7 @@ def test_train_nep_uses_bounded_graph_cache_for_changing_shapes(
         "spin_order 3\n"
         "spin_soc 1\n"
         "spin_cutoff 6\n"
-        "spin_curriculum 0\n"
+        ""
         "lambda_e 1\n"
         "lambda_f 0.7\n"
         "lambda_v 0.2\n"

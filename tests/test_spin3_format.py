@@ -23,11 +23,6 @@ from torchnep.nep import NEPCalculator
 from torchnep.response_training import balanced_group_step_batches
 from torchnep.spin_schema import resolve_gpumd_qscaler
 from torchnep.train import (
-    prepare_spin3_curriculum_clip,
-    refresh_order3_q_scaler,
-    reset_order3_optimizer_state,
-    restore_spin3_curriculum_clip,
-    spin_curriculum_end,
     virial6_for_loss,
 )
 from torchnep.virial import virial9_to_6_numpy
@@ -55,7 +50,6 @@ def _config(order=3, compress=2, soc=1):
         "spin_cutoff": [6.0, 6.0],
         "spin_order": order,
         "spin_soc": soc,
-        "spin_curriculum": False,
         "spin_dof_type": ["Fe", "Ge"],
         "spin_env_type": ["Fe", "Ge"],
     }
@@ -594,74 +588,10 @@ def test_spin3_rms_range_scaler_is_zero_preserving_and_bounded():
     )
 
 
-def test_spin3_curriculum_uses_one_gate_and_refreshes_safely():
-    config = _config()
-    config["spin_curriculum"] = True
-    model = NEPModel(config).double()
-    start = model.spin_order3_input_start
-
-    weight = model.fitting_nets[0].w0
-    model.set_spin_curriculum_scale(0.25)
-    sum(net.w0.sum() for net in model.fitting_nets).backward()
-    model.apply_spin_curriculum_gradients()
-    torch.testing.assert_close(
-        weight.grad[start:], torch.ones_like(weight.grad[start:])
-    )
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3, amsgrad=True)
-    optimizer.step()
-    with torch.no_grad():
-        for net in model.fitting_nets:
-            net.w0[start:].zero_()
-    old_scaler = model.q_scaler.clone()
-    q_min = torch.zeros(model.dim, dtype=DTYPE)
-    q_max = torch.full((model.dim,), 2.0, dtype=DTYPE)
-    q_rms = torch.ones(model.dim, dtype=DTYPE)
-    q_rms[start:] = 4.0
-    q_max[start:] = 8.0
-    assert refresh_order3_q_scaler(model, q_min, q_max, q_rms)
-    torch.testing.assert_close(model.q_scaler[:start], old_scaler[:start])
-    torch.testing.assert_close(
-        model.q_scaler[start:], torch.full_like(model.q_scaler[start:], 0.125)
-    )
-
-    reset_order3_optimizer_state(model, optimizer)
-    for net in model.fitting_nets:
-        state = optimizer.state[net.w0]
-        for name in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-            torch.testing.assert_close(
-                state[name][start:], torch.zeros_like(state[name][start:])
-            )
 
 
-def test_spin3_frozen_rows_do_not_clip_active_curriculum_gradients():
-    config = _config()
-    config["spin_curriculum"] = True
-    model = NEPModel(config).double()
-    start = model.spin_order3_input_start
-    model.set_spin_curriculum_scale(0.0)
-    for parameter in model.parameters():
-        parameter.grad = torch.zeros_like(parameter)
-    weight = model.fitting_nets[0].w0
-    weight.grad[0, 0] = 3.0
-    weight.grad[start:, 0] = 100.0
-
-    saved = prepare_spin3_curriculum_clip(model)
-    effective_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-    restore_spin3_curriculum_clip(model, saved, effective_norm, 10.0)
-
-    assert effective_norm.item() == pytest.approx(3.0)
-    assert weight.grad[0, 0].item() == pytest.approx(3.0)
-    torch.testing.assert_close(
-        weight.grad[start:, 0],
-        torch.full_like(weight.grad[start:, 0], 100.0),
-    )
 
 
-def test_spin3_curriculum_precedes_stage2_without_changing_spin2():
-    assert spin_curriculum_end(2, 100, True, 50) == 50
-    assert spin_curriculum_end(3, 100, True, 50) == 40
-    assert spin_curriculum_end(3, 100, False, None) == 66
 
 
 def test_spin3_virial_loss_uses_low_cost_symmetric_contraction():

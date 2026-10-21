@@ -25,7 +25,6 @@ def _config():
         "spin_basis_size": [8, 0],
         "spin_order": 3,
         "spin_soc": 1,
-        "spin_curriculum": False,
         "spin_dof_type": ["Fe", "Ge", "Ni"],
         "spin_env_type": ["Fe", "Ge", "Ni"],
     }

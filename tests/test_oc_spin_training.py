@@ -41,12 +41,11 @@ from torchnep.train import (
     build_data_lineage,
     fit_energy_baseline_frames,
     grouped_validation_indices,
-    spin_curriculum_scale,
     validate_resume_data_lineage,
 )
 
 
-def _config(curriculum=True):
+def _config():
     return {
         "num_types": 1,
         "type_names": ["Fe"],
@@ -65,7 +64,6 @@ def _config(curriculum=True):
         "spin_cutoff": [6.0, 6.0],
         "spin_order": 3,
         "spin_soc": 1,
-        "spin_curriculum": curriculum,
     }
 
 
@@ -192,7 +190,7 @@ def test_response_benchmark_has_distinct_standard_and_generator_recipes(
     assert spin3["spin_mode"] == 3
 
 
-def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
+def test_oc_defaults_are_o3c2_full_order(tmp_path):
     path = tmp_path / "nep.in"
     path.write_text(
         "type 1 Fe\n"
@@ -207,84 +205,16 @@ def test_oc_defaults_are_o3c2_with_curriculum(tmp_path):
     assert config["spin_compress"] == 2
     assert config["spin_l_max"] == [2, 0, 0]
     assert config["spin_soc"] == 1
-    assert config["spin_curriculum"] is True
+    assert "spin_curriculum" not in config
     assert NEPModel(config).spin_dim == 49
 
 
-def test_oc_curriculum_can_be_disabled_in_nep_input(tmp_path):
-    path = tmp_path / "nep.in"
-    path.write_text(
-        "type 1 Fe\n"
-        "spin_mode 2\n"
-        "spin_order 3\n"
-        "spin_curriculum 0\n"
-    )
-    config = parse_nep_in(path)
-    assert config["spin_curriculum"] is False
-    assert NEPModel(config).spin_curriculum is False
 
 
-def test_oc_curriculum_parser_rejects_non_boolean_value(tmp_path):
-    path = tmp_path / "nep.in"
-    path.write_text(
-        "type 1 Fe\n"
-        "spin_mode 2\n"
-        "spin_curriculum 2\n"
-    )
-    with pytest.raises(ValueError, match="spin_curriculum must be 0 or 1"):
-        parse_nep_in(path)
 
 
-def test_curriculum_starts_at_exact_o2_prefix_and_ramps_gradients():
-    model = NEPModel(_config()).double()
-    start = model.struct_dim + model.spin_descriptor.order_dims[2]
-    assert model.spin_order3_input_start == start
-    assert model.dim - start == 12
-    for net in model.fitting_nets:
-        torch.testing.assert_close(
-            net.w0[start:], torch.zeros_like(net.w0[start:])
-        )
-
-    weight = model.fitting_nets[0].w0
-    model.set_spin_curriculum_scale(0.0)
-    weight.sum().backward()
-    model.apply_spin_curriculum_gradients()
-    assert torch.count_nonzero(weight.grad[:start]) > 0
-    assert torch.count_nonzero(weight.grad[start:]) == 0
-
-    weight.grad = None
-    model.set_spin_curriculum_scale(0.25)
-    weight.sum().backward()
-    model.apply_spin_curriculum_gradients()
-    torch.testing.assert_close(
-        weight.grad[start:], torch.full_like(weight.grad[start:], 0.25)
-    )
-
-    # Adam normalizes its first moment, so gradient scaling alone would make
-    # the first parameter update almost independent of 0.25. The production
-    # seam also scales the actual post-Adam row displacement.
-    full = copy.deepcopy(model)
-    for candidate, scale in ((model, 0.25), (full, 1.0)):
-        candidate.zero_grad(set_to_none=True)
-        candidate.set_spin_curriculum_scale(scale)
-        candidate.fitting_nets[0].w0.sum().backward()
-        candidate.apply_spin_curriculum_gradients()
-        optimizer = torch.optim.Adam(candidate.parameters(), lr=1.0e-3)
-        before = candidate.capture_spin_curriculum_rows()
-        optimizer.step()
-        candidate.apply_spin_curriculum_parameter_step(before)
-    delta_small = model.fitting_nets[0].w0[start:].abs().mean()
-    delta_full = full.fitting_nets[0].w0[start:].abs().mean()
-    torch.testing.assert_close(
-        delta_small, 0.25 * delta_full, rtol=2.0e-5, atol=1.0e-10)
 
 
-def test_curriculum_schedule_is_fully_open_at_stage2_entry():
-    assert spin_curriculum_scale(1, 400) == 0.0
-    assert spin_curriculum_scale(200, 400) == 0.0
-    assert spin_curriculum_scale(300, 400) == 0.5
-    assert spin_curriculum_scale(400, 400) == 1.0
-    assert spin_curriculum_scale(600, 400) == 1.0
 
 
 def test_energy_baseline_is_per_element_least_squares():

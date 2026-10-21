@@ -122,22 +122,25 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
 | `spin_cutoff` | `6` | Magnetic cutoff (Å): one global value, or one value per element in `type` order; pair cutoff is their arithmetic mean |
 | `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
-| `spin_curriculum` | `1` for O3 | Use the O2-to-O3 training curriculum (`0` or `1`); it does not change the exported potential or inference cost |
 | `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
 | `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
 
 For new O/C spin models set `spin_mode 3`. The production default is
 O3-C2-L2-SOC:
 `spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
-`spin_soc 1`. Fresh O3 training enables the O2-to-O3 curriculum by default;
+`spin_soc 1`. All configured orders are trained from the first epoch;
 for typewise cutoffs, for example `type 2 Fe Ge`, use
 `spin_cutoff 5.5 6.5`, giving Fe--Ge cutoff 6.0 Å by the same pair-average
 rule as structural NEP.
-set `spin_curriculum 0` to train the complete O3 model from the first epoch.
-The switch changes training only and is not written into the exported model.
+The former `spin_curriculum` option has been removed. Old inputs containing
+`spin_curriculum 0` emit a deprecation warning and otherwise behave identically;
+remove the line. Enabling it is rejected. Existing exported potentials retain
+their inference semantics. An unfinished legacy curriculum checkpoint cannot
+be resumed exactly; use weight-only fine-tuning instead. Completed or disabled
+legacy schedules remain resumable subject to the ordinary checkpoint checks.
 `nep4_spin3` has 55 magnetic coordinates with exact O1/O2/O3 prefix
 dimensions 9/43/55. The historical `nep4_spin2` 49-dimensional layout and
-training defaults are unchanged.
+inference layout is unchanged; it also trains all orders from initialization.
 See
 [the frozen spin3 descriptor contract](example/oc_spin/NEP4_SPIN3.md),
 [the production design and response-data contract](example/oc_spin/README.md), and
@@ -173,7 +176,7 @@ See
 | `stage2_lambda_tau` | `lambda_tau` | Stage 2 torque weight |
 | `weight_decay` | `1e-4` | AdamW decoupled weight decay on all trainable parameters (`b1` is solved analytically and never decays). `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
 | `joint_rank4` | `0` | Optional joint rank-4 preconditioning of the Adam displacement for `spin_mode 3`; refresh at most every 24 steps. Supports E/F/V/MF/torque and grouped response losses, not optimizer CUDA-graph capture. See [algorithm and limits](example/oc_spin/JOINT_RANK4.md) |
-| `response_refine` | `0` | Opt-in frozen-descriptor L-BFGS final refinement through `train_nep(..., finetune_from=...)`; float64, single device, `joint_rank4 0`, `spin_curriculum 0`. See [response refinement](example/oc_spin/RESPONSE_TARGETS.md). |
+| `response_refine` | `0` | Opt-in frozen-descriptor L-BFGS final refinement through `train_nep(..., finetune_from=...)`; float64, single device, `joint_rank4 0`. See [response refinement](example/oc_spin/RESPONSE_TARGETS.md). |
 | `response_refine_steps` | `2000` | Maximum L-BFGS iterations (line searches can evaluate the objective multiple times). |
 | `response_preserve_scale` | `5e-5 0.003 0.003` | Prediction-drift scales for E/atom, F, MF in response refinement; not DFT error estimates. |
 | `spin_response_target` | `mforce` | Response objective: `energy` (centered per-atom energy differences), `mforce` (rotation generator), or `both`. Enabled by `lambda_spin_response`; see [input and units](example/oc_spin/RESPONSE_TARGETS.md). |
@@ -319,11 +322,11 @@ train_nep("nep.in", "train.xyz", output_dir="output",
 
 | Parameter | Safe to change? | Notes |
 |-----------|----------------|-------|
-| `epoch` | Conditional | Extending a nonmagnetic run is safe. O3 curriculum/automatic Stage 2 boundaries depend on the total epoch count, so resume O3 with explicit `start_stage2` and an unchanged completed curriculum, or start a new run. |
+| `epoch` | Conditional | Extending a run is supported. Specify `start_stage2` explicitly when extending a two-stage run so its automatic boundary does not move. Unfinished legacy curriculum checkpoints require weight-only fine-tuning. |
 | `lambda_e` / `lambda_f` / `lambda_v` | Yes | New weights take effect next epoch. |
 | `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. |
 | `batch` | Yes | — |
-| `stage2`, `start_stage2` | Conditional | An unfinished O2→O3 curriculum keeps its original boundary. After O3 is fully open but before Stage 2, a future Stage-2 boundary may be added. Once a checkpoint is in Stage 2, both settings must remain unchanged. To redo Stage 2, resume from `checkpoint_stage1.pt` |
+| `stage2`, `start_stage2` | Conditional | Before Stage 2, a future boundary may be added. Once a checkpoint is in Stage 2, both settings must remain unchanged. To redo Stage 2, resume from `checkpoint_stage1.pt` |
 | `stage2_lr` | Only at the transition | Applied **once**, when training first crosses Stage 1 → Stage 2. If you resume from a checkpoint that was *already* in Stage 2, the checkpoint's current (possibly-decayed) LR is kept — editing `stage2_lr` then has no effect. To re-enter Stage 2 with a new LR, `resume_from=".../checkpoint_stage1.pt"`. |
 | `lr_scheduler` (`plateau` ↔ `step`) | Yes | Scheduler state from the old mode is incompatible and silently discarded; the new scheduler starts fresh from the current LR |
 | `scheduler_patience` / `scheduler_factor` | Yes | Applied immediately |

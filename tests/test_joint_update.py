@@ -64,7 +64,7 @@ def test_cache_refresh_and_exact_resume():
 
 def test_parser_default_and_rejections(tmp_path):
     path = tmp_path / 'nep.in'
-    path.write_text('type 1 Fe\nspin_mode 3\nspin_curriculum 0\n')
+    path.write_text('type 1 Fe\nspin_mode 3\n')
     assert parse_nep_in(str(path))['joint_rank4'] is False
     path.write_text(path.read_text() + 'joint_rank4 1\n')
     assert parse_nep_in(str(path))['joint_rank4'] is True

@@ -193,8 +193,8 @@ def refine_response(config_file, data_file, model_file, *, output_dir,
     cfg = parse_nep_in(config_file)
     if int(os.environ.get("WORLD_SIZE", "1")) != 1:
         raise ValueError("response_refine supports one process/device, not DDP")
-    if cfg.get("joint_rank4", False) or cfg.get("spin_curriculum", True):
-        raise ValueError("response_refine uses L-BFGS: set joint_rank4 0 and spin_curriculum 0")
+    if cfg.get("joint_rank4", False):
+        raise ValueError("response_refine uses L-BFGS: set joint_rank4 0")
     if cfg.get("lambda_spin_response", 0) <= 0 or cfg.get("spin_mode", 0) not in (2,3):
         raise ValueError("response_refine requires O/C spin and lambda_spin_response > 0")
     if not str(model_file).endswith(".txt"):

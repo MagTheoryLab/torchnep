@@ -12,12 +12,13 @@ These rules apply to changes that touch the versioned `nep4_spin2` path.
 - Keep the public truncation surface narrow: `spin_compress`, `spin_l_max`,
   `spin_order`, `spin_soc`, and `spin_cutoff`. Research block switches do not
   belong in `nep.in` or the serialized model format.
-- `spin_curriculum` is the single public training-path switch: default it on
-  for fresh O3 training, allow users to disable it, and never serialize it as
-  an inference/model-format field.
+- Train the complete configured O/C representation from the first epoch.
+  Do not reintroduce staged order gates, zeroed O3 ANN initialization, or
+  curriculum-triggered scaler refresh. The retired `spin_curriculum 0`
+  spelling is accepted only as a deprecated no-op for old inputs.
 - `spin_mode 2` uses self-consistent descriptor scaling; do not enable the
   generation-0 GPUMD q-scaler for it.
-- O2-to-O3 curriculum, Stage 2, per-element LS conditioning, and grouped
+- Stage 2, per-element LS conditioning, and grouped
   validation are training semantics, not inference/model-format switches.
 - Controlled J-like, D-like, anisotropy, strain, and volume scans are a data
   and acceptance protocol. Do not hard-code their Hamiltonian names as model

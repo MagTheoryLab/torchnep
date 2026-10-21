@@ -61,8 +61,8 @@ class JointRank4:
     sketch of J.T, U=M**(-1/2)V. The proposed Adam displacement d becomes
     M**(-1/2) [I-U(U.T U+lambda I)**(-1)U.T] M**(1/2)d.
     lambda=lambda_max(U.T U), so eigenvalues in whitened coordinates lie in
-    [1/2, 1]. Adam moments are updated normally. Curriculum gates are applied
-    by the caller to the *final* displacement, after this correction.
+    [1/2, 1]. Adam moments are updated normally; all parameter blocks remain
+    active from the first update.
     """
     rank = 4
     interval = 24
@@ -84,6 +84,14 @@ class JointRank4:
             raise ValueError('unsupported joint_rank4 checkpoint version')
         self.steps, self.cache = state['steps'], state['cache']
         self.refreshes = state['refreshes']
+        # Preserve the sketch when resuming an old, fully open schedule.
+        if self.cache is not None:
+            token = self.cache['token']
+            if isinstance(token, tuple) and len(token) == 4:
+                if token[1] != 1.0:
+                    self.cache = None
+                else:
+                    self.cache = dict(self.cache, token=(token[0], token[3]))
 
     @staticmethod
     def _flat(items):
@@ -136,9 +144,9 @@ class JointRank4:
         self.refreshes += 1
 
     def step(self, residual_fn, token):
-        """Called after finite-gradient checks, clipping, and before curriculum.
+        """Called after finite-gradient checks and clipping.
 
-        ``token`` encodes objective weights, curriculum scale, and scaler phase;
+        ``token`` encodes objective weights and response contract;
         a change invalidates the cache immediately. VJPs do not alter .grad or
         the training RNG. Cached tensors and step counters are checkpointed.
         """
@@ -176,8 +184,7 @@ def optimizer_step(optimizer, model, batch, weights, backend, schedule, counts=N
         (getattr(store, "response_target", "mforce"),
          getattr(store, "response_energy_scale", 1e-6), float(weight))
         for _, store, weight in responses)
-    token = (tuple(weights), float(model._spin_order3_gradient_scale),
-             bool(schedule.get('order3_scaler_refreshed', False)), response_contract)
+    token = (tuple(weights), response_contract)
     def residual():
         parts = [physical_residual(model, batch, weights, backend, counts)]
         world = dist.get_world_size() if dist.is_initialized() else 1

@@ -169,10 +169,7 @@ from .train import (
     _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
     preprocess_structures, compute_max_neighbors,
-    fit_energy_baseline_frames, spin_curriculum_scale,
-    spin_curriculum_end,
-    prepare_spin3_curriculum_clip, restore_spin3_curriculum_clip,
-    refresh_order3_q_scaler, reset_order3_optimizer_state,
+    fit_energy_baseline_frames, validate_retired_curriculum_resume,
     virial6_for_loss,
     grouped_validation_indices, validate_spin_frames,
     validate_response_group_disjoint, build_data_lineage,
@@ -1197,25 +1194,10 @@ def train_nep_sharded(
         raise ValueError(
             "start_stage2 must lie within the training run: "
             f"1 <= {start_stage2} <= {num_epochs}")
-    curriculum_enabled = (
-        raw_model.spin_curriculum and finetune_from is None
-    )
-    curriculum_end = spin_curriculum_end(
-        raw_model.spin_mode, num_epochs, stage2, start_stage2
-    )
-    if curriculum_enabled and not 2 <= curriculum_end <= num_epochs:
-        raise ValueError(
-            "spin curriculum requires its full-O3 epoch to lie in the "
-            f"training run: 2 <= {curriculum_end} <= {num_epochs}"
-        )
     schedule_state = {
         "stage2_start": start_stage2 if stage2 else None,
-        "curriculum_end": curriculum_end if curriculum_enabled else None,
-        "curriculum_enabled": curriculum_enabled,
         "use_swa": bool(stage2 and use_swa),
     }
-    if raw_model.spin_mode == 3:
-        schedule_state["order3_scaler_refreshed"] = False
 
     # SWA window: average only the tail of the run (default: the last 100
     # epochs). Averaging the whole of stage 2 drags the energy back toward
@@ -1352,10 +1334,7 @@ def train_nep_sharded(
         )
         saved_schedule = info.get("schedule_state")
         if saved_schedule is not None:
-            if raw_model.spin_mode == 3:
-                schedule_state["order3_scaler_refreshed"] = bool(
-                    saved_schedule.get("order3_scaler_refreshed", False)
-                )
+            validate_retired_curriculum_resume(saved_schedule, info["epoch"])
             saved_stage2_start = saved_schedule.get("stage2_start")
             saved_use_swa = bool(saved_schedule.get("use_swa", False))
             if info["in_stage2"]:
@@ -1375,27 +1354,10 @@ def train_nep_sharded(
                 raise ValueError(
                     "start_stage2 is earlier than the resumed epoch; resume "
                     "from checkpoint_stage1.pt or choose a future boundary")
-            saved_curriculum_end = saved_schedule.get("curriculum_end")
-            saved_curriculum_enabled = bool(saved_schedule.get(
-                "curriculum_enabled", saved_curriculum_end is not None))
-            if not saved_curriculum_enabled:
-                curriculum_enabled = False
-                schedule_state["curriculum_enabled"] = False
-                schedule_state["curriculum_end"] = None
-            elif curriculum_enabled and saved_curriculum_end is not None:
-                if info["epoch"] >= saved_curriculum_end:
-                    curriculum_enabled = False
-                    curriculum_end = saved_curriculum_end
-                    schedule_state["curriculum_end"] = saved_curriculum_end
-                elif curriculum_end != saved_curriculum_end:
-                    raise ValueError(
-                        "resume would change an unfinished O2-to-O3 "
-                        "curriculum boundary; keep the original schedule or "
-                        "start a new run")
         elif raw_model.spin_descriptor is not None:
             raise ValueError(
                 "spin checkpoint is missing schedule_state and cannot be "
-                "resumed with production curriculum semantics")
+                "resumed with verified training schedule semantics")
         if is_main and info["best_model_text"] is not None:
             with open(os.path.join(output_dir, "nep_best.txt"), "w") as stream:
                 stream.write(info["best_model_text"])
@@ -1490,10 +1452,6 @@ def train_nep_sharded(
     # resuming from a checkpoint.
     stage2_tag = (f", Stage 2 from epoch {start_stage2} "
                   f"(SWA={'on' if use_swa else 'off'})") if stage2 else ""
-    curriculum_tag = (
-        f", O2->O3 curriculum fully open at epoch {curriculum_end}"
-        if curriculum_enabled else ""
-    )
     _log("")
     if early_stop:
         monitored = "validation loss" if valid_store is not None else "train loss"
@@ -1504,7 +1462,7 @@ def train_nep_sharded(
              f"{early_stop} epochs")
     _log(
         f"Training: epochs {start_epoch}..{num_epochs}"
-        f"{stage2_tag}{curriculum_tag}"
+        f"{stage2_tag}"
     )
     _log("=" * 72)
 
@@ -1546,41 +1504,6 @@ def train_nep_sharded(
         for epoch in range(start_epoch, num_epochs + 1):
             t_epoch = time.time()
             model.train()
-            if raw_model.spin_curriculum:
-                scale = (
-                    spin_curriculum_scale(epoch, curriculum_end)
-                    if curriculum_enabled else 1.0
-                )
-                raw_model.set_spin_curriculum_scale(scale)
-                warmup_end = max(1, curriculum_end // 2)
-                if epoch in (start_epoch, warmup_end, curriculum_end):
-                    scale_name = (
-                        "step_scale" if raw_model.spin_mode == 3
-                        else "gradient_scale"
-                    )
-                    _log(
-                        f"  O3 curriculum epoch {epoch}: "
-                        f"{scale_name}={scale:.6f}"
-                    )
-                if (raw_model.spin_mode == 3 and curriculum_enabled
-                        and epoch == warmup_end + 1
-                        and not schedule_state["order3_scaler_refreshed"]):
-                    fresh_stats = _compute_q_scaler_sharded(
-                        raw_model, data_store, backend=backend,
-                        batch_size=batch_size, gpumd_init=False,
-                        return_rms=True,
-                        local_real_flags=local_real_flags,
-                    )
-                    if not refresh_order3_q_scaler(
-                            raw_model, *fresh_stats):
-                        raise RuntimeError(
-                            "spin3 O3 q_scaler refresh lost its zero-row "
-                            "function-preserving precondition"
-                        )
-                    reset_order3_optimizer_state(raw_model, optimizer)
-                    schedule_state["order3_scaler_refreshed"] = True
-                    _log("  O3 curriculum: refreshed order-3 q_scaler and "
-                         "reset its Adam moments")
 
             # Per-epoch local frame shuffle. Each rank independently
             # permutes its own n_local frames (different seeds across ranks
@@ -1851,19 +1774,10 @@ def train_nep_sharded(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
 
-                # spin2 applies its historical gradient gate after DDP
-                # reduction; spin3 gates only the realized displacement.
-                raw_model.apply_spin_curriculum_gradients()
-                curriculum_rows = raw_model.capture_spin_curriculum_rows()
+                # Clip the complete, DDP-reduced parameter gradient.
                 if max_grad_norm > 0:
-                    curriculum_clip_rows = prepare_spin3_curriculum_clip(
-                        raw_model
-                    )
                     gn_t = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_grad_norm)
-                    restore_spin3_curriculum_clip(
-                        raw_model, curriculum_clip_rows, gn_t, max_grad_norm
-                    )
                 else:
                     gn_t = torch.sqrt(sum(
                         p.grad.norm() ** 2 for p in raw_model.parameters()
@@ -1898,8 +1812,6 @@ def train_nep_sharded(
                         train_backend, schedule_state, cg,
                         **({"responses": joint_response} if joint_response else {}))
                     ok_f = 1.0
-
-                raw_model.apply_spin_curriculum_parameter_step(curriculum_rows)
 
                 if (in_stage2 and swa_model is not None
                         and epoch >= swa_start):
@@ -2038,9 +1950,7 @@ def train_nep_sharded(
             # and, per-stage (MACE-style), all ranks jump into stage 2
             # together when stage 1 plateaus with a stage 2 still pending.
             stop_now = False
-            curriculum_ready = (
-                not curriculum_enabled or epoch >= curriculum_end)
-            if early_stop and curriculum_ready:
+            if early_stop:
                 if in_stage2 and not prev_in_stage2:
                     es_best = float("inf")
                     es_wait = 0

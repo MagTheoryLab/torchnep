@@ -90,6 +90,10 @@ class NEPModel(nn.Module):
         self.has_q_134  = 1 if (len(lm) > 6 and lm[6] > 0) else 0
         self.num_neurons = config["neuron"]
 
+        # Retired training option: tolerate old disabled config dictionaries.
+        if config.get("spin_curriculum", False):
+            raise ValueError("spin_curriculum has been removed; delete this option")
+
         # Versioned O/C spin descriptor protocol.
         if "spin_descriptor" in config:
             raise ValueError(
@@ -100,7 +104,7 @@ class NEPModel(nn.Module):
         spin_only_keys = {
             "spin_compress", "spin_basis_size", "spin_l_max",
             "spin_order", "spin_soc", "spin_cutoff", "spin_dof_type",
-            "spin_cutoff_by_type", "spin_env_type", "spin_curriculum",
+            "spin_cutoff_by_type", "spin_env_type",
         }
         explicit_keys = config.get("_explicit")
         supplied_spin_keys = (
@@ -122,15 +126,6 @@ class NEPModel(nn.Module):
             raise ValueError("spin_order must be 1, 2, or 3")
         if self.spin_mode in (2, 3) and self.spin_soc not in (0, 1):
             raise ValueError("spin_soc must be 0 or 1")
-        self.spin_curriculum = bool(config.get(
-            "spin_curriculum",
-            self.spin_mode in (2, 3) and self.spin_order == 3,
-        ))
-        if self.spin_curriculum and not (
-            self.spin_mode in (2, 3) and self.spin_order == 3
-        ):
-            raise ValueError(
-                "spin_curriculum requires spin_mode 2 or 3, spin_order 3")
         self.spin_descriptor_kind = (
             "magnetic_polynomial"
             if self.spin_mode == 2
@@ -355,15 +350,6 @@ class NEPModel(nn.Module):
             FittingNet(self.dim, self.num_neurons)
             for _ in range(self.num_types)
         ])
-        self._spin_order3_gradient_scale = 1.0
-        self.spin_order3_input_start = self.dim
-        if self.spin_curriculum:
-            self.spin_order3_input_start = (
-                self.struct_dim + self.spin_descriptor.order_dims[2]
-            )
-            with torch.no_grad():
-                for net in self.fitting_nets:
-                    net.w0[self.spin_order3_input_start :].zero_()
         # One shared output bias (GPUMD convention: single common b1)
         self.b1 = nn.Parameter(torch.tensor(0.0))
 
@@ -378,12 +364,6 @@ class NEPModel(nn.Module):
         self.register_buffer("_c4b", torch.tensor(C4B))
         self.register_buffer("_c5b", torch.tensor(C5B))
         self.register_buffer("_c4b2", torch.tensor(C4B2))
-
-    def set_spin_curriculum_scale(self, scale: float):
-        """Set the train-only O3 opening scale without changing inference."""
-        if not 0.0 <= scale <= 1.0:
-            raise ValueError("spin curriculum scale must lie in [0, 1]")
-        self._spin_order3_gradient_scale = float(scale)
 
     def architecture_signature(self):
         """Return the semantic architecture contract for binary checkpoints."""
@@ -433,49 +413,6 @@ class NEPModel(nn.Module):
                 ],
             }
         return signature
-
-    @torch.no_grad()
-    def apply_spin_curriculum_gradients(self):
-        """Apply the historical spin2 gradient-side curriculum.
-
-        spin3 gates the actual optimizer displacement only.  Scaling both the
-        gradient and the displacement is a double curriculum for SGD, while
-        Adam mostly cancels the first factor but still lets it distort global
-        gradient clipping and moment initialization.
-        """
-        if not self.spin_curriculum or self.spin_mode == 3:
-            return
-        for net in self.fitting_nets:
-            if net.w0.grad is not None:
-                net.w0.grad[self.spin_order3_input_start :].mul_(
-                    self._spin_order3_gradient_scale
-                )
-
-    @torch.no_grad()
-    def capture_spin_curriculum_rows(self):
-        """Snapshot gated O3 rows before an optimizer step."""
-        if (not self.spin_curriculum
-                or self._spin_order3_gradient_scale >= 1.0):
-            return None
-        return tuple(
-            net.w0[self.spin_order3_input_start :].clone()
-            for net in self.fitting_nets
-        )
-
-    @torch.no_grad()
-    def apply_spin_curriculum_parameter_step(self, before):
-        """Apply the curriculum to the actual Adam parameter displacement.
-
-        Scaling only Adam's input gradient does not scale its normalized first
-        update.  Interpolating the post-step rows makes the configured ramp a
-        real ramp in function parameters while retaining Adam's moment state.
-        """
-        if before is None:
-            return
-        scale = self._spin_order3_gradient_scale
-        for net, previous in zip(self.fitting_nets, before):
-            current = net.w0[self.spin_order3_input_start :]
-            current.copy_(previous + scale * (current - previous))
 
     @torch.no_grad()
     def _initialize_magnetic_polynomial_radial(self):
@@ -1570,7 +1507,6 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
             ],
             "spin_order": model.spin_order,
             "spin_soc": model.spin_soc,
-            "spin_curriculum": model.spin_curriculum,
             "spin_dof_type": [
                 model.type_names[index]
                 for index in keep_idx

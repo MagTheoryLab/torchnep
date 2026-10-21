@@ -28,21 +28,14 @@ TorchNEP 的 reference/training 路径使用 autograd 导数；只识别
 
 ## 训练日程
 
-O3-C2 默认启用 O2 到 O3 curriculum；如需从第一个 epoch 直接训练
-完整 O3，可在 `nep.in` 设置 `spin_curriculum 0`：
+从第一个 epoch 起训练完整的指定 O/C 模型，不清零 O3 输入权重、
+不分阶段开放通道，也不触发课程专用的 scaler 重算或 Adam 状态清空。
+Stage 2 仍可独立设置目标权重和学习率；例如 600 epoch、400 epoch
+开始 Stage 2，并不意味着前 400 epoch 只训练低阶通道。
 
-1. 前半段只更新 O2 前缀；
-2. 随后线性释放 O3 的 12 个新增输入行；
-3. O3 在 Stage 2 前约总 epoch 的 10% 处完全打开；
-4. Stage 1 尾段用完整力/磁力目标训练全强度 O3；
-5. Stage 2 保留 E/F/V/MF/Tau 监督，不把磁响应权重清零。
-
-600 epoch、Stage 2 从 400 epoch 开始时，spin3 在 epoch 340 完全打开：
-1--170 为 O2 warm-up，171--339 线性释放 O3，340--399 用 Stage-1
-目标训练完整 O3，400 起进入 Stage 2。课程只缩放 Adam 的实际参数
-位移，不再重复缩放梯度；第一次释放 O3 前会只刷新其 q-scaler 并清空
-相应 Adam moments。curriculum 开关只改变训练路径，不写入模型格式，
-也不增加推理成本。
+`spin_curriculum` 已移除。旧输入的 `spin_curriculum 0` 仅提示后忽略，
+应删去该行；`1` 会报错。未完成课程的旧 checkpoint 不支持精确续算，
+可从导出的模型开始权重微调。已导出的势函数和描述符阶数前缀不受影响。
 
 spin3 的结构块使用带相对分辨率保护的 range scaler；磁块使用不平移的
 保零 RMS/range/floor scaler，所以固定磁矩产生的常数底不会在初始化时

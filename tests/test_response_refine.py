@@ -97,7 +97,7 @@ def test_production_refinement_entry(tmp_path, target):
         # A second frame shape exercises cache grouping rather than BFO's 40 atoms.
         xyz.write_text(xyz.read_text()+"\n".join(["2",*lines[1:4]])+"\n")
     config.write_text(config.read_text()+f"\nresponse_refine 1\nresponse_refine_steps 3\n"
-                      f"spin_curriculum 0\njoint_rank4 0\nspin_response_target {target}\n"
+                      f"joint_rank4 0\nspin_response_target {target}\n"
                       "spin_response_energy_scale .01\n")
     cfg = parse_nep_in(str(config))
     model = NEPModel(cfg).double()

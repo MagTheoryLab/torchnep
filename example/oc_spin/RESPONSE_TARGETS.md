@@ -10,7 +10,6 @@ lambda_spin_response 1
 spin_response_target energy
 spin_response_energy_scale 1e-6
 joint_rank4 1
-spin_curriculum 0
 stage2 1
 start_stage2 1
 ```
@@ -99,7 +98,6 @@ lambda_spin_response 1
 spin_response_target energy
 spin_response_energy_scale 1e-7
 response_preserve_scale 5e-5 0.003 0.003
-spin_curriculum 0
 joint_rank4 0
 ```
 

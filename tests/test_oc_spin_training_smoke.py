@@ -181,11 +181,11 @@ def test_single_device_oc_training_smoke(tmp_path):
     )
     _assert_outputs(output)
     log = (output / "output.log").read_text()
-    assert "O3 curriculum epoch 1: gradient_scale=0.000000" in log
-    assert "O3 curriculum epoch 2: gradient_scale=1.000000" in log
+    assert "O3 curriculum" not in log
     assert "forces: autograd" in log
     assert "generator curves: 3 training frames, 3 validation frames" in log
-    assert "neutral-group-balanced-mean-plus-centered" in log
+    from torchnep.response_training import GENERATOR_CURVE_SCHEMA
+    assert GENERATOR_CURVE_SCHEMA in log
     assert "use_gpumd_qscaler: descriptor coeffs" not in log
 
 
@@ -239,7 +239,8 @@ def test_two_rank_oc_training_smoke(tmp_path):
     assert completed.returncode == 0, completed.stdout
     _assert_outputs(output)
     log = (output / "output.log").read_text()
-    assert "neutral-group-balanced-mean-plus-centered" in log
+    from torchnep.response_training import GENERATOR_CURVE_SCHEMA
+    assert GENERATOR_CURVE_SCHEMA in log
     assert "one replicated complete group per ordinary optimizer step" in log
 
 
@@ -254,7 +255,7 @@ def test_two_rank_spin3_q_scaler_excludes_padding(tmp_path):
         config.read_text()
         .replace(
             "spin_mode 2\n",
-            "spin_mode 3\nspin_curriculum 0\n",
+            "spin_mode 3\n",
         )
     )
     single = tmp_path / "single-spin3"

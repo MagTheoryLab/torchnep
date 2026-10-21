@@ -1,4 +1,4 @@
-"""Production trainer smoke: Stage 2, curriculum, virial and DDP padding."""
+"""Production trainer smoke: Stage 2, full-order updates, virial and DDP padding."""
 import os
 import importlib
 import inspect
@@ -15,12 +15,12 @@ from torchnep import train_nep
 from torchnep.joint_update import physical_residual
 
 
-def _case(tmp_path, curriculum):
+def _case(tmp_path):
     config, xyz, valid = _write_case(tmp_path)
     config.write_text(config.read_text().replace('spin_mode 2', 'spin_mode 3')
                       .replace('lambda_spin_response 0.1', 'lambda_spin_response 0')
                       .replace('epoch 2', 'epoch 4').replace('start_stage2 2', 'start_stage2 3')
-                      + f'joint_rank4 1\nspin_curriculum {curriculum}\n')
+                      + 'joint_rank4 1\n')
     return config, xyz, valid
 
 
@@ -35,10 +35,9 @@ def _check(output):
         assert np.isfinite(np.loadtxt(output / name)).all()
 
 
-@pytest.mark.parametrize('curriculum', [0, 1])
 @pytest.mark.parametrize('precision', ['float32', 'float64'])
-def test_single_joint_stage2(tmp_path, curriculum, precision, monkeypatch):
-    config, xyz, valid = _case(tmp_path, curriculum)
+def test_single_joint_stage2(tmp_path, precision, monkeypatch):
+    config, xyz, valid = _case(tmp_path)
     out = tmp_path / 'output'
     train_module = importlib.import_module('torchnep.train')
     original_step = train_module.optimizer_step
@@ -61,11 +60,10 @@ def test_single_joint_stage2(tmp_path, curriculum, precision, monkeypatch):
     assert len(seen) == 2
 
 
-@pytest.mark.parametrize('curriculum', [0, 1])
-def test_ddp_joint_stage2_padding(tmp_path, curriculum):
+def test_ddp_joint_stage2_padding(tmp_path):
     if os.environ.get('TORCHNEP_TEST_DDP') != '1':
         pytest.skip('set TORCHNEP_TEST_DDP=1 to run distributed smoke')
-    config, xyz, valid = _case(tmp_path, curriculum)
+    config, xyz, valid = _case(tmp_path)
     driver = tmp_path / 'ddp.py'
     driver.write_text('''import sys
 from torchnep import train_nep_sharded

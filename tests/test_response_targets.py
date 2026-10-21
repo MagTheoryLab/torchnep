@@ -45,7 +45,7 @@ def test_energy_offset_and_huber_identity():
 def test_joint_response_trainer(tmp_path, target, monkeypatch):
     config, xyz, valid = _write_case(tmp_path)
     config.write_text(config.read_text().replace("spin_mode 2", "spin_mode 3")
-                      + f"\njoint_rank4 1\nspin_curriculum 0\n"
+                      + f"\njoint_rank4 1\n"
                       f"spin_response_target {target}\nspin_response_energy_scale 0.01\n")
     mod = importlib.import_module("torchnep.train")
     original = mod.optimizer_step
@@ -92,7 +92,7 @@ def test_ddp_response(tmp_path, target):
         pytest.skip("requires two CUDA devices")
     config, xyz, _ = _write_case(tmp_path)
     config.write_text(config.read_text().replace("spin_mode 2", "spin_mode 3") +
-                      f"joint_rank4 1\nspin_curriculum 0\nspin_response_target {target}\n"
+                      f"joint_rank4 1\nspin_response_target {target}\n"
                       "spin_response_energy_scale 0.01\n")
     driver = tmp_path/"ddp.py"
     driver.write_text("""import sys

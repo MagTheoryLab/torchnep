@@ -18,6 +18,7 @@ Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
 import re
+import warnings
 
 import numpy as np
 from typing import Dict, List
@@ -453,10 +454,10 @@ def parse_nep_in(filename: str) -> Dict:
                     raise ValueError("joint_rank4 must be 0 or 1")
                 params[key] = parts[1] == "1"
             elif key == "spin_curriculum":
-                value = int(parts[1])
-                if value not in (0, 1):
-                    raise ValueError("spin_curriculum must be 0 or 1")
-                params["spin_curriculum"] = bool(value)
+                if len(parts) != 2 or parts[1] != "0":
+                    raise ValueError("spin_curriculum has been removed; delete this option")
+                warnings.warn("spin_curriculum 0 is obsolete and ignored; remove this line",
+                              FutureWarning, stacklevel=2)
             elif key == "spin_cutoff":
                 if len(parts) < 2:
                     raise ValueError("spin_cutoff requires at least one value")
@@ -534,7 +535,6 @@ def parse_nep_in(filename: str) -> Dict:
         raise ValueError("spin_mode must be 0, 2, or 3")
     spin_only_keys = {
         "spin_compress", "spin_l_max", "spin_order", "spin_soc",
-        "spin_curriculum",
         "spin_cutoff", "spin_dof_type", "spin_env_type",
     }
     ignored_spin_keys = sorted(explicit & spin_only_keys)
@@ -595,14 +595,12 @@ def parse_nep_in(filename: str) -> Dict:
         params.setdefault("spin_l_max", [2, 0, 0])
         params.setdefault("spin_order", 3)
         params.setdefault("spin_soc", 1)
-        params.setdefault("spin_curriculum", params["spin_order"] == 3)
     else:
         params.setdefault("spin_compress", 2)
         params.setdefault("spin_basis_size", [8, 0])
         params.setdefault("spin_l_max", [2, 0, 0])
         params.setdefault("spin_order", 1)
         params.setdefault("spin_soc", 0)
-        params.setdefault("spin_curriculum", False)
     if params["spin_mode"] in (2, 3):
         params.setdefault("spin_cutoff", [6.0])
         params["spin_cutoff_by_type"] = normalize_spin_cutoff(
@@ -636,8 +634,6 @@ def parse_nep_in(filename: str) -> Dict:
             raise ValueError("spin_order must be 1, 2, or 3")
         if params["spin_soc"] not in (0, 1):
             raise ValueError("spin_soc must be 0 or 1")
-        if params["spin_curriculum"] and params["spin_order"] != 3:
-            raise ValueError("spin_curriculum requires spin_order 3")
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)

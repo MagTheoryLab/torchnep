@@ -366,12 +366,11 @@ class OCCudaGraphTrainCache:
         need_virial: bool,
         need_mforce: bool,
         need_tau: bool,
-        curriculum_enabled: bool,
     ) -> _GraphEntry:
         static_batch = self._make_static_batch(batch, need_mforce, need_tau)
         dtype = static_batch["rij_rad"].dtype
         device = static_batch["rij_rad"].device
-        controls = torch.zeros(9, dtype=dtype, device=device)
+        controls = torch.zeros(8, dtype=dtype, device=device)
         force_skip = torch.ones((), dtype=torch.float32, device=device)
         parameters = [
             parameter for group in self.optimizer.param_groups
@@ -397,17 +396,6 @@ class OCCudaGraphTrainCache:
                 torch._foreach_mul(torch._foreach_sign(parameters), controls[5]),
             )
 
-            before = []
-            if curriculum_enabled:
-                for net in self.model.fitting_nets:
-                    grad_rows = net.w0.grad[
-                        self.model.spin_order3_input_start:
-                    ]
-                    grad_rows.mul_(controls[8])
-                    before.append(net.w0[
-                        self.model.spin_order3_input_start:
-                    ].clone())
-
             grad_norm = _gradient_norm(grads)
             clip = (controls[7] / (grad_norm + 1.0e-6)).clamp(max=1.0)
             torch._foreach_mul_(grads, clip)
@@ -415,12 +403,6 @@ class OCCudaGraphTrainCache:
             self.optimizer.found_inf = torch.maximum(found_inf, force_skip)
             self.optimizer.step()
 
-            if curriculum_enabled:
-                for net, previous in zip(self.model.fitting_nets, before):
-                    current = net.w0[self.model.spin_order3_input_start:]
-                    current.copy_(
-                        previous + controls[8] * (current - previous)
-                    )
             return loss, grad_norm, found_inf, metrics
 
         start = time.perf_counter()
@@ -453,7 +435,6 @@ class OCCudaGraphTrainCache:
         l1_coeff: float,
         l2_coeff: float,
         max_grad_norm: float,
-        curriculum_scale: float,
         need_forces: bool,
         need_virial: bool,
         need_mforce: bool,
@@ -472,7 +453,6 @@ class OCCudaGraphTrainCache:
             entry = self._capture(
                 batch, need_forces=need_forces, need_virial=need_virial,
                 need_mforce=need_mforce, need_tau=need_tau,
-                curriculum_enabled=bool(self.model.spin_curriculum),
             )
             self.total_capture_ms += entry.capture_ms
             if len(self._entries) >= self.max_entries:
@@ -489,7 +469,6 @@ class OCCudaGraphTrainCache:
         )
         control_values = (
             *weights, float(l1_coeff), float(l2_coeff), grad_limit,
-            float(curriculum_scale),
         )
         entry.controls.copy_(entry.controls.new_tensor(control_values))
         entry.graph.replay()
