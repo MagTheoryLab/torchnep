@@ -15,16 +15,32 @@ DATA=Path(__file__).parent/'data'
 
 
 @pytest.mark.parametrize('name',['c3l2s2','c2l4s4','c1l0s1'])
-def test_independent_gpumd_spin_oracle(name):
+@pytest.mark.parametrize('device,dtype',[('cpu',torch.float64), *[
+    pytest.param('cuda',dtype,marks=pytest.mark.skipif(
+        not torch.cuda.is_available(),reason='CUDA required'))
+    for dtype in (torch.float64,torch.float32)]])
+def test_independent_gpumd_spin_oracle(name,device,dtype):
     folder=DATA/'spin_c516'
     oracle=json.loads((folder/(name+'.json')).read_text())
-    calc=NEPCalculator(folder/(name+'.nep'),dtype=torch.float64)
+    calc=NEPCalculator(folder/(name+'.nep'),dtype=dtype,device=device)
     assert calc.dim==oracle['dimension']
-    for case in oracle['cases'].values():
+    for case_name,case in oracle['cases'].items():
         out=calc.compute(case['types'],np.asarray(case['positions']),np.asarray(case['cell']).reshape(3,3),spins=np.asarray(case['spins']))
-        for key,target in [('energy','potential'),('forces','force'),('mforces','mforce')]:
-            np.testing.assert_allclose(out[key].numpy(),case[target],rtol=2e-6,atol=2e-7)
-        np.testing.assert_allclose(out['virial'].sum(0).numpy(),case['virial'],rtol=2e-6,atol=2e-7)
+        targets={key:np.asarray(case[target]) for key,target in
+                 [('energy','potential'),('forces','force'),('mforces','mforce'),('virial','virial')]}
+        targets['tau']=np.cross(np.asarray(case['spins']),targets['mforces'])
+        rtol,atol=(2e-6,2e-7) if dtype==torch.float64 else (2e-5,2e-6)
+        for key,expected in targets.items():
+            value=out[key].sum(0) if key=='virial' else out[key]
+            actual=value.cpu().numpy().astype(np.float64)
+            error=np.abs(actual-expected)
+            index=np.unravel_index(error.argmax(),error.shape)
+            print('ORACLE_ERROR',json.dumps(dict(model=name,case=case_name,device=device,dtype=str(dtype),
+                output=key,max_abs=float(error.max()),rms=float(np.sqrt(np.mean(error**2))),
+                max_rel=float((error/np.maximum(np.abs(expected),1e-7)).max()),
+                worst_index=[int(i) for i in index],reference=float(expected[index]),candidate=float(actual[index]),
+                above_gate=int(np.count_nonzero(error>atol+rtol*np.abs(expected))))))
+            np.testing.assert_allclose(actual,expected,rtol=rtol,atol=atol)
 
 
 @pytest.mark.parametrize('spin',[False,True])

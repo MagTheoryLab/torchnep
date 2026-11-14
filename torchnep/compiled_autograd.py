@@ -278,18 +278,19 @@ class CompiledAutogradForce:
         # sizes.  Trace the equivalent pure-Torch contraction here; the flag
         # is restored immediately and ordinary eager/CUDA training retains
         # the analytic sector kernel.
-        env_key = "TORCHNEP_OC_CUDA_STRUCT_CENTER"
-        previous = os.environ.get(env_key)
-        os.environ[env_key] = "0"
+        keys = ("TORCHNEP_OC_CUDA_STRUCT_CENTER", "TORCHNEP_CUDA_HARMONICS")
+        previous = {key: os.environ.get(key) for key in keys}
+        os.environ.update({key: "0" for key in keys})
         try:
             gm = make_fx(fn, tracing_mode="symbolic",
                          _allow_non_fake_inputs=True)(
                              *self._prime_args(args))
         finally:
-            if previous is None:
-                os.environ.pop(env_key, None)
-            else:
-                os.environ[env_key] = previous
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         strip_detach(gm)
         self._compiled = torch.compile(gm, dynamic=True,
                                        options=inductor_options())

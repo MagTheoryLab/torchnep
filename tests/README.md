@@ -14,6 +14,7 @@ TEST_DEVICE=cpu pytest tests/      # restrict device (default: cpu + cuda if pre
 | `test_checkpoint_format.py` | Current signed checkpoint resume/fine-tuning; rejection of unsigned/raw/prefixed state, missing metadata, and retired schedules. |
 | `test_full_order_training.py` | All magnetic channels update from initialization; every curriculum spelling is rejected. |
 | `test_magnetic_polynomial.py` | c516 tensor layout, SOC/non-SOC symmetry, zero-spin/inactive-type behavior and first/second derivatives. |
+| `test_cuda_harmonics.py` | L0–L4 spin and L1–L4 lattice polynomial values, VJP/JVP/HVP, zero/empty/noncontiguous inputs, CPU table expansion, and CUDA FP32/FP64 gradcheck/gradgradcheck. |
 | `test_gpumd_parity.py` | E / F / V / descriptor vs the GPUMD reference (incl. compressed CrCoNi frames where ZBL forces reach ~120 eV/Å); analytical vs autograd; train path vs predict path. |
 | `test_descriptors.py` | Angular basis L=1..8; gradient checks; the six higher-body channels (q_222, q_1111, q_112, q_123, q_233, q_134) — GPUMD-polynomial match and rotational invariance; backend auto-resolution and loop/bmm/mulsum numerical equivalence. |
 | `test_neighbor.py` | Cell-list vs brute-force neighbor search; tiled / auto-block paths. |

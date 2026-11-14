@@ -8,6 +8,7 @@ import torch
 
 from . import ops
 from .spin_tables import COUPLINGS, HARMONICS
+from .cuda_harmonics import fused_harmonics
 
 
 class MagneticPolynomialDescriptor(torch.nn.Module):
@@ -105,6 +106,9 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             torch.nn.init.uniform_(parameter, -1., 1.)
 
     def _harmonics(self, xyz):
+        fused = fused_harmonics(xyz, self.spin_l_max)
+        if fused is not None:
+            return fused
         columns = [[] for _ in range((self.spin_l_max+1)**2)]
         for component, x, y, z, coefficient in HARMONICS:
             if component < len(columns):

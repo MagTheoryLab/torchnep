@@ -158,7 +158,9 @@ training optimizer; matching the descriptor does not reproduce GPUMD SNES runs.
 Spin training uses eager autograd, including second derivatives for force
 losses. Its shared angular-coefficient contraction reuses the one-hot matmul
 backend to avoid contended gradient atomics at low element counts; no additional
-configuration is needed.
+configuration is needed. On CUDA, lattice and spin harmonics through L4 use
+fused polynomial evaluation, VJP and double backward. CPU, higher lattice
+orders and compiled force tracing retain the independent tensor reference.
 
 ### Training hyperparameters
 

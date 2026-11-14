@@ -250,8 +250,9 @@ def angular_basis(x: torch.Tensor, y: torch.Tensor,
     r"""Solid-harmonics-style angular basis Y_{Ln1} for L = 1..l_max_3b.
 
     Each basis element is z_factor(z) * {Re or Im}[(x + iy)^n1], using the
-    polynomial coefficients in ``Z_COEFFICIENT``. Bit-identical to the
-    previous hand-coded formulas for l_max_3b <= 4.
+    polynomial coefficients in ``Z_COEFFICIENT``. CUDA L <= 4 uses fused
+    polynomial evaluation and analytic first/second pullbacks; the tensor
+    reference below remains independent.
 
     Parameters
     ----------
@@ -268,6 +269,12 @@ def angular_basis(x: torch.Tensor, y: torch.Tensor,
         return torch.zeros(x.shape[0], 0, dtype=x.dtype, device=x.device)
     if l_max_3b > MAX_L3B:
         raise ValueError(f"l_max_3b={l_max_3b} exceeds MAX_L3B={MAX_L3B}")
+
+    if x.is_cuda and l_max_3b <= 4:
+        from .cuda_harmonics import fused_harmonics
+        fused = fused_harmonics(torch.stack((x,y,z),-1), l_max_3b, structural=True)
+        if fused is not None:
+            return fused
 
     z_pow = _build_z_powers(z, l_max_3b)
     Re, Im = _build_xy_powers(x, y, l_max_3b)

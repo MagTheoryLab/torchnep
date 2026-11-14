@@ -24,7 +24,7 @@ from .response_training import (GENERATOR_CURVE_SCHEMA, configure_response_store
 def _reference_jacobian():
     # Batched VJPs need tensor-only ops; custom CUDA pullbacks have no vmap rule.
     # Restore all execution choices before live-autograd parity and evaluation.
-    keys = ("TORCHNEP_OC_CUDA_STRUCT_CENTER",)
+    keys = ("TORCHNEP_OC_CUDA_STRUCT_CENTER", "TORCHNEP_CUDA_HARMONICS")
     saved = {k: os.environ.get(k) for k in keys}
     try:
         os.environ.update({k: "0" for k in keys})

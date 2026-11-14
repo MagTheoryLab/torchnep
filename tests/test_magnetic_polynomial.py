@@ -114,6 +114,7 @@ def test_radial_contraction_matches_reference_through_second_derivatives(
     actual = evaluate()
     with monkeypatch.context() as patch:
         patch.setattr(ops, '_type_contraction_mulsum', ops._type_contraction_bmm)
+        patch.setattr('torchnep.magnetic_polynomial.fused_harmonics', lambda *args: None)
         reference = evaluate()
     for value, expected in zip(actual, reference):
         torch.testing.assert_close(value, expected,
