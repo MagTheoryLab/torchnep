@@ -155,6 +155,11 @@ See [the magnetic example and response-data contract](example/oc_spin/README.md)
 and [the complete input](example/oc_spin/nep.in). TorchNEP keeps its PyTorch
 training optimizer; matching the descriptor does not reproduce GPUMD SNES runs.
 
+Spin training uses eager autograd, including second derivatives for force
+losses. Its shared angular-coefficient contraction reuses the one-hot matmul
+backend to avoid contended gradient atomics at low element counts; no additional
+configuration is needed.
+
 ### Training hyperparameters
 
 | Parameter | Default | Description |

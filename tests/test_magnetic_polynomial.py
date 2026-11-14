@@ -86,3 +86,36 @@ def test_shared_structural_angular_weights_receive_magnetic_gradients():
     gradient=torch.autograd.grad(q.sum(),angular)[0]
     assert torch.count_nonzero(gradient)>0
     assert not hasattr(descriptor,'radial_leg_mix')
+
+
+@pytest.mark.parametrize('soc,order,lmax,compress', [(1,2,2,3),(1,4,4,1),(0,4,4,1)])
+@pytest.mark.parametrize('device,dtype', [('cpu',torch.float64), *[
+    pytest.param('cuda', dtype, marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason='CUDA required'))
+    for dtype in (torch.float64,torch.float32)]])
+def test_radial_contraction_matches_reference_through_second_derivatives(
+        monkeypatch, soc, order, lmax, compress, device, dtype):
+    from torchnep import ops
+
+    descriptor, args = _case(soc, order, lmax, compress)
+    descriptor = descriptor.to(device=device, dtype=dtype)
+    args = tuple(x.to(device=device, dtype=dtype if x.is_floating_point() else x.dtype)
+                 if isinstance(x, torch.Tensor) else x for x in args)
+    for index in (0,3,6):
+        args[index].requires_grad_()
+    inputs = (args[0],args[3],args[6],*descriptor.parameters())
+
+    def evaluate():
+        q = descriptor(*args)
+        gradients = torch.autograd.grad(q.square().mean(), inputs, create_graph=True)
+        second = torch.autograd.grad(sum(g.square().sum() for g in gradients), inputs)
+        return (q,*gradients,*second)
+
+    actual = evaluate()
+    with monkeypatch.context() as patch:
+        patch.setattr(ops, '_type_contraction_mulsum', ops._type_contraction_bmm)
+        reference = evaluate()
+    for value, expected in zip(actual, reference):
+        torch.testing.assert_close(value, expected,
+                                   rtol=2e-11 if dtype == torch.float64 else 2e-4,
+                                   atol=2e-10 if dtype == torch.float64 else 2e-4)

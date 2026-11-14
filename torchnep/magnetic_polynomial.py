@@ -125,7 +125,7 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         distance = torch.linalg.vector_norm(rij, dim=-1).clamp_min(1e-12)
         geometry = self._harmonics(rij / distance.unsqueeze(-1))
         basis = ops.chebyshev_basis(distance, self.cutoff_radial, self.basis_size_radial)
-        angular = ops._type_contraction_bmm(basis, pair_i, pair_j, atom_types, c_angular)
+        angular = ops._type_contraction_mulsum(basis, pair_i, pair_j, atom_types, c_angular)
         radial = angular @ self.radial_mix
         edge = torch.einsum('ec,eg,ep->ecgp', radial, geometry, phi[pair_j])
         density = spins.new_zeros(n_atoms, self.spin_compress,
