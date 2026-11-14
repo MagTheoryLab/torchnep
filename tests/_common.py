@@ -62,7 +62,7 @@ FIXTURES = [
         "nep":   DATA_DIR / "nep_CrCoNi.txt",
         "xyz":   DATA_DIR / "CrCoNi.xyz",
         "ref":   DATA_DIR / "CrCoNi.gpumd.npz",
-        "note":  "nep4_zbl, typewise ZBL, l_max 4 2 1 (legacy 3-field). "
+        "note":  "format_version 1, model nep, typewise ZBL, l_max 4 2 1. "
                  "Multi-frame: original (NN ~1.5 A) plus compressed/rattled "
                  "frames down to NN ~1.18 A that drive the ZBL repulsion "
                  "to/below its inner cutoff (1.25 A).",
@@ -77,16 +77,14 @@ def load_reference(npz_path: Path) -> dict:
       ``E_per_atom``  : (Nframes,)            eV/atom
       ``F``           : (Natoms, 3)           eV/A
       ``V_per_atom``  : (Nframes, 6)          eV, GPUMD-ordered (xx,yy,zz,xy,yz,zx)
-      ``D_per_atom``  : (Natoms, dim) or None scaled descriptor (q * q_scaler);
-                                              ``None`` if the fixture pre-dates
-                                              descriptor baking.
+      ``D_per_atom``  : (Natoms, dim) scaled descriptor (q * q_scaler).
     """
     z = np.load(npz_path)
     return {
         "E_per_atom": z["E_per_atom"],
         "F":          z["F"],
         "V_per_atom": z["V_per_atom"],
-        "D_per_atom": z["D_per_atom"] if "D_per_atom" in z.files else None,
+        "D_per_atom": z["D_per_atom"],
     }
 
 
@@ -164,44 +162,20 @@ def parse_nep_header(nep_path: Path) -> dict:
     """Extract just the architecture fields we need to reconstruct nep.in for
     GPUMD prediction mode (cutoff / n_max / basis_size / l_max / neuron /
     type / zbl)."""
-    out = {}
-    with open(nep_path) as f:
-        for line in f:
-            ln = line.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            parts = ln.split()
-            try:
-                float(parts[0])
-                break               # numeric body starts -> header done
-            except ValueError:
-                pass
-            key = parts[0]
-            if key.startswith("nep"):
-                # version-and-types line: "nep4[_zbl] N T1 T2 ..."
-                out["version_tag"] = key
-                out["num_types"] = int(parts[1])
-                out["type_names"] = parts[2:2 + out["num_types"]]
-            elif key == "zbl":
-                # "zbl <rc_inner> <rc_outer>" or with typewise factor at end
-                if len(parts) == 4:
-                    out["zbl_outer"] = float(parts[2])
-                    out["zbl_factor"] = float(parts[3])
-                else:
-                    out["zbl_outer"] = float(parts[2])
-            elif key == "cutoff":
-                out["rc_radial"]  = float(parts[1])
-                out["rc_angular"] = float(parts[2])
-            elif key == "n_max":
-                out["n_max_radial"]  = int(parts[1])
-                out["n_max_angular"] = int(parts[2])
-            elif key == "basis_size":
-                out["basis_size_radial"]  = int(parts[1])
-                out["basis_size_angular"] = int(parts[2])
-            elif key == "l_max":
-                out["l_max"] = [int(x) for x in parts[1:]]
-            elif key == "ANN":
-                out["neuron"] = int(parts[1])
+    from torchnep.spin_schema import read_nep_model
+    config, _, _ = read_nep_model(nep_path)
+    out = {
+        "model": config["model"], "num_types": config["num_types"],
+        "type_names": config["type_names"], "rc_radial": config["cutoff_radial"],
+        "rc_angular": config["cutoff_angular"], "n_max_radial": config["n_max_radial"],
+        "n_max_angular": config["n_max_angular"], "basis_size_radial": config["basis_size_radial"],
+        "basis_size_angular": config["basis_size_angular"], "l_max": config["l_max"],
+        "neuron": config["neuron"],
+    }
+    if config.get("zbl") is not None:
+        out["zbl_outer"] = config["zbl"]
+        if "typewise_cutoff_zbl_factor" in config:
+            out["zbl_factor"] = config["typewise_cutoff_zbl_factor"]
     return out
 
 
@@ -214,14 +188,13 @@ def write_nep_in(hdr: dict, dst: Path, output_descriptor: int = 0) -> None:
     """
     lines = [
         f"type {hdr['num_types']} {' '.join(hdr['type_names'])}",
+        f"model {hdr['model']}",
         "prediction 1",
         "batch 1",
         f"cutoff {int(hdr['rc_radial'])} {int(hdr['rc_angular'])}",
         f"n_max {hdr['n_max_radial']} {hdr['n_max_angular']}",
         f"basis_size {hdr['basis_size_radial']} {hdr['basis_size_angular']}",
-        # Pad l_max to 5 fields with zeros (new GPUMD format accepts 1–5
-        # but writes 5 by default; we feed it the form it expects).
-        f"l_max {' '.join(str(x) for x in (hdr['l_max'] + [0] * 5)[:5])}",
+        f"l_max {' '.join(str(x) for x in hdr['l_max'])}",
         f"neuron {hdr['neuron']}",
     ]
     if "zbl_outer" in hdr:

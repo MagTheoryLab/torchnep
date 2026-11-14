@@ -29,12 +29,7 @@ from typing import Dict
 from .constants import ELEMENTS, COVALENT_RADIUS, C3B, C4B, C5B, C4B2
 from .neighbor import build_neighbor_list, CellList
 from . import ops
-from .spin_schema import (
-    make_spin_descriptor,
-    normalize_spin_cutoff,
-    spin_projection_parameters,
-    spin_projection_size,
-)
+
 
 
 def _available_memory_bytes(device: torch.device) -> int:
@@ -100,378 +95,45 @@ class NEPCalculator:
         self.device = torch.device(device)
         self._load_model(model_file)
 
-    def _load_model(self, path: str):
-        with open(path) as f:
-            lines = f.readlines()
-
-        idx = 0
-
-        # Line 1: version and types
-        header = lines[idx].split()
-        version_str = header[0]  # "nep4", "nep4_zbl", etc.
-        self.has_zbl = "zbl" in version_str
-        header_spin_mode = (
-            3 if "spin3" in version_str
-            else 2 if "spin2" in version_str
-            else 0
-        )
-        self.spin_mode = header_spin_mode
-        self.num_types = int(header[1])
-        self.type_names = header[2 : 2 + self.num_types]
-        # Real atomic numbers (Z = 1 for H, 6 for C, ...). ELEMENTS is
-        # 0-indexed, so we add 1. ZBL uses these directly (Z*Z', Z^0.23).
-        self.atomic_numbers = [ELEMENTS.index(n) + 1 for n in self.type_names]
-        idx += 1
-
-        # Counted O/C spin metadata block.
-        self.spin_order = 1
-        self.spin_soc = 0
-        self.spin_projection_size = None
-        self.spin_compress = 2
-        self.spin_basis_size = [8, 0]
-        self.spin_l_max = [2, 0, 0]
-        self.spin_cutoff = None
-        spin_cutoff_values = None
-        self.energy_baseline = torch.zeros(
-            self.num_types, dtype=self.dtype, device=self.device)
-        self.spin_dof_type_active = torch.ones(
-            self.num_types, dtype=torch.bool, device=self.device)
-        self.spin_env_type_active = self.spin_dof_type_active.clone()
-        saw_spin_header = False
-        saw_spin_baseline = False
-        seen_spin_metadata = set()
-        allowed_spin_metadata = {
-            "spin_baseline", "spin_basis_size", "spin_l_max",
-            "spin_compress", "spin_cutoff", "spin_order", "spin_soc",
-            "spin_projection_size", "spin_scaler", "spin_dof_type",
-            "spin_env_type",
-        }
-        if idx < len(lines) and lines[idx].split()[0] == "spin_mode":
-            saw_spin_header = True
-            parts = lines[idx].split()
-            self.spin_mode = int(parts[1])
-            count = int(parts[2]) if len(parts) > 2 else 0
-            idx += 1
-            if idx + count > len(lines):
-                raise ValueError("truncated counted spin_mode block")
-            for raw in lines[idx:idx + count]:
-                tokens = raw.split()
-                key = tokens[0]
-                if key == "spin_descriptor":
-                    raise ValueError(
-                        "spin_descriptor is not supported; the standalone "
-                        "O/C protocol uses spin_mode 2 or 3")
-                if key not in allowed_spin_metadata:
-                    raise ValueError(f"unknown O/C model metadata: {key}")
-                if key in seen_spin_metadata:
-                    raise ValueError(f"duplicate O/C model metadata: {key}")
-                seen_spin_metadata.add(key)
-                if key == "spin_baseline":
-                    if len(tokens) != self.num_types + 1:
-                        raise ValueError(
-                            "spin_baseline must have one value per type")
-                    self.energy_baseline = torch.tensor(
-                        [float(value) for value in tokens[1:]],
-                        dtype=self.dtype, device=self.device)
-                    saw_spin_baseline = True
-                elif key == "spin_compress":
-                    self.spin_compress = int(tokens[1])
-                elif key == "spin_basis_size":
-                    values = [int(value) for value in tokens[1:]]
-                    self.spin_basis_size = (
-                        [values[0], 0]
-                        if len(values) == 1
-                        else values[:2]
-                    )
-                elif key == "spin_l_max":
-                    values = [int(value) for value in tokens[1:]]
-                    self.spin_l_max = (
-                        [values[0], 0, 0]
-                        if len(values) == 1
-                        else values[:3]
-                    )
-                elif key == "spin_cutoff":
-                    spin_cutoff_values = [
-                        float(value) for value in tokens[1:]
-                    ]
-                elif key == "spin_order":
-                    self.spin_order = int(tokens[1])
-                elif key == "spin_soc":
-                    self.spin_soc = int(tokens[1])
-                elif key == "spin_projection_size":
-                    self.spin_projection_size = int(tokens[1])
-                elif key == "spin_scaler":
-                    if len(tokens) != 2 or int(tokens[1]) != 1:
-                        raise ValueError("spin_scaler must be 1")
-                elif key in ("spin_dof_type", "spin_env_type"):
-                    active = torch.zeros(
-                        self.num_types, dtype=torch.bool, device=self.device)
-                    for name in tokens[1:]:
-                        if name not in self.type_names:
-                            raise ValueError(
-                                f"{key} contains unknown type {name!r}")
-                        active[self.type_names.index(name)] = True
-                    if not active.any():
-                        raise ValueError(
-                            f"{key} must enable at least one type")
-                    if key == "spin_dof_type":
-                        self.spin_dof_type_active = active
-                        self.spin_env_type_active = active.clone()
-                    else:
-                        self.spin_env_type_active = active
-            idx += count
-            if (idx < len(lines)
-                    and lines[idx].split()[0].startswith("spin_")):
-                raise ValueError(
-                    "spin_mode metadata count does not match its block; "
-                    "spin metadata found outside the counted block: "
-                    + lines[idx].split()[0]
-                )
-        if self.spin_mode and not saw_spin_header:
-            raise ValueError(
-                f"nep4_spin{self.spin_mode} model requires a counted "
-                "spin_mode block"
-            )
-        if self.spin_mode and not saw_spin_baseline:
-            raise ValueError("spin_mode block is missing spin_baseline")
-        if self.spin_mode != header_spin_mode:
-            raise ValueError(
-                f"header declares spin_mode {header_spin_mode}, but the "
-                f"metadata block declares {self.spin_mode}"
-            )
-        if self.spin_mode not in (0, 2, 3):
-            raise ValueError("spin_mode must be 0, 2, or 3")
-        self.spin_descriptor_kind = (
-            "magnetic_polynomial"
-            if self.spin_mode == 2
-            else "magnetic_polynomial_v3"
-            if self.spin_mode == 3
-            else None
-        )
-        if self.spin_mode in (2, 3):
-            required = {
-                "spin_baseline", "spin_basis_size", "spin_l_max",
-                "spin_compress", "spin_cutoff", "spin_order", "spin_soc",
-                "spin_projection_size", "spin_scaler",
-            }
-            missing = sorted(required - seen_spin_metadata)
-            if missing:
-                raise ValueError(
-                    "spin_mode block is missing required metadata: "
-                    + ", ".join(missing))
-            if self.spin_order not in (1, 2, 3):
-                raise ValueError("spin_order must be 1, 2, or 3")
-            if self.spin_soc not in (0, 1):
-                raise ValueError("spin_soc must be 0 or 1")
-            if self.spin_projection_size is None:
-                raise ValueError(
-                    f"nep4_spin{self.spin_mode} model is missing "
-                    "spin_projection_size"
-                )
-        if bool((self.spin_dof_type_active
-                 & ~self.spin_env_type_active).any().item()):
-            raise ValueError("spin_dof_type must be a subset of spin_env_type")
-
-        # ZBL line
-        if self.has_zbl:
-            parts = lines[idx].split()
-            self.zbl_rc_inner = float(parts[1])
-            self.zbl_rc_outer = float(parts[2])
-            self.zbl_typewise_factor = float(parts[3]) if len(parts) > 3 else None
-            idx += 1
-
-            if self.zbl_typewise_factor is not None:
-                # Per-type cutoffs. COVALENT_RADIUS is 0-indexed (H at 0),
-                # while self.atomic_numbers holds real Z (H=1), hence z-1.
-                self.zbl_rc_inner_per_type = torch.tensor(
-                    [self.zbl_typewise_factor * COVALENT_RADIUS[z - 1]
-                     for z in self.atomic_numbers],
-                    dtype=self.dtype, device=self.device)
-                self.zbl_rc_outer_per_type = 2.0 * self.zbl_rc_inner_per_type
-        else:
-            self.zbl_rc_inner = None
-            self.zbl_rc_outer = None
-            self.zbl_typewise_factor = None
-
-        # Cutoff
-        parts = lines[idx].split()
-        self.rc_radial = float(parts[1])
-        self.rc_angular = float(parts[2])
-        idx += 1
-        if self.spin_mode:
-            self.spin_cutoff_by_type = normalize_spin_cutoff(
-                ([self.rc_radial]
-                 if spin_cutoff_values is None else spin_cutoff_values),
-                self.num_types,
-            )
-            spin_cutoff_max = max(self.spin_cutoff_by_type)
-            self.spin_cutoff = [spin_cutoff_max, spin_cutoff_max]
-        else:
-            self.spin_cutoff_by_type = [self.rc_radial] * self.num_types
-            self.spin_cutoff = [self.rc_radial, self.rc_angular]
-        spin_cutoff_type = torch.tensor(
-            self.spin_cutoff_by_type, dtype=self.dtype, device=self.device
-        )
-        self.spin_cutoff_pair = 0.5 * (
-            spin_cutoff_type[:, None] + spin_cutoff_type[None, :]
-        )
-        self.spin_has_typewise_cutoff = any(
-            value != self.spin_cutoff_by_type[0]
-            for value in self.spin_cutoff_by_type[1:]
-        )
-
-        # n_max, basis_size, l_max
-        parts = lines[idx].split()
-        self.n_max_radial = int(parts[1])
-        self.n_max_angular = int(parts[2])
-        idx += 1
-
-        parts = lines[idx].split()
-        self.basis_size_radial = int(parts[1])
-        self.basis_size_angular = int(parts[2])
-        idx += 1
-
-        parts = lines[idx].split()
-        self.l_max_3b   = int(parts[1])
-        self.has_q_222  = 1 if (len(parts) > 2 and int(parts[2]) > 0) else 0
-        self.has_q_1111 = 1 if (len(parts) > 3 and int(parts[3]) > 0) else 0
-        self.has_q_112  = 1 if (len(parts) > 4 and int(parts[4]) > 0) else 0
-        self.has_q_123  = 1 if (len(parts) > 5 and int(parts[5]) > 0) else 0
-        self.has_q_233  = 1 if (len(parts) > 6 and int(parts[6]) > 0) else 0
-        self.has_q_134  = 1 if (len(parts) > 7 and int(parts[7]) > 0) else 0
-        idx += 1
-
-        # ANN
-        parts = lines[idx].split()
-        self.num_neurons = int(parts[1])
-        idx += 1
-
-        # Descriptor dimension — order must match GPUMD save layout:
-        # radial -> 3-body -> q_222 -> q_1111 -> q_112 -> q_123 -> q_233 -> q_134.
-        n_ap1 = self.n_max_angular + 1
-        self.dim_radial = self.n_max_radial + 1
-        self.dim_angular_3b   = n_ap1 * self.l_max_3b
-        self.dim_angular_4b   = n_ap1 if self.has_q_222  else 0
-        self.dim_angular_5b   = n_ap1 if self.has_q_1111 else 0
-        self.dim_angular_112  = n_ap1 if self.has_q_112  else 0
-        self.dim_angular_123  = n_ap1 if self.has_q_123  else 0
-        self.dim_angular_233  = n_ap1 if self.has_q_233  else 0
-        self.dim_angular_134  = n_ap1 if self.has_q_134  else 0
-        self.struct_dim = (self.dim_radial + self.dim_angular_3b +
-                           self.dim_angular_4b + self.dim_angular_5b +
-                           self.dim_angular_112 +
-                           self.dim_angular_123 + self.dim_angular_233 +
-                           self.dim_angular_134)
-        self.spin_descriptor = None
-        self.spin_dim = 0
-        if self.spin_mode:
-            self.spin_descriptor = make_spin_descriptor(
-                self.spin_mode,
-                spin_compress=self.spin_compress,
-                spin_l_max=self.spin_l_max[0],
-                spin_order=self.spin_order,
-                spin_soc=bool(self.spin_soc),
-                basis_size_radial=self.spin_basis_size[0],
-                cutoff_radial=self.spin_cutoff[0],
-            )
-            self.spin_descriptor = self.spin_descriptor.to(
-                dtype=self.dtype, device=self.device
-            )
-            self.spin_dim = self.spin_descriptor.dim
-        self.dim = self.struct_dim + self.spin_dim
-        self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
-
-        # Parse data
-        data = [float(l) for l in lines[idx:] if l.strip()]
-        di = 0
-        n = self.num_neurons
-        d = self.dim
-
-        # Per-type NN weights
-        self.w0, self.b0, self.w1 = [], [], []
-        for t in range(self.num_types):
-            w0 = np.array(data[di:di + n * d]).reshape(n, d)
-            di += n * d
-            b0 = np.array(data[di:di + n])
-            di += n
-            w1 = np.array(data[di:di + n])
-            di += n
-            self.w0.append(torch.tensor(w0, dtype=self.dtype, device=self.device))
-            self.b0.append(torch.tensor(b0, dtype=self.dtype, device=self.device))
-            self.w1.append(torch.tensor(w1, dtype=self.dtype, device=self.device))
-
-        # Common output bias
-        self.b1 = torch.tensor(data[di], dtype=self.dtype, device=self.device)
-        di += 1
-
-        # c parameters
-        nt2 = self.num_types ** 2
-        c2_size = (self.n_max_radial + 1) * (self.basis_size_radial + 1) * nt2
-        c2 = np.array(data[di:di + c2_size]).reshape(
-            self.n_max_radial + 1, self.basis_size_radial + 1,
-            self.num_types, self.num_types)
-        # save_nep_txt stores c2 transposed as (n_max+1, basis+1, nt, nt);
-        # ops.compute_descriptors expects (nt, nt, n_max+1, basis+1).
-        self.c2 = torch.tensor(c2, dtype=self.dtype, device=self.device).permute(2, 3, 0, 1).contiguous()
-        di += c2_size
-
-        if self.l_max_3b > 0:
-            c3_size = (self.n_max_angular + 1) * (self.basis_size_angular + 1) * nt2
-            c3 = np.array(data[di:di + c3_size]).reshape(
-                self.n_max_angular + 1, self.basis_size_angular + 1,
-                self.num_types, self.num_types)
-            self.c3 = torch.tensor(c3, dtype=self.dtype, device=self.device).permute(2, 3, 0, 1).contiguous()
-            di += c3_size
-
-        self.c_spin = None
-        if self.spin_mode:
-            c_spin_size = (
-                self.spin_compress * (self.spin_basis_size[0] + 1) * nt2)
-            c_spin = np.array(
-                data[di:di + c_spin_size]).reshape(
-                    1, self.spin_compress, self.spin_basis_size[0] + 1,
-                    self.num_types, self.num_types)
-            self.c_spin = torch.tensor(
-                c_spin, dtype=self.dtype, device=self.device
-            ).permute(0, 3, 4, 1, 2).contiguous()
-            di += c_spin_size
-
-        expected_projection_size = spin_projection_size(self)
-        if self.spin_mode in (2, 3):
-            if self.spin_projection_size != expected_projection_size:
-                raise ValueError(
-                    "spin_projection_size does not match the descriptor: "
-                    f"{self.spin_projection_size} != "
-                    f"{expected_projection_size}"
-                )
-        for parameter in spin_projection_parameters(self):
-            size = parameter.numel()
-            values = data[di:di + size]
-            if len(values) != size:
-                raise ValueError("truncated O/C projection weights")
-            parameter.data.copy_(
-                torch.tensor(
-                    values,
-                    dtype=self.dtype,
-                    device=self.device,
-                ).reshape(parameter.shape)
-            )
-            di += size
-
-        # q_scaler
-        self.q_scaler = torch.tensor(
-            data[di:di + self.dim], dtype=self.dtype, device=self.device)
-        di += self.dim
-        if di != len(data):
-            raise ValueError(
-                f"unexpected trailing numeric values: {len(data) - di}"
-            )
-
-        # Pre-build constants
-        self._c3b  = torch.tensor(C3B[:self.num_lm], dtype=self.dtype, device=self.device)
-        self._c4b  = torch.tensor(C4B,  dtype=self.dtype, device=self.device)
-        self._c5b  = torch.tensor(C5B,  dtype=self.dtype, device=self.device)
+    def _load_model(self, path):
+        from .model import NEPModel
+        from .spin_schema import read_nep_model
+        config, _, _ = read_nep_model(path)
+        # Reading a potential must not consume the caller's training RNG.
+        with torch.random.fork_rng(devices=[]):
+            model = NEPModel(config).to(dtype=self.dtype, device=self.device)
+        model.load_weights_from_nep_txt(path)
+        model.requires_grad_(False)
+        names = ("num_types", "type_names", "rc_radial", "rc_angular", "n_max_radial", "n_max_angular",
+                 "basis_size_radial", "basis_size_angular", "num_neurons", "l_max_3b", "has_q_222",
+                 "has_q_1111", "has_q_112", "has_q_123", "has_q_233", "has_q_134", "dim_radial",
+                 "dim_angular_3b", "dim_angular_4b", "dim_angular_5b", "dim_angular_112", "dim_angular_123",
+                 "dim_angular_233", "dim_angular_134", "struct_dim", "dim", "num_lm", "spin_mode", "spin_version",
+                 "spin_order", "spin_soc", "spin_compress", "spin_basis_size", "spin_l_max", "spin_cutoff",
+                 "spin_cutoff_by_type", "spin_cutoff_pair", "spin_has_typewise_cutoff", "spin_dof_type_active",
+                 "spin_descriptor", "spin_dim", "energy_baseline", "q_scaler", "_c3b", "_c4b", "_c5b", "_c4b2")
+        for name in names:
+            setattr(self, name, getattr(model, name))
+        self._c3b = torch.tensor(C3B[:self.num_lm], dtype=self.dtype, device=self.device)
+        self._c4b = torch.tensor(C4B, dtype=self.dtype, device=self.device)
+        self._c5b = torch.tensor(C5B, dtype=self.dtype, device=self.device)
         self._c4b2 = torch.tensor(C4B2, dtype=self.dtype, device=self.device)
+        self.atomic_numbers = [ELEMENTS.index(name)+1 if name in ELEMENTS else 0 for name in self.type_names]
+        self.c2, self.c3 = model.c_param_2.detach(), None if model.c_param_3 is None else model.c_param_3.detach()
+        self.w0 = [net.w0.T.detach() for net in model.fitting_nets]
+        self.b0 = [net.b0.detach() for net in model.fitting_nets]
+        self.w1 = [net.w1.detach() for net in model.fitting_nets]
+        self.b1 = model.b1.detach()
+        self.has_zbl = model.zbl is not None
+        self.zbl_rc_outer = model.zbl
+        self.zbl_rc_inner = None if model.zbl is None else model.zbl/2
+        self.zbl_typewise_factor = model.zbl_typewise_factor
+        if self.zbl_typewise_factor is not None:
+            self.zbl_rc_inner_per_type = torch.tensor(
+                [self.zbl_typewise_factor * COVALENT_RADIUS[z - 1]
+                 for z in self.atomic_numbers],
+                dtype=self.dtype, device=self.device)
+            self.zbl_rc_outer_per_type = 2*self.zbl_rc_inner_per_type
 
     def _spin_descriptor_coordinates(
         self, rij, pair_i, pair_j, atom_types
@@ -586,8 +248,7 @@ class NEPCalculator:
             q_spin = self.spin_descriptor(
                 descriptor_rij_spin, pi_spin, pj_spin,
                 spin_tensor, N, atom_types,
-                self.c_spin, None,
-                self.spin_dof_type_active, self.spin_env_type_active,
+                self.c3, self.spin_dof_type_active,
             )
             q = torch.cat((q, q_spin), dim=-1)
 
@@ -740,7 +401,7 @@ class NEPCalculator:
             Fp[mask] = (self.w1[t] * tanh_der) @ self.w0[t]
 
         Fp = Fp * self.q_scaler
-        Ei = Ei - self.b1
+        Ei = Ei - self.b1 + self.energy_baseline[batch["atom_types"]]
 
         # ZBL correction (energy + forces/virial via local autograd on rij_ang).
         # enable_grad: predict_dataset wraps this call in torch.no_grad(),
@@ -847,8 +508,7 @@ class NEPCalculator:
                 descriptor_rij_spin,
                 pair_i_spin,
                 pair_j_spin,
-                spins, N, batch["atom_types"], self.c_spin, None,
-                self.spin_dof_type_active, self.spin_env_type_active,
+                spins, N, batch["atom_types"], self.c3, self.spin_dof_type_active,
             )
             q = torch.cat((q_struct, q_spin), dim=-1)
             q_scaled = q * self.q_scaler
@@ -1109,7 +769,7 @@ class NEPCalculator:
                 h = torch.tanh(qt @ self.w0[t].T - self.b0[t])
                 Ei_blk[m] = h @ self.w1[t]
                 Fp_blk[m] = (self.w1[t] * (1.0 - h * h)) @ self.w0[t]
-            E_atom[blk] = Ei_blk - self.b1
+            E_atom[blk] = Ei_blk - self.b1 + self.energy_baseline[types_blk]
 
             Fp = torch.zeros(N, self.dim, dtype=dtype, device=device)
             Fp[blk] = Fp_blk * self.q_scaler

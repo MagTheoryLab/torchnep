@@ -31,9 +31,9 @@ def _write_case(tmp_path):
         "cutoff 3.5 3.5\n"
         "n_max 1 1\n"
         "basis_size 1 1\n"
-        "l_max 1 0 0\n"
+        "l_max 2 0 0\n"
         "neuron 4\n"
-        "spin_mode 2\n"
+        "model nep_spin\nspin_version 1\n"
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_order 3\n"
@@ -141,10 +141,10 @@ def _assert_outputs(output):
     ):
         assert (output / name).stat().st_size > 0
     potential = (output / "nep_final.txt").read_text()
-    assert potential.startswith("nep4_spin2 1 Fe\n")
+    assert potential.startswith("nep 1 Fe\nformat_version 1\nmodel nep_spin\n")
     baseline_line = next(
         line for line in potential.splitlines()
-        if line.startswith("spin_baseline ")
+        if line.startswith("energy_reference ")
     )
     assert float(baseline_line.split()[1]) != 0.0
     values = np.loadtxt(output / "mforce_train.out")
@@ -244,29 +244,22 @@ def test_two_rank_oc_training_smoke(tmp_path):
     assert "one replicated complete group per ordinary optimizer step" in log
 
 
-def test_two_rank_spin3_q_scaler_excludes_padding(tmp_path):
-    """The DDP-only duplicate frame must not change spin3 RMS scaling."""
+def test_two_rank_spin_q_scaler_excludes_padding(tmp_path):
+    """The DDP-only duplicate frame must not change spin RMS scaling."""
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
         import pytest
         pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
 
     config, xyz, _ = _write_case(tmp_path)
-    config.write_text(
-        config.read_text()
-        .replace(
-            "spin_mode 2\n",
-            "spin_mode 3\n",
-        )
-    )
-    single = tmp_path / "single-spin3"
+    single = tmp_path / "single-spin"
     train_nep(
         str(config), str(xyz), output_dir=str(single), device="cpu",
         precision="float64", restart=False, prediction_interval=0,
         run_seed=7,
     )
 
-    sharded = tmp_path / "sharded-spin3"
-    driver = tmp_path / "run_spin3_ddp.py"
+    sharded = tmp_path / "sharded-spin"
+    driver = tmp_path / "run_spin_ddp.py"
     driver.write_text(
         "import sys\n"
         "from torchnep import train_nep_sharded\n"

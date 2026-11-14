@@ -64,11 +64,11 @@ def test_cache_refresh_and_exact_resume():
 
 def test_parser_default_and_rejections(tmp_path):
     path = tmp_path / 'nep.in'
-    path.write_text('type 1 Fe\nspin_mode 3\n')
+    path.write_text('type 1 Fe\nmodel nep_spin\nspin_version 1\n')
     assert parse_nep_in(str(path))['joint_rank4'] is False
     path.write_text(path.read_text() + 'joint_rank4 1\n')
     assert parse_nep_in(str(path))['joint_rank4'] is True
-    for extra in ['joint_rank4 2', 'spin_mode 2']:
+    for extra in ['joint_rank4 2', 'model nep']:
         original = path.read_text()
         path.write_text(original + extra + '\n')
         with pytest.raises(ValueError):
@@ -80,7 +80,7 @@ def test_residual_includes_symmetric_virial_active_spins_and_padding():
     device = os.environ.get('JOINT_TEST_DEVICE', 'cpu')
     x = torch.tensor(2., dtype=torch.float64, device=device, requires_grad=True)
     class Model:
-        spin_mode = 3
+        spin_mode = 1
         spin_dof_type_active = torch.tensor([True, False], device=device)
         def compute_properties_cached(self, batch, **kwargs):
             return dict(Etot=x.expand(2), forces=x.expand(3, 3),
@@ -99,3 +99,12 @@ def test_residual_includes_symmetric_virial_active_spins_and_padding():
     expected = x*x*(.25 + 2 + 3 + 4 + 5*1.5)
     torch.testing.assert_close(r.square().sum(), expected)
     torch.testing.assert_close(torch.autograd.grad(r.square().sum(), x)[0], 2*expected/x)
+
+
+def test_joint_checkpoint_rejects_removed_version():
+    _, _, _, update = setup_problem()
+    state = dict(version=1, steps=4, refreshes=1,
+                 cache={'token': ((1., 1., 0., 1., 0.), 1., False, ())})
+    with pytest.raises(ValueError, match='checkpoint version'):
+        update.load_state_dict(state)
+    assert update.steps == 0 and update.cache is None

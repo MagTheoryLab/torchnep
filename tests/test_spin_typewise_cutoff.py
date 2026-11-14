@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from torchnep.data import parse_nep_in
-from torchnep.magnetic_polynomial_v3 import MagneticPolynomialDescriptorV3
+from torchnep.magnetic_polynomial import MagneticPolynomialDescriptor
 from torchnep.model import NEPModel, slim_model
 from torchnep.nep import NEPCalculator
 from torchnep.train import compute_q_scaler, preprocess_structures
@@ -25,7 +25,7 @@ def _write_input(path, cutoffs="4 6"):
         "basis_size 4 4\n"
         "l_max 2 0 0\n"
         "neuron 6\n"
-        "spin_mode 3\n"
+        "model nep_spin\nspin_version 1\n"
         "spin_order 2\n"
         "spin_compress 2\n"
         "spin_l_max 2\n"
@@ -69,7 +69,7 @@ def test_spin_typewise_cutoff_rejects_partial_type_list(tmp_path):
     path = tmp_path / "bad.in"
     path.write_text(
         "type 3 Fe Ge Ni\n"
-        "spin_mode 3\n"
+        "model nep_spin\nspin_version 1\n"
         "spin_cutoff 4 6\n"
     )
     with pytest.raises(ValueError, match=r"one value per element type \(3\)"):
@@ -124,21 +124,22 @@ def test_spin_pair_coordinate_map_is_exact_and_differentiable(tmp_path):
     )
     torch.testing.assert_close(mapped, rij * (6.0 / 5.0))
 
-    reference = MagneticPolynomialDescriptorV3(
+    reference = MagneticPolynomialDescriptor(
         spin_compress=model.spin_compress,
         spin_l_max=model.spin_l_max[0],
         spin_order=model.spin_order,
         spin_soc=bool(model.spin_soc),
         basis_size_radial=model.spin_basis_size[0],
+        n_max_angular=model.n_max_angular,
         cutoff_radial=5.0,
     ).double()
     with torch.no_grad():
-        reference.radial_leg_mix.copy_(model.spin_descriptor.radial_leg_mix)
+        reference.load_state_dict(model.spin_descriptor.state_dict())
     expected = reference(
-        rij, pair_i, pair_j, spins, 2, atom_types, model.c_param_spin
+        rij, pair_i, pair_j, spins, 2, atom_types, model.c_param_3
     )
     actual = model.spin_descriptor(
-        mapped, pair_i, pair_j, spins, 2, atom_types, model.c_param_spin
+        mapped, pair_i, pair_j, spins, 2, atom_types, model.c_param_3
     )
     torch.testing.assert_close(actual, expected, rtol=2.0e-12, atol=2.0e-12)
 
@@ -153,7 +154,7 @@ def test_spin_pair_coordinate_map_is_exact_and_differentiable(tmp_path):
         )
         descriptor = model.spin_descriptor(
             effective, pair_i, pair_j, spins, 2,
-            atom_types, model.c_param_spin,
+            atom_types, model.c_param_3,
         )
         return (descriptor * head).sum()
 
@@ -211,7 +212,7 @@ def test_spin_q_scaler_uses_typewise_coordinates(tmp_path, monkeypatch):
     )
     spin_q = model.spin_descriptor(
         mapped, pair_i, pair_j, spins, 2,
-        atom_types, model.c_param_spin,
+        atom_types, model.c_param_3,
     )
     expected = torch.cat(
         (torch.zeros(2, model.struct_dim, dtype=DTYPE), spin_q), dim=1
@@ -220,85 +221,6 @@ def test_spin_q_scaler_uses_typewise_coordinates(tmp_path, monkeypatch):
     torch.testing.assert_close(q_max, expected.max(0).values)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_spin_typewise_cutoff_cuda_forward_vjp_hvp(tmp_path, monkeypatch):
-    """The pair-coordinate pullback composes with the production CUDA bank."""
-    path = tmp_path / "nep.in"
-    _write_input(path)
-    source = NEPModel(parse_nep_in(path)).cuda().double()
-    reference = copy.deepcopy(source)
-    candidate = copy.deepcopy(source)
-    pair_i = torch.tensor([0, 0, 1, 1], dtype=torch.long, device="cuda")
-    pair_j = torch.tensor([1, 1, 0, 0], dtype=torch.long, device="cuda")
-    atom_types = torch.tensor([0, 1], dtype=torch.long, device="cuda")
-    raw_rij = torch.tensor(
-        [[1.2, 0.3, -0.1], [2.1, -0.2, 0.4],
-         [-1.2, -0.3, 0.1], [-2.1, 0.2, -0.4]],
-        dtype=DTYPE, device="cuda",
-    )
-    raw_spins = torch.tensor(
-        [[0.2, -0.3, 1.1], [0.4, 0.7, -0.2]],
-        dtype=DTYPE, device="cuda",
-    )
-    ref_rij = raw_rij.clone().requires_grad_(True)
-    ref_spins = raw_spins.clone().requires_grad_(True)
-    cuda_rij = raw_rij.clone().requires_grad_(True)
-    cuda_spins = raw_spins.clone().requires_grad_(True)
-
-    def evaluate(model, rij, spins, *, cuda_bank):
-        monkeypatch.setenv("TORCHNEP_OC_CUDA_PREBUILT", "1")
-        monkeypatch.setenv("TORCHNEP_OC_CUDA_FULL", "0")
-        monkeypatch.setenv("TORCHNEP_OC_CUDA_TRAIN", "0")
-        monkeypatch.setenv(
-            "TORCHNEP_OC_CUDA_BANK", "1" if cuda_bank else "0"
-        )
-        monkeypatch.setenv("TORCHNEP_OC_CUDA_CENTER", "0")
-        mapped = model._spin_descriptor_coordinates(
-            rij, pair_i, pair_j, atom_types
-        )
-        return model.spin_descriptor(
-            mapped, pair_i, pair_j, spins, 2, atom_types,
-            model.c_param_spin, None,
-            model.spin_dof_type_active, model.spin_env_type_active,
-        )
-
-    expected = evaluate(reference, ref_rij, ref_spins, cuda_bank=False)
-    actual = evaluate(candidate, cuda_rij, cuda_spins, cuda_bank=True)
-    torch.testing.assert_close(actual, expected, rtol=3.0e-11, atol=3.0e-11)
-
-    generator = torch.Generator(device="cuda").manual_seed(20260903)
-    pull = torch.randn(
-        expected.shape, dtype=DTYPE, device="cuda", generator=generator
-    )
-    ref_inputs = (ref_rij, ref_spins, reference.c_param_spin)
-    cuda_inputs = (cuda_rij, cuda_spins, candidate.c_param_spin)
-    first_ref = torch.autograd.grad(
-        (expected * pull).sum(), ref_inputs, create_graph=True
-    )
-    first_cuda = torch.autograd.grad(
-        (actual * pull).sum(), cuda_inputs, create_graph=True
-    )
-    for value, oracle in zip(first_cuda, first_ref):
-        torch.testing.assert_close(value, oracle, rtol=3.0e-9, atol=3.0e-9)
-
-    tangents = tuple(
-        torch.randn(
-            value.shape, dtype=DTYPE, device="cuda", generator=generator
-        )
-        for value in first_ref
-    )
-    scalar_ref = sum(
-        (value * tangent).sum()
-        for value, tangent in zip(first_ref, tangents)
-    )
-    scalar_cuda = sum(
-        (value * tangent).sum()
-        for value, tangent in zip(first_cuda, tangents)
-    )
-    second_ref = torch.autograd.grad(scalar_ref, ref_inputs)
-    second_cuda = torch.autograd.grad(scalar_cuda, cuda_inputs)
-    for value, oracle in zip(second_cuda, second_ref):
-        torch.testing.assert_close(value, oracle, rtol=3.0e-8, atol=5.0e-9)
 
 
 def test_spin_typewise_cutoff_round_trip(tmp_path):
@@ -306,7 +228,7 @@ def test_spin_typewise_cutoff_round_trip(tmp_path):
     _write_input(input_path)
     config = parse_nep_in(input_path)
     source = NEPModel(config).double()
-    model_path = tmp_path / "nep4_spin3.txt"
+    model_path = tmp_path / "nep_spin.txt"
     source.save_nep_txt(
         model_path, max_NN_radial=32, max_NN_angular=32
     )

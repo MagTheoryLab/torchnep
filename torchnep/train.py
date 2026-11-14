@@ -51,19 +51,12 @@ from . import ops
 from . import __version__
 from .predict import predict_from_store
 from .spin_schema import resolve_gpumd_qscaler
-from .oc_cuda_graph import (
-    OCCudaGraphTrainCache,
-    configure_graph_optimizer,
-    graph_cache_requested,
-    graph_support_reason,
-)
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
     GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
     balanced_group_step_batches,
-    complete_group_batches,
     generator_curve_loss,
     group_balanced_generator_rms,
     normalized_group_batches,
@@ -185,10 +178,10 @@ def format_config_summary(config: dict) -> List[str]:
             zbl_extra = f"  typewise factor {config['typewise_cutoff_zbl_factor']}"
         lines.append(f"  {tag('zbl'):10}  zbl          {config['zbl']}{zbl_extra}")
     if config.get("spin_mode", 0):
-        mode = config["spin_mode"]
-        family = "O/C magnetic polynomial"
+        mode = 1
+        family = "GPUMD c516 tensor descriptor"
         lines.append(
-            f"  {tag('spin_mode'):10}  spin_mode    {mode} ({family})"
+            f"  {tag('spin_version'):10}  spin_version {mode} ({family})"
         )
         lines.append(f"  {tag('spin_compress'):10}  spin_compress "
                      f"{config['spin_compress']}")
@@ -304,7 +297,7 @@ class StreamDataStore:
         self.has_spin = bool(config.get("spin_mode", 0))
         if self.has_spin and any("spins" not in s for s in structures):
             raise ValueError(
-                "spin_mode 2 or 3 requires a spin/moment vector for every atom")
+                "model nep_spin requires a spin/moment vector for every atom")
         self._pin = device.type == "cuda"
 
         # Basis parameters (needed at collate time).
@@ -1042,7 +1035,7 @@ def validate_spin_frames(frames, source_name):
         preview = ", ".join(str(index) for index in missing[:5])
         suffix = "..." if len(missing) > 5 else ""
         raise ValueError(
-            f"spin_mode 2 or 3 requires spins in every {source_name} frame; "
+            f"model nep_spin requires spins in every {source_name} frame; "
             f"missing at indices {preview}{suffix}"
         )
 
@@ -1106,8 +1099,8 @@ def load_response_dataset(config, data_file, valid_frames, energy_key="energy"):
         raise ValueError("lambda_spin_response must be finite and non-negative")
     if weight == 0:
         return [], []
-    if config.get("spin_mode", 0) not in (2, 3):
-        raise ValueError("lambda_spin_response requires spin_mode 2 or 3")
+    if config.get("spin_mode", 0) != 1:
+        raise ValueError("lambda_spin_response requires model nep_spin")
     path = response_data_path(data_file)
     if not os.path.isfile(path):
         raise ValueError("lambda_spin_response > 0 requires response.xyz beside train.xyz")
@@ -1127,7 +1120,7 @@ def load_response_dataset(config, data_file, valid_frames, energy_key="energy"):
                     f"response.xyz frame {index}: {key} must be finite "
                     f"with shape {expected}")
     validate_spin_frames(frames, "response")
-    active = config.get("spin_dof_type")
+    active = config.get("spin_type")
     target = config.get("spin_response_target", "mforce")
     selected = select_response_frames(frames, active, target)
     if not selected or len(selected) != len(frames):
@@ -1149,43 +1142,10 @@ def load_response_dataset(config, data_file, valid_frames, energy_key="energy"):
     return selected, validation
 
 
-def validate_resume_data_lineage(saved, current, require_versioned=False):
-    """Fail closed when resume would silently change a scientific split."""
-    if saved is None:
-        if require_versioned:
-            raise ValueError(
-                "spin checkpoint is missing content-addressed data lineage")
-        return
-    if "data" not in saved:
-        # Backward compatibility for old nonmagnetic checkpoints, which only
-        # recorded the validation path/ratio. Spin2 has no legacy production
-        # checkpoint contract and therefore takes the fail-closed branch.
-        if require_versioned:
-            raise ValueError(
-                "spin checkpoint is missing content-addressed data lineage")
-        legacy_current = {
-            "valid_file": (
-                None if current["validation"] is None
-                else current["validation"]["path"]
-            ),
-            "valid_ratio": current["valid_ratio"],
-        }
-        legacy_saved = {
-            "valid_file": (
-                None if saved.get("valid_file") is None
-                else os.path.realpath(saved["valid_file"])
-            ),
-            "valid_ratio": saved.get("valid_ratio"),
-        }
-        if legacy_saved != legacy_current:
-            raise ValueError(
-                "validation settings changed since the checkpoint was saved")
-        warnings.warn(
-            "legacy checkpoint has no data-content fingerprint; resume can "
-            "only verify its validation path/ratio",
-            RuntimeWarning,
-        )
-        return
+def validate_resume_data_lineage(saved, current):
+    """Require content-addressed lineage and the same scientific split."""
+    if not isinstance(saved, dict) or "data" not in saved:
+        raise ValueError("checkpoint is missing content-addressed data lineage")
     if saved != current:
         raise ValueError(
             "training/validation data content or split changed since the "
@@ -1228,11 +1188,8 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
         c2 = torch.ones_like(model.c_param_2)
         c3 = (torch.ones_like(model.c_param_3)
               if model.c_param_3 is not None else None)
-        c_spin = (torch.ones_like(model.c_param_spin)
-                  if model.c_param_spin is not None else None)
     else:
         c2, c3 = model.c_param_2, model.c_param_3
-        c_spin = model.c_param_spin
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -1262,9 +1219,7 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
             q_spin = model.spin_descriptor(
                 rij_spin, batch["pair_i_spin"],
                 batch["pair_j_spin"], batch["spins"], batch["N"],
-                batch["atom_types"], c_spin, None,
-                model.spin_dof_type_active,
-                model.spin_env_type_active,
+                batch["atom_types"], c3, model.spin_dof_type_active,
             )
             q = torch.cat((q, q_spin), dim=-1)
         q_min = torch.min(q_min, q.min(0).values)
@@ -1423,12 +1378,10 @@ def _scheduler_step(scheduler, avg_loss, mode, optimizer, min_lr):
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
-                     loss_weights=None, in_stage2=False, swa_model=None,
-                     best_true_loss=None, run_seed=None,
-                     best_valid_loss=None, valid_info=None,
-                     schedule_state=None, early_stop_state=None,
-                     start_stage2=None):
+def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss, *,
+                     loss_weights, best_true_loss, run_seed, best_valid_loss,
+                     valid_info, schedule_state, early_stop_state,
+                     in_stage2=False, swa_model=None, start_stage2=None):
     """Write a full training checkpoint.
 
     ``scheduler`` must be the ACTIVE one (stage2_scheduler while in stage 2,
@@ -1452,26 +1405,19 @@ def _save_checkpoint(path, model, optimizer, scheduler, epoch, best_loss,
         "in_stage2": in_stage2,
         "run_seed": run_seed,
         "start_stage2": start_stage2,
+        "scheduler_state": scheduler.state_dict(),
+        "loss_weights": loss_weights,
+        "best_true_loss": best_true_loss,
+        "best_valid_loss": best_valid_loss,
+        "valid_info": valid_info,
+        "schedule_state": schedule_state,
+        "early_stop_state": early_stop_state,
     }
     joint = getattr(optimizer, "joint_rank4", None)
     if joint is not None:
         state["joint_rank4"] = joint.state_dict()
-    if scheduler is not None:
-        state["scheduler_state"] = scheduler.state_dict()
-    if loss_weights is not None:
-        state["loss_weights"] = loss_weights
     if swa_model is not None:
         state["swa_state"] = swa_model.state_dict()
-    if best_true_loss is not None:
-        state["best_true_loss"] = best_true_loss
-    if best_valid_loss is not None:
-        state["best_valid_loss"] = best_valid_loss
-    if valid_info is not None:
-        state["valid_info"] = valid_info
-    if schedule_state is not None:
-        state["schedule_state"] = schedule_state
-    if early_stop_state is not None:
-        state["early_stop_state"] = early_stop_state
     best_model_path = os.path.join(
         os.path.dirname(os.path.abspath(path)), "nep_best.txt")
     if os.path.exists(best_model_path):
@@ -1495,28 +1441,26 @@ def _load_checkpoint(path, model, optimizer, swa_model, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     m = model._orig_mod if hasattr(model, "_orig_mod") else model
     m = m.module if hasattr(m, "module") else m
+    required = {
+        "epoch", "best_loss", "model_state", "model_signature", "optimizer_state",
+        "in_stage2", "run_seed", "start_stage2", "scheduler_state", "loss_weights",
+        "best_true_loss", "best_valid_loss", "valid_info", "schedule_state", "early_stop_state",
+    }
+    missing = required - ckpt.keys()
+    if missing:
+        raise ValueError("checkpoint is missing required fields: " + ", ".join(sorted(missing)))
+    if ckpt["model_signature"] != m.architecture_signature():
+        raise ValueError("checkpoint architecture does not match the current config")
+    if ckpt["run_seed"] is None:
+        raise ValueError("checkpoint is missing run_seed")
+    if not isinstance(ckpt["valid_info"], dict) or "data" not in ckpt["valid_info"]:
+        raise ValueError("checkpoint is missing content-addressed data lineage")
+    if (not isinstance(ckpt["schedule_state"], dict)
+            or ckpt["schedule_state"].keys() != {"stage2_start", "use_swa"}):
+        raise ValueError("checkpoint has an unsupported schedule_state")
+    if ckpt["scheduler_state"] is None:
+        raise ValueError("checkpoint is missing scheduler_state")
     model_state = ckpt["model_state"]
-    # Checkpoints written by older DDP runs saved the shim's state_dict,
-    # whose keys carry a uniform "model." prefix — strip it so they load
-    # into a plain NEPModel (new checkpoints always store plain keys).
-    if model_state and all(k.startswith("model.") for k in model_state):
-        model_state = {k[len("model."):]: v for k, v in model_state.items()}
-    saved_signature = ckpt.get("model_signature")
-    expected_signature = m.architecture_signature()
-    if saved_signature is None:
-        if m.spin_mode:
-            raise ValueError(
-                "spin checkpoint is missing model_signature; export a "
-                "versioned nep4_spin2/nep4_spin3 model before fine-tuning")
-        warnings.warn(
-            "legacy checkpoint has no architecture signature; only tensor "
-            "shapes can be checked",
-            RuntimeWarning,
-        )
-    elif saved_signature != expected_signature:
-        raise ValueError(
-            "checkpoint architecture does not match the current config: "
-            f"{saved_signature} != {expected_signature}")
     joint = getattr(optimizer, "joint_rank4", None)
     if (joint is not None) != (ckpt.get("joint_rank4") is not None):
         raise ValueError("resume requires the same joint_rank4 setting; use finetune_from to change optimizer")
@@ -1524,7 +1468,7 @@ def _load_checkpoint(path, model, optimizer, swa_model, device):
     optimizer.load_state_dict(ckpt["optimizer_state"])
     if joint is not None:
         joint.load_state_dict(ckpt["joint_rank4"])
-    in_stage2 = ckpt.get("in_stage2", False)
+    in_stage2 = ckpt["in_stage2"]
     if swa_model is not None and ckpt.get("swa_state") is not None:
         try:
             swa_model.load_state_dict(ckpt["swa_state"])
@@ -1535,23 +1479,22 @@ def _load_checkpoint(path, model, optimizer, swa_model, device):
     return {
         "epoch": ckpt["epoch"],
         "best_loss": ckpt["best_loss"],
-        "best_true_loss": ckpt.get("best_true_loss", float("inf")),
-        "loss_weights": ckpt.get("loss_weights"),
+        "best_true_loss": ckpt["best_true_loss"],
+        "loss_weights": ckpt["loss_weights"],
         "in_stage2": in_stage2,
-        "run_seed": ckpt.get("run_seed"),
-        "best_valid_loss": ckpt.get("best_valid_loss", float("inf")),
-        "valid_info": ckpt.get("valid_info"),
-        "schedule_state": ckpt.get("schedule_state"),
-        "early_stop_state": ckpt.get("early_stop_state"),
+        "run_seed": ckpt["run_seed"],
+        "best_valid_loss": ckpt["best_valid_loss"],
+        "valid_info": ckpt["valid_info"],
+        "schedule_state": ckpt["schedule_state"],
+        "early_stop_state": ckpt["early_stop_state"],
         "has_swa_state": ckpt.get("swa_state") is not None,
         "best_model_text": ckpt.get("best_model_text"),
-        "scheduler_state": ckpt.get("scheduler_state"),
-        "start_stage2": ckpt.get("start_stage2"),
+        "scheduler_state": ckpt["scheduler_state"],
+        "start_stage2": ckpt["start_stage2"],
     }
 
 
-def _restore_scheduler_state(info, lr_scheduler, stage2_scheduler,
-                             require_versioned=False):
+def _restore_scheduler_state(info, lr_scheduler, stage2_scheduler):
     """Strictly restore the active scheduler for an unchanged objective."""
     target = (
         stage2_scheduler
@@ -1562,14 +1505,7 @@ def _restore_scheduler_state(info, lr_scheduler, stage2_scheduler,
     if target is None:
         return
     if state is None:
-        if require_versioned:
-            raise ValueError(
-                "spin checkpoint is missing scheduler_state")
-        warnings.warn(
-            "legacy checkpoint has no scheduler_state; scheduler restarts",
-            RuntimeWarning,
-        )
-        return
+        raise ValueError("checkpoint is missing scheduler_state")
     try:
         target.load_state_dict(state)
     except (KeyError, ValueError, TypeError) as error:
@@ -1584,29 +1520,11 @@ def _load_finetune_weights(target, path, device):
         target.load_weights_from_nep_txt(path)
         return
     payload = torch.load(path, map_location=device, weights_only=False)
-    if "model_state" in payload:
-        state = payload["model_state"]
-        signature = payload.get("model_signature")
-    else:
-        state = payload
-        signature = None
-    if state and all(key.startswith("model.") for key in state):
-        state = {key[len("model."):]: value for key, value in state.items()}
-    expected = target.architecture_signature()
-    if signature is None:
-        if target.spin_mode:
-            raise ValueError(
-                "spin .pt weights are missing model_signature; use a "
-                "versioned checkpoint or nep4_spin2/nep4_spin3 text model")
-        warnings.warn(
-            "legacy .pt weights have no architecture signature; only tensor "
-            "shapes can be checked",
-            RuntimeWarning,
-        )
-    elif signature != expected:
-        raise ValueError(
-            "fine-tune architecture does not match the current config: "
-            f"{signature} != {expected}")
+    if "model_state" not in payload or "model_signature" not in payload:
+        raise ValueError(".pt weights require model_state and model_signature")
+    if payload["model_signature"] != target.architecture_signature():
+        raise ValueError("fine-tune architecture does not match the current config")
+    state = payload["model_state"]
     target.load_state_dict(state, strict=True)
 
 
@@ -1753,7 +1671,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                     t_mask = batch["tau_mask"] & active
                     if t_mask.any():
                         t_diff = result["tau"][t_mask] - batch["tau"][t_mask]
-                        tau_dof = 2 if raw_model.spin_mode == 3 else 3
+                        tau_dof = 2 if raw_model.spin_mode == 1 else 3
                         sum_lt += (
                             t_diff.square().sum(dim=1) / tau_dof
                         ).sum().item()
@@ -1958,16 +1876,6 @@ def _compile_check(dev):
 # ---------------------------------------------------------------------------
 # Unified training entry point (single GPU or torchrun DDP)
 # ---------------------------------------------------------------------------
-
-
-def validate_retired_curriculum_resume(schedule, epoch):
-    """Reject a legacy checkpoint whose removed update schedule is unfinished."""
-    end = schedule.get("curriculum_end")
-    enabled = bool(schedule.get("curriculum_enabled", end is not None))
-    if enabled and (end is None or epoch < end):
-        raise ValueError(
-            "unfinished spin_curriculum checkpoint cannot be resumed after removal; "
-            "use weight-only fine-tuning from its exported nep.txt instead")
 
 
 def train_nep(
@@ -2185,8 +2093,9 @@ def train_nep(
     if resume_ckpt is not None:
         _saved_seed = torch.load(resume_ckpt, map_location="cpu",
                                  weights_only=False).get("run_seed")
-        if _saved_seed is not None:
-            run_seed = _saved_seed  # continue the original streams + split
+        if _saved_seed is None:
+            raise ValueError("checkpoint is missing run_seed")
+        run_seed = _saved_seed
     if run_seed is None:
         import random
         run_seed = random.randrange(1, 2**31 - 1)
@@ -2225,7 +2134,7 @@ def train_nep(
         # The same draw export_valid_split reproduces (see data.py) — the
         # split can be exported as GPUMD-ready train.xyz/test.xyz files.
         has_response_groups = any("response_group" in f for f in frames)
-        if config.get("spin_mode", 0) in (2, 3) and has_response_groups:
+        if config.get("spin_mode", 0) == 1 and has_response_groups:
             val_idx = grouped_validation_indices(frames, valid_ratio, run_seed)
             val_set = set(val_idx)
             train_idx = [i for i in range(len(frames)) if i not in val_set]
@@ -2315,15 +2224,13 @@ def train_nep(
             config = dict(orig_config)
             config["type_names"] = keep
             config["num_types"] = len(keep)
-            for key in ("spin_dof_type", "spin_env_type"):
-                if config.get(key) is not None:
-                    config[key] = [
-                        name for name in config[key] if name in keep
-                    ]
+            config["spin_cutoff_by_type"] = [orig_config["spin_cutoff_by_type"][orig_config["type_names"].index(name)] for name in keep]
+            if config.get("spin_type") is not None:
+                config["spin_type"] = [name for name in config["spin_type"] if name in keep]
             if (config.get("spin_mode", 0)
-                    and config.get("spin_dof_type") == []):
+                    and config.get("spin_type") == []):
                 raise ValueError(
-                    "slim_types removed every active spin_dof_type")
+                    "slim_types removed every active spin_type")
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
@@ -2403,7 +2310,7 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode in (2, 3) and not use_autograd_forces:
+    if model.spin_mode == 1 and not use_autograd_forces:
         use_autograd_forces = True
         _log(f"  spin_mode {model.spin_mode}: using the full autograd "
              "E/F/V/MF/Tau path")
@@ -2476,10 +2383,9 @@ def train_nep(
              f"dim={model.dim}, b1 init={model.b1.item():.4f}")
 
     # Decide whether torch.compile will actually run BEFORE resolving the
-    # backend — the backend choice depends on it. Only the analytical path is
-    # compiled; the autograd path's create_graph=True double backward is
-    # incompatible with compile, so it stays eager.
-    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # backend — the backend choice depends on it. Ordinary models compile
+    # the analytical core or the materialized autograd force graph.
+    # use_compile=None means AUTO: attempt compilation on GPU,
     # stay eager on CPU (C++ Inductor warmup outweighs the gain for
     # typical CPU-sized runs). Explicit True/False always wins; every
     # failed capability check degrades to eager with a log line instead
@@ -2493,11 +2399,9 @@ def train_nep(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces and model.spin_descriptor is not None:
-            # O/C uses custom analytic CUDA Functions with explicit mixed
-            # pullbacks.  The generic make_fx compiler does not accept the
-            # spin/ragged inputs and must not replace that production path.
-            compile_msg = ("  torch.compile: disabled for O/C custom "
-                           "autograd sectors")
+            # CompiledAutogradForce currently handles ordinary NEP inputs only.
+            compile_msg = ("  torch.compile: disabled for spin/ragged "
+                           "autograd inputs")
         elif use_autograd_forces:
             # The nested create_graph=True double backward cannot be lowered
             # directly, but the make_fx route (materialize the first-order
@@ -2542,7 +2446,7 @@ def train_nep(
         q_stats = compute_q_scaler(
             model, data_store, backend=backend, batch_size=batch_size,
             gpumd_init=use_gpumd_qscaler,
-            return_rms=model.spin_mode == 3,
+            return_rms=model.spin_mode == 1,
         )
         model.set_q_scaler(*q_stats)
         if dev.type == "cuda":
@@ -2580,37 +2484,8 @@ def train_nep(
     if compile_msg is not None:
         _log(compile_msg)
 
-    oc_graph_reason = graph_support_reason(raw_model, dev)
-    if graph_cache_requested() and use_autograd_forces and not oc_graph_reason:
-        oc_graph_enabled = True
-        # Keep capture on the production Torch oracle.  The native moment-gate
-        # HVP and the shape-specialized Inductor experiment are separate,
-        # opt-in research paths and must not leak into this cache.
-        os.environ["TORCHNEP_OC_CUDA_FULL"] = "0"
-        os.environ["TORCHNEP_OC_CUDA_TRAIN"] = "0"
-        os.environ["TORCHNEP_OC_CUDA_GRAPH"] = "1"
-        _log("  O/C CUDA train graph: enabled "
-             "(Torch reference, bounded exact-ragged-shape LRU)")
-    else:
-        oc_graph_enabled = False
-        if graph_cache_requested():
-            reason = (
-                oc_graph_reason or
-                "the graph cache requires autograd response training"
-            )
-            _log(f"  O/C CUDA train graph: disabled — {reason}")
-
     weight_decay = config["weight_decay"]
-    if oc_graph_enabled and config["joint_rank4"]:
-        raise ValueError("joint_rank4 requires the eager optimizer path; disable TORCHNEP_OC_CUDA_GRAPH")
-    if oc_graph_enabled:
-        optimizer_cls = (torch.optim.AdamW if weight_decay > 0
-                         else torch.optim.Adam)
-        optimizer = optimizer_cls(
-            trainable_params, lr=lr, weight_decay=weight_decay,
-            amsgrad=True, capturable=True, fused=True)
-    else:
-        optimizer = _make_optimizer(trainable_named, lr, weight_decay)
+    optimizer = _make_optimizer(trainable_named, lr, weight_decay)
 
     configure_joint_update(optimizer, config)
     if config["joint_rank4"]:
@@ -2680,7 +2555,7 @@ def train_nep(
     if response_enabled and config.get("spin_response_target", "mforce") != "mforce":
         cur_loss_weights["response_target"] = config["spin_response_target"]
         cur_loss_weights["response_energy_scale"] = config["spin_response_energy_scale"]
-    if raw_model.spin_mode == 3:
+    if raw_model.spin_mode == 1:
         cur_loss_weights["generator_curve_step_balance"] = (
             "exact-per-epoch" if response_enabled else None
         )
@@ -2714,45 +2589,35 @@ def train_nep(
         # redo-stage-2-with-edited-settings flow keeps working).
         if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
             start_stage2 = info["start_stage2"]
-        saved_valid_info = info.get("valid_info")
-        validate_resume_data_lineage(
-            saved_valid_info, cur_valid_info,
-            require_versioned=raw_model.spin_descriptor is not None,
-        )
-        saved_schedule = info.get("schedule_state")
-        if saved_schedule is not None:
-            validate_retired_curriculum_resume(saved_schedule, info["epoch"])
-            saved_stage2_start = saved_schedule.get("stage2_start")
-            saved_use_swa = bool(saved_schedule.get("use_swa", False))
-            if info["in_stage2"]:
-                if (not stage2
-                        or saved_stage2_start != schedule_state["stage2_start"]):
-                    raise ValueError(
-                        "a Stage-2 checkpoint must resume with the same "
-                        "stage2/start_stage2 schedule")
-                if saved_use_swa != schedule_state["use_swa"]:
-                    raise ValueError(
-                        "a Stage-2 checkpoint must resume with the same "
-                        "use_swa setting")
-                if saved_use_swa and not info["has_swa_state"]:
-                    raise ValueError(
-                        "Stage-2 checkpoint declares SWA but has no swa_state")
-            elif stage2 and start_stage2 < start_epoch:
+        saved_valid_info = info["valid_info"]
+        validate_resume_data_lineage(saved_valid_info, cur_valid_info)
+        saved_schedule = info["schedule_state"]
+        saved_stage2_start = saved_schedule["stage2_start"]
+        saved_use_swa = saved_schedule["use_swa"]
+        if info["in_stage2"]:
+            if (not stage2
+                    or saved_stage2_start != schedule_state["stage2_start"]):
                 raise ValueError(
-                    "start_stage2 is earlier than the resumed epoch; resume "
-                    "from checkpoint_stage1.pt or choose a future boundary")
-        elif raw_model.spin_descriptor is not None:
+                    "a Stage-2 checkpoint must resume with the same "
+                    "stage2/start_stage2 schedule")
+            if saved_use_swa != schedule_state["use_swa"]:
+                raise ValueError(
+                    "a Stage-2 checkpoint must resume with the same "
+                    "use_swa setting")
+            if saved_use_swa and not info["has_swa_state"]:
+                raise ValueError(
+                    "Stage-2 checkpoint declares SWA but has no swa_state")
+        elif stage2 and start_stage2 < start_epoch:
             raise ValueError(
-                "spin checkpoint is missing schedule_state and cannot be "
-                "resumed with verified training schedule semantics")
+                "start_stage2 is earlier than the resumed epoch; resume "
+                "from checkpoint_stage1.pt or choose a future boundary")
         if info["best_model_text"] is not None:
             with open(os.path.join(output_dir, "nep_best.txt"), "w") as stream:
                 stream.write(info["best_model_text"])
-        elif (raw_model.spin_descriptor is not None
-              and np.isfinite(best_loss)):
+        elif np.isfinite(best_loss):
             raise ValueError(
-                "spin checkpoint is missing its historical best model")
-        resume_early_stop_state = info.get("early_stop_state")
+                "checkpoint is missing its saved best model")
+        resume_early_stop_state = info["early_stop_state"]
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
@@ -2762,10 +2627,7 @@ def train_nep(
              f"{optimizer.param_groups[0]['lr']:.2e} "
              f"(nep.in lr is not applied on resume)")
         saved_loss_weights = info["loss_weights"]
-        training_config_changed = (
-            saved_loss_weights is not None
-            and saved_loss_weights != cur_loss_weights
-        )
+        training_config_changed = saved_loss_weights != cur_loss_weights
         if training_config_changed:
             _log("Loss weights changed since checkpoint was saved — "
                  "resetting best losses so the new scale can establish "
@@ -2790,18 +2652,7 @@ def train_nep(
         else:
             _restore_scheduler_state(
                 info, lr_scheduler, stage2_scheduler,
-                require_versioned=raw_model.spin_descriptor is not None,
             )
-
-    oc_graph_cache = None
-    if oc_graph_enabled:
-        configure_graph_optimizer(optimizer)
-        oc_graph_cache = OCCudaGraphTrainCache(
-            # The loop backend contains a data-dependent ``Tensor.any()``
-            # host branch and cannot be captured.  bmm is numerically
-            # identical and has a fixed launch topology for each ragged key.
-            raw_model, optimizer, backend="bmm",
-        )
 
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
@@ -3000,23 +2851,12 @@ def train_nep(
             batch_indices = [perm[start:start + batch_size]
                              for start in range(0, n_structs, batch_size)]
             # Pair response groups with the existing ordinary optimizer steps.
-            # spin3 makes the per-group total coefficient exactly equal within
-            # every epoch; spin2 retains its historical modulo cycle.
+            # Give each complete response group equal total weight per epoch.
             if in_stage2 and response_store is not None:
-                if raw_model.spin_mode == 3:
-                    response_batches = balanced_group_step_batches(
-                        response_store.response_group_ids,
-                        len(batch_indices), seed=run_seed + epoch,
-                    )
-                else:
-                    legacy = complete_group_batches(
-                        response_store.response_group_ids, 1,
-                        seed=run_seed + epoch,
-                    )
-                    response_batches = [
-                        [(legacy[index % len(legacy)], 1.0)]
-                        for index in range(len(batch_indices))
-                    ]
+                response_batches = balanced_group_step_batches(
+                    response_store.response_group_ids,
+                    len(batch_indices), seed=run_seed + epoch,
+                )
             else:
                 response_batches = []
             _tp = [0.0, 0.0]
@@ -3028,50 +2868,6 @@ def train_nep(
                     _tp, _PROF >= 2 and dev.type == "cuda")):
                 batch["need_mforce"] = has_mforces
                 batch["need_tau"] = has_tau
-
-                # A generator-response group changes the objective and shape
-                # independently of the ordinary ragged batch, so keep that
-                # less common stage-2 path eager.  Every ordinary O3-C2 batch
-                # replays descriptor -> E/F/V/MF/Tau -> backward -> Adam.
-                if oc_graph_cache is not None and not response_batches:
-                    graph_step = oc_graph_cache.step(
-                        batch,
-                        weights=(
-                            cur_pref_e, cur_pref_f, cur_pref_v,
-                            cur_pref_m, cur_pref_tau,
-                        ),
-                        l1_coeff=0.0,
-                        l2_coeff=0.0,
-                        max_grad_norm=max_grad_norm,
-                        need_forces=has_forces,
-                        need_virial=has_virial,
-                        need_mforce=has_mforces,
-                        need_tau=has_tau,
-                    )
-                    graph_metrics = graph_step.metrics
-                    graph_ok = (1.0 - graph_step.found_inf).to(torch.float64)
-                    acc += graph_ok * torch.stack([
-                        graph_metrics["sum_le"].double(),
-                        graph_metrics["sum_lf"].double(),
-                        graph_metrics["sum_lv"].double(),
-                        graph_metrics["sum_ls"].double(),
-                        graph_metrics["sum_lm"].double(),
-                        graph_metrics["sum_lt"].double(),
-                        graph_metrics["count_e"].double(),
-                        graph_metrics["count_f"].double(),
-                        graph_metrics["count_v"].double(),
-                        graph_metrics["count_m"].double(),
-                        graph_metrics["count_t"].double(),
-                        graph_metrics["sum_e_resid"].double(),
-                    ])
-                    max_gn_t = torch.maximum(
-                        max_gn_t,
-                        torch.nan_to_num(graph_step.grad_norm, 0.0, 0.0, 0.0))
-                    n_bad_t += graph_step.found_inf.to(dtype)
-                    if (in_stage2 and swa_model is not None
-                            and epoch >= swa_start):
-                        swa_model.update_parameters(raw_model)
-                    continue
 
                 if use_autograd_forces:
                     result = compute_props(
@@ -3173,7 +2969,7 @@ def train_nep(
                     tmf = t_mask.to(dtype).unsqueeze(-1)
                     nt_b = tmf.sum()
                     dtau = (result["tau"] - batch["tau"]) * tmf
-                    tau_dof = 2 if raw_model.spin_mode == 3 else 3
+                    tau_dof = 2 if raw_model.spin_mode == 1 else 3
                     loss = loss + cur_pref_tau * (
                         dtau.square().sum()
                         / (tau_dof * nt_b.clamp_min(1.0)))
@@ -3454,13 +3250,6 @@ def train_nep(
                     f"E {rmse_e:.5f} eV/atom | F {rmse_f:.5f} eV/A"
                     f"{v_str}{spin_str}{valid_str} | gnorm {max_gn:.1f} | "
                     f"lr {cur_lr:.2e} | {dt:.1f}s")
-            if oc_graph_cache is not None:
-                graph_stats = oc_graph_cache.stats()
-                line += (
-                    f" | graph {graph_stats['hit_rate'] * 100:.1f}% hit "
-                    f"({graph_stats['entries']}/{graph_stats['max_entries']}, "
-                    f"capture {graph_stats['total_capture_ms']:.1f} ms)"
-                )
             if epoch % print_interval == 0 or epoch == 1:
                 _log(line)
             else:

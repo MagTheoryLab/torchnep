@@ -232,7 +232,7 @@ class NEP(Calculator):
         # Per-atom virial is (N, 9) row-major; W_ab = Σ rij_a * F_b.
         # ASE stress σ = -W / V (Voigt order xx, yy, zz, yz, xz, xy).
         raw9 = virial.detach().cpu().numpy().sum(0)
-        if spin_mode == 3:
+        if spin_mode == 1:
             # DFT/ASE stress is the derivative with respect to symmetric
             # strain. Keep raw9 in the model, but expose its symmetric six
             # components here without materializing a transpose.

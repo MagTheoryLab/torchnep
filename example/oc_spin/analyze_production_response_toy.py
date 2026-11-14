@@ -137,8 +137,8 @@ def main():
                 health["derivatives"]["descriptor_jacobian"]["spin"]
                 ["full_column_rank"] for health in health_entries
             ),
-            "zero_spin_exact_all": all(
-                health["derivatives"]["spin_limits"]["zero"]["exact_zero"]
+            "zero_spin_mforce_exact_all": all(
+                health["derivatives"]["spin_limits"]["zero"]["mforce_exact_zero"]
                 for health in health_entries
             ),
             "near_zero_spin_finite_all": all(

@@ -18,12 +18,11 @@ Supports extended XYZ format (as used by GPUMD) and nep.in parameter files.
 """
 
 import re
-import warnings
 
 import numpy as np
 from typing import Dict, List
 
-from .spin_schema import normalize_spin_cutoff
+from .spin_schema import normalize_spin_config
 
 
 def _parse_properties_schema(comment: str):
@@ -361,6 +360,8 @@ def parse_nep_in(filename: str) -> Dict:
 
             parts = line.split()
             key = parts[0].lower()
+            if (key == "model" or key.startswith("spin_")) and key in params:
+                raise ValueError(f"duplicate model input: {key}")
 
             if key == "type":
                 params["num_types"] = int(parts[1])
@@ -406,15 +407,17 @@ def parse_nep_in(filename: str) -> Dict:
                     raise ValueError("lambda_spin_response must be finite and non-negative")
                 params["lambda_spin_response"] = value
             elif key in ("lambda_1", "lambda_2", "pos_noise"):
-                # Retired regularization/noise controls are accepted for old
-                # input files but intentionally ignored.
-                continue
-            elif key == "spin_descriptor":
-                raise ValueError(
-                    "spin_descriptor is not part of the TorchNEP protocol; "
-                    "use spin_mode 2 or 3 for a versioned O/C descriptor")
-            elif key == "spin_mode":
-                params["spin_mode"] = int(parts[1])
+                raise ValueError(f"{key} is unsupported; use weight_decay")
+            elif key == "model":
+                if len(parts) != 2:
+                    raise ValueError("model requires one value")
+                params["model"] = parts[1]
+            elif key in ("spin_version", "spin_basis_size"):
+                if len(parts) != 2:
+                    raise ValueError(f"{key} requires one value")
+                params[key] = int(parts[1])
+            elif key in ("spin_mode", "spin_descriptor", "spin_dof_type", "spin_env_type"):
+                raise ValueError(f"{key} was removed; use model nep_spin, spin_version 1, spin_type")
             elif key == "spin_compress":
                 params["spin_compress"] = int(parts[1])
             elif key == "spin_l_max":
@@ -453,21 +456,12 @@ def parse_nep_in(filename: str) -> Dict:
                 if len(parts) != 2 or parts[1] not in ("0", "1"):
                     raise ValueError("joint_rank4 must be 0 or 1")
                 params[key] = parts[1] == "1"
-            elif key == "spin_curriculum":
-                if len(parts) != 2 or parts[1] != "0":
-                    raise ValueError("spin_curriculum has been removed; delete this option")
-                warnings.warn("spin_curriculum 0 is obsolete and ignored; remove this line",
-                              FutureWarning, stacklevel=2)
             elif key == "spin_cutoff":
                 if len(parts) < 2:
                     raise ValueError("spin_cutoff requires at least one value")
                 params["spin_cutoff"] = [float(value) for value in parts[1:]]
-            elif key in ("spin_dof_type", "spin_env_type"):
-                params[key] = parts[1:]
             elif key == "spin_type":
-                raise ValueError(
-                    "spin_type was replaced by spin_dof_type; use "
-                    "spin_dof_type and optional spin_env_type")
+                params[key] = parts[1:]
             elif key.startswith("spin_"):
                 raise ValueError(f"unsupported O/C spin parameter: {key}")
             elif key == "weight_decay":
@@ -530,21 +524,6 @@ def parse_nep_in(filename: str) -> Dict:
     # to a default.
     explicit = set(params.keys())
 
-    declared_spin_mode = int(params.get("spin_mode", 0))
-    if declared_spin_mode not in (0, 2, 3):
-        raise ValueError("spin_mode must be 0, 2, or 3")
-    spin_only_keys = {
-        "spin_compress", "spin_l_max", "spin_order", "spin_soc",
-        "spin_cutoff", "spin_dof_type", "spin_env_type",
-    }
-    ignored_spin_keys = sorted(explicit & spin_only_keys)
-    if declared_spin_mode not in (2, 3) and ignored_spin_keys:
-        raise ValueError(
-            "O/C spin parameters require 'spin_mode 2' or 'spin_mode 3'; "
-            "otherwise they "
-            "would be silently ignored: " + ", ".join(ignored_spin_keys)
-        )
-
     # Defaults — model architecture
     params.setdefault("version", 4)
     params.setdefault("cutoff_radial", 8.0)
@@ -577,8 +556,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("spin_response_energy_scale", 1.0e-6)
     params.setdefault("joint_rank4", False)
     if params["joint_rank4"]:
-        if params.get("spin_mode", 0) != 3:
-            raise ValueError("joint_rank4 currently requires spin_mode 3")
+        if params.get("model") != "nep_spin":
+            raise ValueError("joint_rank4 requires model nep_spin")
         for name, value in params.items():
             if name in {prefix + label for prefix in ("lambda_", "stage2_lambda_")
                         for label in ("e", "f", "v", "m", "tau")}:
@@ -587,53 +566,8 @@ def parse_nep_in(filename: str) -> Dict:
     params.setdefault("weight_decay", 1e-4)
     params.setdefault("stage2", False)
 
-    # spin_mode 2 and 3 are versioned O/C magnetic descriptors.
-    params.setdefault("spin_mode", 0)
-    if params["spin_mode"] in (2, 3):
-        params.setdefault("spin_compress", 2)
-        params.setdefault("spin_basis_size", [8, 0])
-        params.setdefault("spin_l_max", [2, 0, 0])
-        params.setdefault("spin_order", 3)
-        params.setdefault("spin_soc", 1)
-    else:
-        params.setdefault("spin_compress", 2)
-        params.setdefault("spin_basis_size", [8, 0])
-        params.setdefault("spin_l_max", [2, 0, 0])
-        params.setdefault("spin_order", 1)
-        params.setdefault("spin_soc", 0)
-    if params["spin_mode"] in (2, 3):
-        params.setdefault("spin_cutoff", [6.0])
-        params["spin_cutoff_by_type"] = normalize_spin_cutoff(
-            params["spin_cutoff"], params["num_types"]
-        )
-        spin_cutoff_max = max(params["spin_cutoff_by_type"])
-        # Retain the historical two-slot runtime field.  The spin descriptor
-        # has one radial cutoff; both entries carry the candidate-list max.
-        params["spin_cutoff"] = [spin_cutoff_max, spin_cutoff_max]
-    else:
-        # Preserve the non-spin config shape; this feature must not alter the
-        # structural radial/angular cutoff contract.
-        params["spin_cutoff"] = [
-            params["cutoff_radial"], params["cutoff_angular"]
-        ]
-        params["spin_cutoff_by_type"] = [
-            params["cutoff_radial"]
-        ] * params["num_types"]
-    params.setdefault("spin_dof_type", None)
-    params.setdefault("spin_env_type", None)
-
-    if params["spin_mode"] in (2, 3):
-        max_spin_compress = params["spin_basis_size"][0] + 1
-        if not 1 <= params["spin_compress"] <= max_spin_compress:
-            raise ValueError(
-                "spin_compress must be in [1, "
-                f"{max_spin_compress}] for the fixed magnetic radial "
-                f"basis B={params['spin_basis_size'][0]}"
-            )
-        if params["spin_order"] not in (1, 2, 3):
-            raise ValueError("spin_order must be 1, 2, or 3")
-        if params["spin_soc"] not in (0, 1):
-            raise ValueError("spin_soc must be 0 or 1")
+    params["_explicit"] = explicit
+    params = normalize_spin_config(params)
     # Defaults for optional stage-2 parameters (only used if stage2=1).
     params.setdefault("stage2_lr", 1e-3)
     params.setdefault("stage2_pref_e", 1.0)

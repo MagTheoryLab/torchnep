@@ -24,8 +24,7 @@ from .response_training import (GENERATOR_CURVE_SCHEMA, configure_response_store
 def _reference_jacobian():
     # Batched VJPs need tensor-only ops; custom CUDA pullbacks have no vmap rule.
     # Restore all execution choices before live-autograd parity and evaluation.
-    keys = ("TORCHNEP_OC_CUDA_CENTER", "TORCHNEP_OC_CUDA_BANK",
-            "TORCHNEP_OC_CUDA_FULL", "TORCHNEP_OC_CUDA_STRUCT_CENTER")
+    keys = ("TORCHNEP_OC_CUDA_STRUCT_CENTER",)
     saved = {k: os.environ.get(k) for k in keys}
     try:
         os.environ.update({k: "0" for k in keys})
@@ -195,7 +194,7 @@ def refine_response(config_file, data_file, model_file, *, output_dir,
         raise ValueError("response_refine supports one process/device, not DDP")
     if cfg.get("joint_rank4", False):
         raise ValueError("response_refine uses L-BFGS: set joint_rank4 0")
-    if cfg.get("lambda_spin_response", 0) <= 0 or cfg.get("spin_mode", 0) not in (2,3):
+    if cfg.get("lambda_spin_response", 0) <= 0 or cfg.get("spin_mode", 0) != 1:
         raise ValueError("response_refine requires O/C spin and lambda_spin_response > 0")
     if not str(model_file).endswith(".txt"):
         raise ValueError("response_refine currently loads a nep.txt, not an optimizer checkpoint")

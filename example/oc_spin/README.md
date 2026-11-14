@@ -1,53 +1,41 @@
-# O/C 磁势生产框架
+# GPUMD c516 磁势
 
-## 模型
+使用 [nep.in](nep.in) 训练：
 
-O/C 表示两个截断参数：
+```python
+from torchnep import train_nep
+train_nep("nep.in", "train.xyz", output_dir="output")
+```
 
-- O（order）：局域磁集团的相关阶数；
-- C（compression）：所有收缩路径共享的径向秩。
+唯一的磁模型是 `model nep_spin`、`spin_version 1`，对应 GPUMD-MagTheoryLab
+`c516` 的 `fd358023c51239d7290d048928b3a0b298451993`。默认 C3/L2/O2/SOC，
+本例有 30 个结构坐标和 34 个磁坐标。非 SOC 同配置有 31 个磁坐标。
+`spin_compress` 为 1–9，`spin_l_max` 为 0–4，`spin_order` 为 1–4；
+受 96 个磁坐标、199 个总坐标限制。
 
-新模型的生产默认是 `nep4_spin3` O3-C2-L2-SOC（55D）；本示例通过
-`n_max 4 4` 和 `l_max 4 2 0` 配置了 30D 结构描述符。spin3 的
-O1/O2/O3 磁通道分别是严格的 9D、43D、55D 前缀。新增的 6 维是
-四阶交换的 \(l=1,2\) 键角分辨率，\(l=0\) 块与历史 spin2 精确相同。
-提高 C 会统一增加径向分辨率，而不是追加某个指定哈密顿量通道。
+角向结构系数在 spin cutoff 下重新求值，再经共享径向混合、路径权重和中心
+primitive 混合构建张量密度。SOC 使用实 CG 耦合；非 SOC 保留空间与自旋
+乘积扇区。输出包括局域偶数阶标量、偶标量密度以及各扇区的归一化平方范数。
+阶数控制 primitive 的自旋多项式次数，不是能量的体阶，也不保证通道前缀。
 
-每个原子的结构描述符和磁描述符进入同一个元素条件化非线性能量
-网络。总能量是唯一的学习输出，原子力、virial、磁力和力矩均由它
-求导得到，因此不会引入彼此不一致的独立响应 head。O/C 的全部磁
-通道在零磁矩时严格为零；每元素最小二乘能量 baseline 只负责移除
-总能量中的成分偏置。
+`spin_type Fe` 表示只有 Fe 有独立自旋；其它元素输入自旋按零处理，仍提供几何
+环境。`spin_basis_size` 默认跟随结构角向 `basis_size`，只能设置相同值。
+`spin_cutoff` 默认跟随结构径向 cutoff，可按元素设置，不能超过结构径向 cutoff。
+零自旋时保留 degree-zero 几何通道；自旋导数仍有限。
 
-新训练使用 `nep4_spin3`；`nep4_spin2` 的 49D 排布、数值和默认训练
-语义只为历史模型保留。角交换的数学定义、无近邻对循环的低成本等价
-实现、固定通道表和训练契约见 [NEP4_SPIN3.md](NEP4_SPIN3.md)。
-TorchNEP 的 reference/training 路径使用 autograd 导数；只识别
-`nep4_spin2` 的下游 reader 不能加载 spin3，必须先补齐 55D reader
-并通过同模型、同输入、同精度下的能量及全部导数 parity gate。
+结构和磁坐标进入同一个元素条件化标量能量 ANN，F、virial、mforce、torque
+都是它的导数。训练从第一个 epoch 起使用全部配置；Stage 2 和响应组是训练
+语义。磁 scaler 为 `1/max(RMS, range, 1)`，不平移，且不使用全一系数的旧
+`use_gpumd_qscaler` 路径。TorchNEP 保留自己的优化器，不复现 GPUMD 的 SNES 轨迹。
 
-## 训练日程
-
-从第一个 epoch 起训练完整的指定 O/C 模型，不清零 O3 输入权重、
-不分阶段开放通道，也不触发课程专用的 scaler 重算或 Adam 状态清空。
-Stage 2 仍可独立设置目标权重和学习率；例如 600 epoch、400 epoch
-开始 Stage 2，并不意味着前 400 epoch 只训练低阶通道。
-
-`spin_curriculum` 已移除。旧输入的 `spin_curriculum 0` 仅提示后忽略，
-应删去该行；`1` 会报错。未完成课程的旧 checkpoint 不支持精确续算，
-可从导出的模型开始权重微调。已导出的势函数和描述符阶数前缀不受影响。
-
-spin3 的结构块使用带相对分辨率保护的 range scaler；磁块使用不平移的
-保零 RMS/range/floor scaler，所以固定磁矩产生的常数底不会在初始化时
-把 `tanh` 推入饱和区，近零对称通道也不会被放大。训练入口应保持
-`use_gpumd_qscaler=False`；全一径向系数不适用于该描述符。
-
-`mforce` 损失拟合完整的 \(-\partial E/\partial S\)，包括纵向分量。
-只定义横向约束场的定磁矩数据可设 `lambda_m 0`、`lambda_tau > 0`，
-通过自动派生的 \(\tau=S\times m\) 监督横向响应。
-第二阶段对应设置 `stage2_lambda_m 0`、`stage2_lambda_tau > 0`。
-spin3 的 torque RMSE 按两个内禀自由度统计；torque 不是独立 head，
-其损失等价于 \(|S|^2\) 加权的横向磁力误差。
+普通和磁模型均导出 `nep / format_version 1 / model nep[_spin]` 及
+`@ parameters`、`@ q_scaler` 块，结构系数按 type-pair-first 排列。只接受这种新格式；
+旧普通 `nep4[_zbl]` 和旧磁 `nep4_spin2/3` 文本均被拒绝。`.pt` 微调要求当前
+`torchnep-c516-v1` 架构签名；续训还要求完整的 seed、scheduler、数据 lineage 和
+训练日程，不补缺省值，也不迁移旧 DDP 前缀、课程日程或缓存。`spin_curriculum 0`
+同样报错。`.pt` 为 TorchNEP 训练状态，不是 GPUMD 的 SNES restart。
+针对旧描述符的 CUDA 实验、图缓存和版本选择已删除。CPU 上已核对独立冻结
+oracle；CUDA 执行与吞吐应在目标设备另验。
 
 ## 受控响应结构
 

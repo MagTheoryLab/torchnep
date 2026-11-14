@@ -34,7 +34,7 @@ def physical_residual(model, batch, weights, backend, counts=None):
     counts = counts.to(result['Etot']).clamp_min(1)
     parts = [result['Etot'].reshape(-1) * 0]  # differentiable on empty shards
     for index, (weight, mask, dof) in enumerate(zip(
-            weights, masks, (1, 3, 6, 3, 2 if model.spin_mode == 3 else 3))):
+            weights, masks, (1, 3, 6, 3, 2 if model.spin_mode == 1 else 3))):
         if weight <= 0:
             continue
         if index == 0:
@@ -76,23 +76,14 @@ class JointRank4:
         self.last_norm_ratio = 1.0
 
     def state_dict(self):
-        return dict(version=1, steps=self.steps, cache=self.cache,
+        return dict(version=2, steps=self.steps, cache=self.cache,
                     refreshes=self.refreshes)
 
     def load_state_dict(self, state):
-        if state['version'] != 1:
+        if state['version'] != 2:
             raise ValueError('unsupported joint_rank4 checkpoint version')
         self.steps, self.cache = state['steps'], state['cache']
         self.refreshes = state['refreshes']
-        # Preserve the sketch when resuming an old, fully open schedule.
-        if self.cache is not None:
-            token = self.cache['token']
-            if isinstance(token, tuple) and len(token) == 4:
-                if token[1] != 1.0:
-                    self.cache = None
-                else:
-                    self.cache = dict(self.cache, token=(token[0], token[3]))
-
     @staticmethod
     def _flat(items):
         return torch.cat([x.reshape(-1) for x in items])

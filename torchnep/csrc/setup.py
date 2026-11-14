@@ -1,4 +1,4 @@
-"""Build the OC training prototype without requiring Ninja.
+"""Build the structural center contraction without requiring Ninja.
 
 Sai's production PyTorch environment does not ship Ninja.  This setuptools
 entry point deliberately uses the standard compiler backend; the resulting
@@ -16,36 +16,6 @@ HERE = Path(__file__).resolve().parent
 setup(
     name="torchnep-oc-cuda-training-sectors",
     ext_modules=[
-        CUDAExtension(
-            name="torchnep_oc_moment_gate_v2",
-            sources=[str(HERE / "oc_moment_gate.cu")],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
-        ),
-        CUDAExtension(
-            name="torchnep_oc_density_bank_v1",
-            sources=[str(HERE / "oc_density_bank.cu")],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
-        ),
-        CUDAExtension(
-            name="torchnep_oc_density_bank_generic_v1",
-            sources=[str(HERE / "oc_density_bank_generic.cu")],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
-        ),
-        CUDAExtension(
-            name="torchnep_oc_edge_sector_generic_v1",
-            sources=[str(HERE / "oc_edge_sector_generic.cu")],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
-        ),
-        CUDAExtension(
-            name="torchnep_oc_center_sector_generic_v1",
-            sources=[str(HERE / "oc_center_sector_generic.cu")],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
-        ),
-        CUDAExtension(
-            name="torchnep_oc_center_sector_v1",
-            sources=[str(HERE / "oc_center_sector.cu")],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3", "-lineinfo"]},
-        ),
         CUDAExtension(
             name="torchnep_oc_struct_center_v1",
             sources=[str(HERE / "oc_struct_center.cu")],

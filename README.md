@@ -18,10 +18,10 @@ A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (
 - 💾 **Memory-friendly** — the dataset stays in host memory and batches are streamed to the GPU, so memory scales with batch size, not dataset size
 - 🔧 **Fine-tuning** — load any `nep.txt` or `checkpoint.pt` to fine-tune; optionally slim the model to only the element types present in the new dataset
 - 🛡️ **ZBL** — universal ZBL repulsive potential with optional typewise cutoffs
-- 🧲 **O/C magnetic potentials** — order-nested, radially compressed spin
-  descriptors with conservative magnetic forces and torques. The recommended
-  `nep4_spin3` format adds angle-resolved fourth-order exchange;
-  `nep4_spin2` remains available as the frozen historical format
+- 🧲 **Magnetic potentials** — the GPUMD c516 `model nep_spin / spin_version 1`
+  tensor descriptor, with forces, virials, magnetic forces and torques derived
+  from one scalar energy
+
 
 ---
 
@@ -116,35 +116,44 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `neuron` | `30` | Neurons in the (single) hidden layer |
 | `zbl` | — | ZBL outer cutoff (Å); enables short-range repulsion |
 | `use_typewise_cutoff_zbl` | — | Scale ZBL cutoffs by covalent radii |
-| `spin_mode` | `0` | Set to `3` for the recommended O/C model; `2` selects the frozen historical format |
-| `spin_order` | `3` | Magnetic correlation order O (`1`–`3`) |
-| `spin_compress` | `2` | Shared magnetic radial rank C (`1`–`9` with the fixed B8 basis) |
-| `spin_l_max` | `2` | Highest retained magnetic angular rank (`0`–`2`) |
-| `spin_cutoff` | `6` | Magnetic cutoff (Å): one global value, or one value per element in `type` order; pair cutoff is their arithmetic mean |
-| `spin_soc` | `1` | Enable lattice-coupled SOC/chiral sectors (`0` or `1`) |
-| `spin_dof_type` | all types | Element types carrying trainable spin degrees of freedom |
-| `spin_env_type` | `spin_dof_type` | Element types allowed in the magnetic environment; must include every `spin_dof_type` |
+| `model` | `nep` | `nep` or `nep_spin` |
+| `spin_version` | `1` | The sole supported magnetic descriptor/layout |
+| `spin_order` | `2` | Maximum primitive spin polynomial degree (`1`–`4`) |
+| `spin_compress` | `3` | Learned radial channels C (`1`–`9`) |
+| `spin_l_max` | `2` | Maximum tensor rank (`0`–`4`) |
+| `spin_cutoff` | radial cutoff | One positive value or one per element; pair cutoffs are arithmetic means; cannot exceed the structural radial cutoff |
+| `spin_soc` | `1` | Joint lattice/spin rotations (`1`) or independent rotations (`0`) |
+| `spin_type` | all types | Elements with independent spins; excluded types retain geometric environments |
 
-For new O/C spin models set `spin_mode 3`. The production default is
-O3-C2-L2-SOC:
-`spin_order 3`, `spin_compress 2`, `spin_l_max 2`, `spin_cutoff 6`, and
-`spin_soc 1`. All configured orders are trained from the first epoch;
-for typewise cutoffs, for example `type 2 Fe Ge`, use
-`spin_cutoff 5.5 6.5`, giving Fe--Ge cutoff 6.0 Å by the same pair-average
-rule as structural NEP.
-The former `spin_curriculum` option has been removed. Old inputs containing
-`spin_curriculum 0` emit a deprecation warning and otherwise behave identically;
-remove the line. Enabling it is rejected. Existing exported potentials retain
-their inference semantics. An unfinished legacy curriculum checkpoint cannot
-be resumed exactly; use weight-only fine-tuning instead. Completed or disabled
-legacy schedules remain resumable subject to the ordinary checkpoint checks.
-`nep4_spin3` has 55 magnetic coordinates with exact O1/O2/O3 prefix
-dimensions 9/43/55. The historical `nep4_spin2` 49-dimensional layout and
-inference layout is unchanged; it also trains all orders from initialization.
-See
-[the frozen spin3 descriptor contract](example/oc_spin/NEP4_SPIN3.md),
-[the production design and response-data contract](example/oc_spin/README.md), and
-[the complete example](example/oc_spin/nep.in).
+Select `model nep_spin` and `spin_version 1`. The C3/L2/O2 default has 34
+magnetic coordinates with SOC, 31 without SOC. Angular structural coefficients
+are reused at the spin cutoff; `spin_basis_size` follows the angular basis and
+may only repeat that value. All configured primitives train from the first
+epoch. Zero spins retain degree-zero geometric channels. Magnetic scaling is
+`1/max(RMS, range, 1)`, without centering.
+
+Ordinary and spin exports use the GPUMD c516 named-block format:
+
+```text
+nep <number of types> <elements...>
+format_version 1
+model nep                 # or nep_spin, with spin_version 1
+...
+@ parameters <count>
+...
+@ q_scaler <dimension>
+...
+```
+
+Parameters are per-type ANN weights, shared bias, pair-first structural radial
+and angular coefficients, then (spin only) radial mix, path weights and center
+mix. Only the c516 named-block format is accepted. Older `nep4[_zbl]` and
+`nep4_spin2/3` text files are rejected. Experimental
+`spin_mode 2/3`, split DOF/environment masks, their weights and specialized CUDA
+experiments have been removed; those spin models require retraining.
+See [the magnetic example and response-data contract](example/oc_spin/README.md)
+and [the complete input](example/oc_spin/nep.in). TorchNEP keeps its PyTorch
+training optimizer; matching the descriptor does not reproduce GPUMD SNES runs.
 
 ### Training hyperparameters
 
@@ -158,7 +167,7 @@ See
 | `lambda_f` | `1.0` | Force loss weight |
 | `lambda_v` | `0.01` | Virial loss weight |
 | `lambda_m` | `1.0` | Magnetic-force loss weight |
-| `lambda_tau` | `0.0` | Extra \(|S|^2\)-weighted transverse magnetic-force loss; spin3 torque RMSE uses its two intrinsic components |
+| `lambda_tau` | `0.0` | Extra \(|S|^2\)-weighted transverse magnetic-force loss; spin torque RMSE uses its two intrinsic components |
 | `max_grad_norm` | `10.0` | Gradient clipping threshold |
 | `lr_scheduler` | `plateau` | LR schedule — `plateau` (ReduceLROnPlateau) or `step` (StepLR). Stage 1 and Stage 2 share this mode |
 | `scheduler_patience` | `15` | For `plateau`: epochs without improvement before LR reduction. For `step`: epoch interval between LR reductions |
@@ -174,8 +183,8 @@ See
 | `stage2_lambda_v` | `0.1` | Stage 2 virial weight |
 | `stage2_lambda_m` | `lambda_m` | Stage 2 magnetic-force weight |
 | `stage2_lambda_tau` | `lambda_tau` | Stage 2 torque weight |
-| `weight_decay` | `1e-4` | AdamW decoupled weight decay on all trainable parameters (`b1` is solved analytically and never decays). `0` falls back to plain Adam. Unsupported legacy keys (`lambda_1`, `lambda_2`, `pos_noise`) are ignored |
-| `joint_rank4` | `0` | Optional joint rank-4 preconditioning of the Adam displacement for `spin_mode 3`; refresh at most every 24 steps. Supports E/F/V/MF/torque and grouped response losses, not optimizer CUDA-graph capture. See [algorithm and limits](example/oc_spin/JOINT_RANK4.md) |
+| `weight_decay` | `1e-4` | AdamW decoupled weight decay on all trainable parameters (`b1` is solved analytically and never decays). `0` falls back to plain Adam. Unsupported keys (`lambda_1`, `lambda_2`, `pos_noise`) are rejected |
+| `joint_rank4` | `0` | Optional joint rank-4 preconditioning of the Adam displacement for `model nep_spin`; refresh at most every 24 steps. Supports E/F/V/MF/torque and grouped response losses |
 | `response_refine` | `0` | Opt-in frozen-descriptor L-BFGS final refinement through `train_nep(..., finetune_from=...)`; float64, single device, `joint_rank4 0`. See [response refinement](example/oc_spin/RESPONSE_TARGETS.md). |
 | `response_refine_steps` | `2000` | Maximum L-BFGS iterations (line searches can evaluate the objective multiple times). |
 | `response_preserve_scale` | `5e-5 0.003 0.003` | Prediction-drift scales for E/atom, F, MF in response refinement; not DFT error estimates. |
@@ -318,11 +327,20 @@ train_nep("nep.in", "train.xyz", output_dir="output",
           resume_from="output/checkpoint_stage1.pt")
 ```
 
+Only current TorchNEP checkpoints can be resumed. Architecture signature,
+energy references, saved seed, scheduler state, content-addressed data lineage
+and training schedule are required for ordinary and spin models alike.
+Unsigned/raw state dictionaries, old DDP-prefixed state, missing-reference
+checkpoints and curriculum-era schedules/caches are rejected. No default
+values are injected or checkpoint versions migrated. These `.pt` files store
+TorchNEP training state; they are not GPUMD SNES restart files.
+`spin_curriculum` is rejected for every value, including `0`.
+
 ### What you can safely change on restart
 
 | Parameter | Safe to change? | Notes |
 |-----------|----------------|-------|
-| `epoch` | Conditional | Extending a run is supported. Specify `start_stage2` explicitly when extending a two-stage run so its automatic boundary does not move. Unfinished legacy curriculum checkpoints require weight-only fine-tuning. |
+| `epoch` | Conditional | Extending a run is supported. Specify `start_stage2` explicitly when extending a two-stage run so its automatic boundary does not move. |
 | `lambda_e` / `lambda_f` / `lambda_v` | Yes | New weights take effect next epoch. |
 | `stage2_lambda_e` / `stage2_lambda_f` / `stage2_lambda_v` | Yes | Same auto-reset rule. |
 | `batch` | Yes | — |
@@ -360,9 +378,10 @@ train_nep(
 ```
 
 `finetune_from` accepts:
-- `nep.txt` — structural GPUMD text models or versioned TorchNEP
-  `nep4_spin2`/`nep4_spin3` models, with full semantic architecture validation
-- `checkpoint.pt` — full checkpoint (weights are extracted automatically)
+- `nep.txt` — GPUMD c516 `format_version 1`, `model nep` / `model nep_spin`
+  files, with semantic architecture validation
+- `checkpoint.pt` — current TorchNEP checkpoint with `model_state` and an exact
+  `torchnep-c516-v1` architecture signature; weights are extracted automatically
 
 If the new dataset contains fewer element types than the original model, `slim_types=True` removes the unused types **before training begins**, shrinking the model and speeding up training.
 
@@ -439,15 +458,10 @@ parts = atoms.calc.get_components()
 print(parts["nep"]["energy"], parts["zbl"]["energy"], parts["total"]["energy"])
 ```
 
-For `nep4_spin2` or `nep4_spin3`, attach an `(N,3)` `spins` array before
-evaluation;
+For `model nep_spin`, attach an `(N,3)` `spins` array before evaluation;
 `atoms.calc.results["mforces"]` and `atoms.calc.results["tau"]` are then
-available. Spin models can also use `zbl` and the same NEP/ZBL component-split
-helper; because ZBL is spin-independent, it contributes no magnetic force or
-torque. TorchNEP exports the new combination as `nep4_spin3_zbl`. Current
-GPUMD and NEPAdapters spin readers still accept only `nep4_spin2`; a spin3
-text model therefore needs a downstream reader and full derivative-parity
-update before deployment there.
+available. Optional ZBL contributes no magnetic derivative. Export uses the
+same `model nep_spin` block format with an optional `zbl` field.
 
 ### Full-dataset prediction
 

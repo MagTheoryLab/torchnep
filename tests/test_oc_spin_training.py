@@ -17,10 +17,6 @@ import numpy as np
 import pytest
 import torch
 
-from example.oc_spin.benchmark_production_response_toy import (
-    _recipe as response_benchmark_recipe,
-    _write_config as write_response_benchmark_config,
-)
 from torchnep.data import parse_nep_in, read_xyz
 from torchnep.model import NEPModel
 from torchnep.response_training import (
@@ -57,11 +53,11 @@ def _config():
         "basis_size_angular": 8,
         "l_max": [4, 2, 0],
         "neuron": 8,
-        "spin_mode": 2,
+        "model": "nep_spin",
         "spin_compress": 2,
         "spin_basis_size": [8, 0],
         "spin_l_max": [2, 0, 0],
-        "spin_cutoff": [6.0, 6.0],
+        "spin_cutoff": [6.0],
         "spin_order": 3,
         "spin_soc": 1,
     }
@@ -161,36 +157,9 @@ def test_generator_reweighting_rejects_incomplete_structure_map():
         )
 
 
-def test_response_benchmark_has_distinct_standard_and_generator_recipes(
-    tmp_path,
-):
-    standard = response_benchmark_recipe("standard", 0.1, 3.0)
-    generator = response_benchmark_recipe("generator", 0.1, 1.0)
-    lighter_generator = response_benchmark_recipe(
-        "generator", 0.1, 1.0, generator_weight=0.03
-    )
-    assert standard["generator_enabled"] is False
-    assert standard["generator_weight"] == 0.0
-    assert generator["generator_enabled"] is True
-    assert generator["generator_weight"] > 0.0
-    assert lighter_generator["generator_weight"] == 0.03
-    assert "lambda_R=0.03" in lighter_generator["label"]
-
-    config_path = tmp_path / "nep.in"
-    write_response_benchmark_config(config_path, 20, 0.1, 3.0)
-    config = parse_nep_in(config_path)
-    assert config["lambda_m"] == 0.1
-    assert config["stage2_pref_m"] == 3.0
-
-    spin3_path = tmp_path / "nep-spin3.in"
-    write_response_benchmark_config(
-        spin3_path, 20, 0.1, 3.0, spin_mode=3
-    )
-    spin3 = parse_nep_in(spin3_path)
-    assert spin3["spin_mode"] == 3
 
 
-def test_oc_defaults_are_o3c2_full_order(tmp_path):
+def test_spin_defaults_match_gpumd_c516(tmp_path):
     path = tmp_path / "nep.in"
     path.write_text(
         "type 1 Fe\n"
@@ -198,15 +167,15 @@ def test_oc_defaults_are_o3c2_full_order(tmp_path):
         "n_max 4 4\n"
         "basis_size 8 8\n"
         "l_max 4 2 0\n"
-        "spin_mode 2\n"
+        "model nep_spin\nspin_version 1\n"
     )
     config = parse_nep_in(path)
-    assert config["spin_order"] == 3
-    assert config["spin_compress"] == 2
+    assert config["spin_order"] == 2
+    assert config["spin_compress"] == 3
     assert config["spin_l_max"] == [2, 0, 0]
     assert config["spin_soc"] == 1
     assert "spin_curriculum" not in config
-    assert NEPModel(config).spin_dim == 49
+    assert NEPModel(config).spin_dim == 34
 
 
 
@@ -473,7 +442,7 @@ def test_spin_resume_data_lineage_detects_in_place_edits(tmp_path):
     current = build_data_lineage(data, None, 0.1)
     with pytest.raises(ValueError, match="data content or split"):
         validate_resume_data_lineage(
-            saved, current, require_versioned=True)
+            saved, current)
 
 
 def test_spin_pt_finetune_requires_matching_architecture_signature(tmp_path):
@@ -484,7 +453,7 @@ def test_spin_pt_finetune_requires_matching_architecture_signature(tmp_path):
         "model_signature": source.architecture_signature(),
     }, checkpoint)
     changed = _config()
-    changed["spin_cutoff"] = [5.5, 5.5]
+    changed["spin_cutoff"] = [5.5]
     target = NEPModel(changed)
     with pytest.raises(ValueError, match="architecture"):
         _load_finetune_weights(target, str(checkpoint), torch.device("cpu"))

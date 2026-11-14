@@ -17,7 +17,7 @@ from torchnep.joint_update import physical_residual
 
 def _case(tmp_path):
     config, xyz, valid = _write_case(tmp_path)
-    config.write_text(config.read_text().replace('spin_mode 2', 'spin_mode 3')
+    config.write_text(config.read_text()
                       .replace('lambda_spin_response 0.1', 'lambda_spin_response 0')
                       .replace('epoch 2', 'epoch 4').replace('start_stage2 2', 'start_stage2 3')
                       + 'joint_rank4 1\n')

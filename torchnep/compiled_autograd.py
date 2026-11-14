@@ -204,7 +204,7 @@ class CompiledAutogradForce:
             h = torch.tanh(torch.bmm(q_scaled.unsqueeze(1), W0).squeeze(1)
                            - B0)
         Ei = (h * W1).sum(-1)
-        return Ei - pd["b1"]
+        return Ei - pd["b1"] + pd["energy_baseline"][atom_types]
 
     def _raw(self, pvals, rij_rad, rij_ang, pi_rad, pj_rad, pi_ang, pj_ang,
              atom_types):

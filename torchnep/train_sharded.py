@@ -58,7 +58,6 @@ from .response_training import (
     GENERATOR_CURVE_SCALE_FLOOR,
     GENERATOR_CURVE_SCHEMA,
     balanced_group_step_batches,
-    complete_group_batches,
     generator_curve_loss,
     configure_response_store,
     response_from_store,
@@ -169,7 +168,7 @@ from .train import (
     _backend_info, StreamDataStore, iter_collated,
     format_config_summary,
     preprocess_structures, compute_max_neighbors,
-    fit_energy_baseline_frames, validate_retired_curriculum_resume,
+    fit_energy_baseline_frames,
     virial6_for_loss,
     grouped_validation_indices, validate_spin_frames,
     validate_response_group_disjoint, build_data_lineage,
@@ -204,7 +203,7 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
     coefficients to 1.0, matching GPUMD's generation-0 q_scaler.
 
     ``local_real_flags`` excludes the duplicate frames used only to equalize
-    DDP step counts.  Min/max are duplicate-invariant, but the spin3 RMS is
+    DDP step counts.  Min/max are duplicate-invariant, but the magnetic RMS is
     not, so padded atoms must never enter any scaler statistic.
     """
     model.eval()
@@ -228,11 +227,8 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
         c2 = torch.ones_like(model.c_param_2)
         c3 = (torch.ones_like(model.c_param_3)
               if model.c_param_3 is not None else None)
-        c_spin = (torch.ones_like(model.c_param_spin)
-                  if model.c_param_spin is not None else None)
     else:
         c2, c3 = model.c_param_2, model.c_param_3
-        c_spin = model.c_param_spin
 
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
@@ -256,11 +252,12 @@ def _compute_q_scaler_sharded(model, data_store, batch_size=1000,
         )
         if model.spin_descriptor is not None:
             q_spin = model.spin_descriptor(
-                batch["rij_spin"], batch["pair_i_spin"],
+                model._spin_descriptor_coordinates(
+                    batch["rij_spin"], batch["pair_i_spin"],
+                    batch["pair_j_spin"], batch["atom_types"],
+                ), batch["pair_i_spin"],
                 batch["pair_j_spin"], batch["spins"], batch["N"],
-                batch["atom_types"], c_spin, None,
-                model.spin_dof_type_active,
-                model.spin_env_type_active,
+                batch["atom_types"], c3, model.spin_dof_type_active,
             )
             q = torch.cat((q, q_spin), dim=-1)
         if local_real_flags is not None:
@@ -437,8 +434,9 @@ def train_nep_sharded(
     if resume_ckpt is not None:
         _saved_seed = torch.load(resume_ckpt, map_location="cpu",
                                  weights_only=False).get("run_seed")
-        if _saved_seed is not None:
-            run_seed = _saved_seed  # continue the original streams + split
+        if _saved_seed is None:
+            raise ValueError("checkpoint is missing run_seed")
+        run_seed = _saved_seed
 
     # rank 0 owns the seed (picks a random one when run_seed is None) and
     # broadcasts it so every replica seeds identically — the DDP wrapper later
@@ -654,15 +652,13 @@ def train_nep_sharded(
                 config = dict(orig_config)
                 config["type_names"] = keep
                 config["num_types"] = len(keep)
-                for key in ("spin_dof_type", "spin_env_type"):
-                    if config.get(key) is not None:
-                        config[key] = [
-                            name for name in config[key] if name in keep
-                        ]
+                config["spin_cutoff_by_type"] = [orig_config["spin_cutoff_by_type"][orig_config["type_names"].index(name)] for name in keep]
+                if config.get("spin_type") is not None:
+                    config["spin_type"] = [name for name in config["spin_type"] if name in keep]
                 if (config.get("spin_mode", 0)
-                        and config.get("spin_dof_type") == []):
+                        and config.get("spin_type") == []):
                     raise ValueError(
-                        "slim_types removed every active spin_dof_type")
+                        "slim_types removed every active spin_type")
                 _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                      f"(removing: {removed})")
             else:
@@ -693,7 +689,7 @@ def train_nep_sharded(
             raise ValueError(f"valid_ratio must be in (0, 1), "
                              f"got {valid_ratio}")
         has_response_groups = any("response_group" in f for f in frames)
-        if config.get("spin_mode", 0) in (2, 3) and has_response_groups:
+        if config.get("spin_mode", 0) == 1 and has_response_groups:
             val_idx = grouped_validation_indices(frames, valid_ratio, run_seed)
             val_set = set(val_idx)
             train_idx = [i for i in range(len(frames)) if i not in val_set]
@@ -773,15 +769,13 @@ def train_nep_sharded(
             config = dict(orig_config)
             config["type_names"] = keep
             config["num_types"] = len(keep)
-            for key in ("spin_dof_type", "spin_env_type"):
-                if config.get(key) is not None:
-                    config[key] = [
-                        name for name in config[key] if name in keep
-                    ]
+            config["spin_cutoff_by_type"] = [orig_config["spin_cutoff_by_type"][orig_config["type_names"].index(name)] for name in keep]
+            if config.get("spin_type") is not None:
+                config["spin_type"] = [name for name in config["spin_type"] if name in keep]
             if (config.get("spin_mode", 0)
-                    and config.get("spin_dof_type") == []):
+                    and config.get("spin_type") == []):
                 raise ValueError(
-                    "slim_types removed every active spin_dof_type")
+                    "slim_types removed every active spin_type")
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:
@@ -993,7 +987,7 @@ def train_nep_sharded(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode in (2, 3) and not use_autograd_forces:
+    if model.spin_mode == 1 and not use_autograd_forces:
         use_autograd_forces = True
         _log(f"  spin_mode {model.spin_mode}: using the full autograd "
              "E/F/V/MF/Tau path")
@@ -1077,10 +1071,9 @@ def train_nep_sharded(
     global_has_tau = bool(flags_t[3].item())
 
     # Decide whether torch.compile will actually run BEFORE resolving the
-    # backend — the backend choice depends on it. Only the analytical path is
-    # compiled; the autograd path's create_graph=True double backward is
-    # incompatible with compile, so it stays eager.
-    # use_compile=None means AUTO: compile on GPU (where it is 3-5x),
+    # backend — the backend choice depends on it. Ordinary models compile
+    # the analytical core or the materialized autograd force graph.
+    # use_compile=None means AUTO: attempt compilation on GPU,
     # stay eager on CPU (C++ Inductor warmup outweighs the gain for
     # typical CPU-sized runs). Explicit True/False always wins; every
     # failed capability check degrades to eager with a log line instead
@@ -1094,8 +1087,8 @@ def train_nep_sharded(
         if not ok:
             compile_msg = f"  torch.compile: disabled — {msg}"
         elif use_autograd_forces and model.spin_descriptor is not None:
-            compile_msg = ("  torch.compile: disabled for O/C custom "
-                           "autograd sectors")
+            compile_msg = ("  torch.compile: disabled for spin/ragged "
+                           "autograd inputs")
         elif use_autograd_forces:
             compile_on = True
             compile_msg = ("  torch.compile: enabled (make_fx autograd "
@@ -1138,9 +1131,9 @@ def train_nep_sharded(
             model, data_store, backend=backend,
             batch_size=batch_size,
             gpumd_init=use_gpumd_qscaler,
-            return_rms=model.spin_mode == 3,
+            return_rms=model.spin_mode == 1,
             local_real_flags=(
-                local_real_flags if model.spin_mode == 3 else None
+                local_real_flags if model.spin_mode == 1 else None
             ))
         model.set_q_scaler(*q_stats)
         if cuda_available:
@@ -1292,7 +1285,7 @@ def train_nep_sharded(
     if response_enabled and config.get("spin_response_target", "mforce") != "mforce":
         cur_loss_weights["response_target"] = config["spin_response_target"]
         cur_loss_weights["response_energy_scale"] = config["spin_response_energy_scale"]
-    if raw_model.spin_mode == 3:
+    if raw_model.spin_mode == 1:
         cur_loss_weights["generator_curve_step_balance"] = (
             "exact-per-epoch" if response_enabled else None
         )
@@ -1327,46 +1320,35 @@ def train_nep_sharded(
         # stage-1 checkpoints defer to nep.in — see train_nep.
         if stage2 and info["in_stage2"] and info.get("start_stage2") is not None:
             start_stage2 = info["start_stage2"]
-        saved_valid_info = info.get("valid_info")
-        validate_resume_data_lineage(
-            saved_valid_info, cur_valid_info,
-            require_versioned=raw_model.spin_descriptor is not None,
-        )
-        saved_schedule = info.get("schedule_state")
-        if saved_schedule is not None:
-            validate_retired_curriculum_resume(saved_schedule, info["epoch"])
-            saved_stage2_start = saved_schedule.get("stage2_start")
-            saved_use_swa = bool(saved_schedule.get("use_swa", False))
-            if info["in_stage2"]:
-                if (not stage2
-                        or saved_stage2_start != schedule_state["stage2_start"]):
-                    raise ValueError(
-                        "a Stage-2 checkpoint must resume with the same "
-                        "stage2/start_stage2 schedule")
-                if saved_use_swa != schedule_state["use_swa"]:
-                    raise ValueError(
-                        "a Stage-2 checkpoint must resume with the same "
-                        "use_swa setting")
-                if saved_use_swa and not info["has_swa_state"]:
-                    raise ValueError(
-                        "Stage-2 checkpoint declares SWA but has no swa_state")
-            elif stage2 and start_stage2 < start_epoch:
+        saved_valid_info = info["valid_info"]
+        validate_resume_data_lineage(saved_valid_info, cur_valid_info)
+        saved_schedule = info["schedule_state"]
+        saved_stage2_start = saved_schedule["stage2_start"]
+        saved_use_swa = saved_schedule["use_swa"]
+        if info["in_stage2"]:
+            if (not stage2
+                    or saved_stage2_start != schedule_state["stage2_start"]):
                 raise ValueError(
-                    "start_stage2 is earlier than the resumed epoch; resume "
-                    "from checkpoint_stage1.pt or choose a future boundary")
-        elif raw_model.spin_descriptor is not None:
+                    "a Stage-2 checkpoint must resume with the same "
+                    "stage2/start_stage2 schedule")
+            if saved_use_swa != schedule_state["use_swa"]:
+                raise ValueError(
+                    "a Stage-2 checkpoint must resume with the same "
+                    "use_swa setting")
+            if saved_use_swa and not info["has_swa_state"]:
+                raise ValueError(
+                    "Stage-2 checkpoint declares SWA but has no swa_state")
+        elif stage2 and start_stage2 < start_epoch:
             raise ValueError(
-                "spin checkpoint is missing schedule_state and cannot be "
-                "resumed with verified training schedule semantics")
+                "start_stage2 is earlier than the resumed epoch; resume "
+                "from checkpoint_stage1.pt or choose a future boundary")
         if is_main and info["best_model_text"] is not None:
             with open(os.path.join(output_dir, "nep_best.txt"), "w") as stream:
                 stream.write(info["best_model_text"])
-        elif (raw_model.spin_descriptor is not None
-              and np.isfinite(best_loss)
-              and info["best_model_text"] is None):
+        elif np.isfinite(best_loss) and info["best_model_text"] is None:
             raise ValueError(
-                "spin checkpoint is missing its historical best model")
-        resume_early_stop_state = info.get("early_stop_state")
+                "checkpoint is missing its saved best model")
+        resume_early_stop_state = info["early_stop_state"]
         _log(f"Resumed from {resume_ckpt}: epoch {start_epoch - 1}, "
              f"best_loss={best_loss:.4e}, run_seed={run_seed}")
         # Resume = exact continuation: lr (and the whole optimizer state)
@@ -1376,10 +1358,7 @@ def train_nep_sharded(
              f"{optimizer.param_groups[0]['lr']:.2e} "
              f"(nep.in lr is not applied on resume)")
         saved_loss_weights = info["loss_weights"]
-        training_config_changed = (
-            saved_loss_weights is not None
-            and saved_loss_weights != cur_loss_weights
-        )
+        training_config_changed = saved_loss_weights != cur_loss_weights
         if training_config_changed:
             _log("Loss weights changed since checkpoint was saved — "
                  "resetting best losses so the new scale can establish "
@@ -1409,7 +1388,6 @@ def train_nep_sharded(
         else:
             _restore_scheduler_state(
                 info, lr_scheduler, stage2_scheduler,
-                require_versioned=raw_model.spin_descriptor is not None,
             )
 
     n_local = data_store.n
@@ -1607,23 +1585,13 @@ def train_nep_sharded(
                              for start in range(0, n_local, batch_size)]
             # The response subset is deliberately replicated. Every rank uses
             # the same group schedule, so DDP averages an identical response
-            # gradient while reducing the sharded ordinary gradient. spin3
+            # gradient while reducing the sharded ordinary gradient. Spin
             # balances every group's total coefficient within the epoch.
             if in_stage2 and response_store is not None:
-                if raw_model.spin_mode == 3:
-                    response_batches = balanced_group_step_batches(
-                        response_store.response_group_ids,
-                        len(batch_indices), seed=run_seed + epoch,
-                    )
-                else:
-                    legacy = complete_group_batches(
-                        response_store.response_group_ids, 1,
-                        seed=run_seed + epoch,
-                    )
-                    response_batches = [
-                        [(legacy[index % len(legacy)], 1.0)]
-                        for index in range(len(batch_indices))
-                    ]
+                response_batches = balanced_group_step_batches(
+                    response_store.response_group_ids,
+                    len(batch_indices), seed=run_seed + epoch,
+                )
             else:
                 response_batches = []
             for batch_index, batch in enumerate(
@@ -1747,7 +1715,7 @@ def train_nep_sharded(
                 if tmf is not None and batch["has_tau"]:
                     t_diff = (result["tau"] - batch["tau"]) * tmf
                     sum_sq_t = t_diff.square().sum()
-                    tau_dof = 2 if raw_model.spin_mode == 3 else 3
+                    tau_dof = 2 if raw_model.spin_mode == 1 else 3
                     loss = loss + (
                         cur_pref_tau * sum_sq_t * ws / (tau_dof * cg[4])
                     )

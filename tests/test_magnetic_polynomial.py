@@ -1,18 +1,5 @@
-# Copyright 2025 Yongchao Wu
-# This file is part of the TorchNEP project.
-# TorchNEP is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-# TorchNEP is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-# You should have received a copy of the GNU General Public License
-# along with TorchNEP.  If not, see <http://www.gnu.org/licenses/>.
-
-import ast
-from pathlib import Path
+"""GPUMD spin_version 1 layout, symmetry and differentiable energy contract."""
+import copy
 
 import pytest
 import torch
@@ -20,367 +7,82 @@ import torch
 from torchnep.magnetic_polynomial import MagneticPolynomialDescriptor
 
 
-DTYPE = torch.float64
+def _case(soc=1, order=2, lmax=2, compress=3):
+    torch.manual_seed(23)
+    descriptor = MagneticPolynomialDescriptor(compress, lmax, order, soc,
+                                               basis_size_radial=3, n_max_angular=2).double()
+    positions = torch.randn(4, 3, dtype=torch.float64)
+    i, j = torch.where(~torch.eye(4, dtype=torch.bool))
+    rij = positions[j] - positions[i]
+    spins = torch.randn(4, 3, dtype=torch.float64)
+    types = torch.tensor([0, 1, 0, 1])
+    angular = torch.randn(2, 2, 3, 4, dtype=torch.float64)
+    return descriptor, (rij, i, j, spins, 4, types, angular)
 
 
-def _environment(n_atoms=7, seed=20260809):
-    generator = torch.Generator().manual_seed(seed)
-    pair_i = []
-    pair_j = []
-    rij = []
-    positions = torch.randn(n_atoms, 3, generator=generator, dtype=DTYPE)
-    for center in range(n_atoms):
-        for neighbor in range(n_atoms):
-            if center == neighbor:
-                continue
-            pair_i.append(center)
-            pair_j.append(neighbor)
-            rij.append(positions[neighbor] - positions[center])
-    return {
-        "rij": torch.stack(rij),
-        "pair_i": torch.tensor(pair_i, dtype=torch.long),
-        "pair_j": torch.tensor(pair_j, dtype=torch.long),
-        "spins": torch.randn(n_atoms, 3, generator=generator, dtype=DTYPE),
-        "N": n_atoms,
-    }
+@pytest.mark.parametrize('soc,dimension,paths,components', [(1,34,33,34),(0,31,21,81)])
+def test_c516_default_layout(soc, dimension, paths, components):
+    descriptor = MagneticPolynomialDescriptor(spin_soc=soc)
+    assert descriptor.dim == dimension
+    assert descriptor.path_count == paths
+    assert descriptor.components == components
+    assert descriptor.radial_mix.shape == (5,3)
+    assert descriptor.center_mix.shape == (3,3)
 
 
-def _evaluate(descriptor, environment, **overrides):
-    values = dict(environment)
-    values.update(overrides)
-    return descriptor(**values)
-
-
-def _rotation(seed=17, reflection=False):
-    generator = torch.Generator().manual_seed(seed)
-    matrix = torch.randn(3, 3, generator=generator, dtype=DTYPE)
-    q, _ = torch.linalg.qr(matrix)
-    if torch.linalg.det(q) < 0:
-        q[:, 0] *= -1
+@pytest.mark.parametrize('soc', [0,1])
+@pytest.mark.parametrize('reflection', [False,True])
+def test_rotation_inversion_and_time_reversal(soc, reflection):
+    descriptor, args = _case(soc=soc, order=4, lmax=4, compress=1)
+    rij, i, j, spins, n, types, angular = args
+    rotation, _ = torch.linalg.qr(torch.randn(3,3,dtype=torch.float64))
+    rotation[:,0] *= torch.linalg.det(rotation)
     if reflection:
-        q = torch.diag(torch.tensor([-1.0, 1.0, 1.0], dtype=DTYPE)) @ q
-    return q
+        rotation[:,0] *= -1
+    expected = descriptor(*args)
+    # Spins are axial vectors under reflection.
+    actual = descriptor(rij@rotation, i,j, torch.linalg.det(rotation)*spins@rotation, n,types,angular)
+    torch.testing.assert_close(actual, expected, rtol=2e-12,atol=2e-11)
+    torch.testing.assert_close(descriptor(rij,i,j,-spins,n,types,angular),expected,rtol=0,atol=0)
+    if not soc:
+        torch.testing.assert_close(descriptor(rij@rotation,i,j,spins,n,types,angular),expected,rtol=2e-12,atol=2e-11)
 
 
-def test_descriptor_has_only_the_ops_internal_dependency():
-    source = Path(__file__).parents[1] / "torchnep" / "magnetic_polynomial.py"
-    tree = ast.parse(source.read_text())
-    relative = [
-        (node.module, tuple(alias.name for alias in node.names))
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.level
-    ]
-    assert relative == [(None, ("ops",))]
+@pytest.mark.parametrize('soc',[0,1])
+def test_gradcheck_and_gradgradcheck_including_projection_weights(soc):
+    descriptor,args = _case(soc=soc,order=2,lmax=1,compress=1)
+    rij,i,j,spins,n,types,angular=args
+    params = dict(descriptor.named_parameters())
+    def forward(r,s,c,*weights):
+        from torch.func import functional_call
+        return functional_call(descriptor,dict(zip(params,weights)),(r,i,j,s,n,types,c))
+    inputs=(rij.requires_grad_(),spins.requires_grad_(),angular.requires_grad_(),*params.values())
+    assert torch.autograd.gradcheck(forward,inputs,fast_mode=True)
+    assert torch.autograd.gradgradcheck(forward,inputs,fast_mode=True)
 
 
-@pytest.mark.parametrize("compress", (1, 2, 3))
-def test_orders_are_literal_prefixes(compress):
-    environment = _environment()
-    descriptors = [
-        MagneticPolynomialDescriptor(
-            spin_compress=compress,
-            spin_l_max=2,
-            spin_order=order,
-            spin_soc=True,
-        ).to(dtype=DTYPE)
-        for order in (1, 2, 3)
-    ]
-    outputs = [_evaluate(descriptor, environment) for descriptor in descriptors]
-    assert descriptors[0].dim < descriptors[1].dim < descriptors[2].dim
-    torch.testing.assert_close(outputs[1][..., : descriptors[0].dim], outputs[0])
-    torch.testing.assert_close(outputs[2][..., : descriptors[1].dim], outputs[1])
-    assert all(
-        token.order <= descriptors[-1].spin_order
-        for token in descriptors[-1].channel_grammar
-    )
+def test_zero_spin_geometry_and_inactive_type_semantics():
+    descriptor,args=_case()
+    rij,i,j,spins,n,types,angular=args
+    zeros=torch.zeros_like(spins,requires_grad=True)
+    q=descriptor(rij,i,j,zeros,n,types,angular)
+    assert torch.count_nonzero(q) > 0  # Degree-zero geometry paths are intentional in c516.
+    derivative=torch.autograd.grad(q.sum(),zeros,create_graph=True)[0]
+    assert torch.isfinite(derivative).all()
+    torch.testing.assert_close(derivative,torch.zeros_like(zeros),rtol=0,atol=0)
+    active=torch.tensor([True,False])
+    expected=descriptor(rij,i,j,spins*active[types,None],n,types,angular)
+    actual=descriptor(*args,spin_type_active=active)
+    torch.testing.assert_close(actual,expected,rtol=0,atol=0)
+    perm=torch.randperm(i.numel())
+    torch.testing.assert_close(descriptor(rij[perm],i[perm],j[perm],spins,n,types,angular),descriptor(*args))
 
 
-def test_rank_one_prunes_contractions_that_require_independent_radial_legs():
-    minimum_rank = {
-        "coupling_l11_axial": 2,
-        "coupling_l22_axial": 2,
-        "coupling_l11_dot_response": 2,
-        "coupling_l22_dot_response": 2,
-        "coupling_l112_edge_response": 2,
-        "coupling_l111_bulk": 3,
-    }
-    rank_three = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    )
-    metadata = {
-        token.name: token.minimum_radial_rank
-        for token in rank_three.channel_grammar
-    }
-    assert {
-        name: metadata[name] for name in minimum_rank
-    } == minimum_rank
-
-    rank_one = MagneticPolynomialDescriptor(
-        spin_compress=1,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    names = {token.name for token in rank_one.channel_grammar}
-    assert names.isdisjoint(minimum_rank)
-    assert all(
-        token.minimum_radial_rank <= rank_one.spin_compress
-        for token in rank_one.channel_grammar
-    )
-    assert rank_one.order_dims == {1: 5, 2: 16, 3: 19}
-
-    result = _evaluate(rank_one, _environment(n_atoms=8, seed=29))
-    for name, block in rank_one.split_by_token(result).items():
-        assert block.abs().max() > 1.0e-10, name
-
-
-def test_rank_two_retains_exact_production_dimensions():
-    order2 = MagneticPolynomialDescriptor(
-        spin_compress=2,
-        spin_l_max=2,
-        spin_order=2,
-        spin_soc=True,
-    )
-    order3 = MagneticPolynomialDescriptor(
-        spin_compress=2,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    )
-    assert order2.dim == 37
-    assert order3.dim == 49
-    assert order3.channel_grammar[: len(order2.channel_grammar)] == (
-        order2.channel_grammar
-    )
-
-
-def test_rank_three_retains_exact_production_dimensions():
-    order2 = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=2,
-        spin_soc=True,
-    )
-    order3 = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    )
-    assert order2.dim == 58
-    assert order3.dim == 79
-    assert order3.channel_grammar[: len(order2.channel_grammar)] == (
-        order2.channel_grammar
-    )
-
-
-@pytest.mark.parametrize("reflection", (False, True))
-def test_soc_descriptor_is_o3_and_time_reversal_invariant(reflection):
-    environment = _environment(seed=7)
-    descriptor = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    reference = _evaluate(descriptor, environment)
-    rotation = _rotation(reflection=reflection)
-    determinant = torch.linalg.det(rotation)
-    transformed = _evaluate(
-        descriptor,
-        environment,
-        rij=environment["rij"] @ rotation.T,
-        spins=determinant * environment["spins"] @ rotation.T,
-    )
-    reversed_spin = _evaluate(
-        descriptor, environment, spins=-environment["spins"]
-    )
-    torch.testing.assert_close(transformed, reference, rtol=3.0e-11, atol=3.0e-11)
-    torch.testing.assert_close(reversed_spin, reference, rtol=3.0e-11, atol=3.0e-11)
-
-
-def test_non_soc_allows_independent_space_and_spin_rotations():
-    environment = _environment(seed=19)
-    descriptor = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=False,
-    ).to(dtype=DTYPE)
-    reference = _evaluate(descriptor, environment)
-    space = _rotation(seed=3, reflection=True)
-    spin = _rotation(seed=5, reflection=False)
-    transformed = _evaluate(
-        descriptor,
-        environment,
-        rij=environment["rij"] @ space.T,
-        spins=environment["spins"] @ spin.T,
-    )
-    torch.testing.assert_close(transformed, reference, rtol=3.0e-11, atol=3.0e-11)
-
-
-def test_zero_spin_has_no_magnetic_energy_leakage():
-    environment = _environment(seed=23)
-    descriptor = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    result = _evaluate(
-        descriptor, environment, spins=torch.zeros_like(environment["spins"])
-    )
-    torch.testing.assert_close(result, torch.zeros_like(result))
-
-
-def test_order3_contains_nonzero_triple_density_coordinates():
-    environment = _environment(n_atoms=8, seed=31)
-    descriptor = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    result = _evaluate(descriptor, environment)
-    tokens = descriptor.split_by_token(result)
-    assert tokens["coupling_l111_bulk"].abs().max() > 1.0e-10
-    assert tokens["coupling_l111_p_m_x"].abs().max() > 1.0e-10
-
-
-def test_order3_rank_two_keeps_supported_channels_and_omits_bulk_chirality():
-    environment = _environment(n_atoms=8, seed=32)
-    order2 = MagneticPolynomialDescriptor(
-        spin_compress=2,
-        spin_l_max=2,
-        spin_order=2,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    order3 = MagneticPolynomialDescriptor(
-        spin_compress=2,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    result2 = _evaluate(order2, environment)
-    result3 = _evaluate(order3, environment)
-    torch.testing.assert_close(result3[..., : order2.dim], result2)
-    tokens = order3.split_by_token(result3)
-    assert order3.dim == 49
-    assert "coupling_l111_bulk" not in tokens
-    assert "coupling_l111_p_l_x" not in tokens
-    assert tokens["coupling_l11_dot_response"].abs().max() > 1.0e-10
-    assert tokens["coupling_l111_p_m_x"].abs().max() > 1.0e-10
-
-
-def test_removed_longitudinal_triple_channel_is_an_exact_linear_combination():
-    generator = torch.Generator().manual_seed(20260817)
-    rhat = torch.randn(19, 3, generator=generator, dtype=DTYPE)
-    rhat = rhat / torch.linalg.vector_norm(rhat, dim=-1, keepdim=True)
-    spin = torch.randn(19, 3, generator=generator, dtype=DTYPE)
-
-    longitudinal = (rhat * spin).sum(-1, keepdim=True) * rhat
-    quadrupole_on_spin = (
-        rhat * (rhat * spin).sum(-1, keepdim=True) - spin / 3.0
-    )
-    torch.testing.assert_close(
-        longitudinal,
-        quadrupole_on_spin + spin / 3.0,
-        rtol=2.0e-15,
-        atol=2.0e-15,
-    )
-
-
-def test_element_conditioned_radial_mixing_changes_only_active_types():
-    environment = _environment(n_atoms=6, seed=37)
-    descriptor = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=2,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    atom_types = torch.tensor([0, 1, 0, 1, 0, 1], dtype=torch.long)
-    coefficient = torch.zeros(1, 2, 2, 3, 9, dtype=DTYPE)
-    coefficient[..., 0, 0] = 1.0
-    coefficient[..., 1, 1] = 1.0
-    coefficient[..., 2, 2] = 1.0
-    reference = _evaluate(
-        descriptor,
-        environment,
-        atom_types=atom_types,
-        c_spin_2body=coefficient,
-    )
-    modified = coefficient.clone()
-    modified[:, 0, 1] *= 1.7
-    changed = _evaluate(
-        descriptor,
-        environment,
-        atom_types=atom_types,
-        c_spin_2body=modified,
-    )
-    center_type_zero = atom_types == 0
-    center_type_one = atom_types == 1
-    active_delta = (
-        changed[center_type_zero] - reference[center_type_zero]
-    )
-    assert active_delta.abs().max() > 1.0e-10
-    torch.testing.assert_close(
-        changed[center_type_one], reference[center_type_one]
-    )
-
-
-def test_autograd_matches_finite_difference_for_geometry_and_spin():
-    environment = _environment(n_atoms=5, seed=41)
-    descriptor = MagneticPolynomialDescriptor(
-        spin_compress=3,
-        spin_l_max=2,
-        spin_order=3,
-        spin_soc=True,
-    ).to(dtype=DTYPE)
-    rij = environment["rij"].clone().requires_grad_(True)
-    spins = environment["spins"].clone().requires_grad_(True)
-    head = torch.linspace(-0.4, 0.6, descriptor.dim, dtype=DTYPE)
-
-    def energy(rij_value, spin_value):
-        atomic = _evaluate(
-            descriptor, environment, rij=rij_value, spins=spin_value
-        )
-        return (atomic * head).sum()
-
-    value = energy(rij, spins)
-    grad_rij, grad_spin = torch.autograd.grad(value, (rij, spins))
-    step = 2.0e-6
-
-    rij_plus = rij.detach().clone()
-    rij_minus = rij.detach().clone()
-    rij_plus[2, 1] += step
-    rij_minus[2, 1] -= step
-    fd_rij = (
-        energy(rij_plus, spins.detach()) - energy(rij_minus, spins.detach())
-    ) / (2.0 * step)
-
-    spin_plus = spins.detach().clone()
-    spin_minus = spins.detach().clone()
-    spin_plus[1, 2] += step
-    spin_minus[1, 2] -= step
-    fd_spin = (
-        energy(rij.detach(), spin_plus) - energy(rij.detach(), spin_minus)
-    ) / (2.0 * step)
-
-    torch.testing.assert_close(grad_rij[2, 1], fd_rij, rtol=2.0e-5, atol=2.0e-6)
-    torch.testing.assert_close(
-        grad_spin[1, 2], fd_spin, rtol=2.0e-5, atol=2.0e-6
-    )
-
-
-def test_separate_three_body_coefficient_fails_closed():
-    environment = _environment(n_atoms=4)
-    descriptor = MagneticPolynomialDescriptor(spin_order=2).to(dtype=DTYPE)
-    with pytest.raises(ValueError, match="one generated radial seam"):
-        _evaluate(
-            descriptor,
-            environment,
-            c_spin_3body=torch.ones(1, dtype=DTYPE),
-        )
+def test_shared_structural_angular_weights_receive_magnetic_gradients():
+    descriptor,args=_case()
+    *rest,angular=args
+    angular.requires_grad_()
+    q=descriptor(*rest,angular)
+    gradient=torch.autograd.grad(q.sum(),angular)[0]
+    assert torch.count_nonzero(gradient)>0
+    assert not hasattr(descriptor,'radial_leg_mix')

@@ -91,5 +91,5 @@ def test_response_duplicate_validation_and_lineage(tmp_path):
     path.write_text(path.read_text() + "\n")
     current = build_data_lineage(xyz, valid, None, response_weight=0.1)
     with pytest.raises(ValueError, match="data content"):
-        validate_resume_data_lineage(saved, current, require_versioned=True)
+        validate_resume_data_lineage(saved, current)
     assert "response" not in build_data_lineage(xyz, valid, None)

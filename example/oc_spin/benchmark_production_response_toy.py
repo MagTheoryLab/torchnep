@@ -192,7 +192,7 @@ def _write_xyz(path, frames, with_tangent):
     path.write_text("\n".join(lines) + "\n")
 
 
-def _write_config(path, epochs, lambda_m, stage2_lambda_m, spin_mode=2):
+def _write_config(path, epochs, lambda_m, stage2_lambda_m):
     if lambda_m < 0.0 or stage2_lambda_m < 0.0:
         raise ValueError("magnetic-force weights must be nonnegative")
     path.write_text(
@@ -202,7 +202,7 @@ def _write_config(path, epochs, lambda_m, stage2_lambda_m, spin_mode=2):
         "basis_size 8 8\n"
         "l_max 4 2 0\n"
         "neuron 16\n"
-        f"spin_mode {spin_mode}\n"
+        "model nep_spin\nspin_version 1\n"
         "spin_compress 2\n"
         "spin_l_max 2\n"
         "spin_order 3\n"
@@ -381,29 +381,15 @@ def _descriptor_health(calculator, frames):
     ]
     raw = scaled / scaler[None, :]
     descriptor = calculator.spin_descriptor
-    labels = []
-    for token in descriptor.schema:
-        labels.extend(
-            f"{token.name}[{offset}]"
-            for offset in range(token.stop - token.start)
-        )
+    labels = [f"spin[{index}]" for index in range(descriptor.dim)]
     sectors = {}
-    previous = 0
-    for order in range(1, descriptor.spin_order + 1):
-        stop = descriptor.order_dims[order]
-        sectors[f"O{order}_increment"] = {
-            "raw": svd_health(
-                raw[:, previous:stop], labels=labels[previous:stop]
-            ),
-            "scaled": svd_health(
-                scaled[:, previous:stop], labels=labels[previous:stop]
-            ),
-            "correlation": svd_health(
-                raw[:, previous:stop], standardize=True,
-                labels=labels[previous:stop],
-            ),
+    for key, offset, width, column, scalar in descriptor.sectors:
+        start = scalar if scalar is not None else column
+        stop = column + descriptor.spin_compress
+        sectors[str(key)] = {
+            "raw": svd_health(raw[:, start:stop], labels=labels[start:stop]),
+            "scaled": svd_health(scaled[:, start:stop], labels=labels[start:stop]),
         }
-        previous = stop
     return {
         "raw": svd_health(raw, labels=labels),
         "scaled": svd_health(scaled, labels=labels),
@@ -486,8 +472,8 @@ def _finite_difference_health(calculator, frame, step=1.0e-5):
 
     sector_norms = {}
     previous = 0
-    for order in range(1, calculator.spin_descriptor.spin_order + 1):
-        stop = calculator.spin_descriptor.order_dims[order]
+    for key, offset, width, column, scalar in calculator.spin_descriptor.sectors:
+        stop = column + calculator.spin_compress
         position_sector = position_jacobian.reshape(
             n_atoms, spin_dim, -1
         )[:, previous:stop]
@@ -495,7 +481,7 @@ def _finite_difference_health(calculator, frame, step=1.0e-5):
             n_atoms, spin_dim, -1
         )[:, previous:stop]
         strain_sector = strain_descriptor[:, previous:stop]
-        sector_norms[f"O{order}_increment"] = {
+        sector_norms[str(key)] = {
             "position_rms": float(np.sqrt(np.mean(position_sector ** 2))),
             "spin_rms": float(np.sqrt(np.mean(spin_sector ** 2))),
             "isotropic_strain_rms": float(
@@ -509,10 +495,11 @@ def _finite_difference_health(calculator, frame, step=1.0e-5):
         values = compute(
             positions, cell, spins * scale, descriptor=True
         )
+        limit_mforce = compute(positions, cell, spins * scale)["mforces"].detach().cpu().numpy()
         spin_limits[label] = {
             "finite": bool(np.isfinite(values).all()),
             "max_abs": float(np.max(np.abs(values))),
-            "exact_zero": bool(np.count_nonzero(values) == 0),
+            "mforce_exact_zero": bool(np.count_nonzero(limit_mforce) == 0),
         }
 
     force = analytic["forces"].detach().cpu().numpy()
@@ -621,7 +608,6 @@ def main():
         help="Internal benchmark seam; this is not a nep.in parameter.",
     )
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--spin-mode", type=int, choices=(2, 3), default=2)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--evaluate-only", action="store_true",
@@ -644,10 +630,9 @@ def main():
         if result_path.is_file():
             stored = json.loads(result_path.read_text())
             if stored.get("variant") != args.variant \
-                    or int(stored.get("seed", -1)) != args.seed \
-                    or int(stored.get("spin_mode", 2)) != args.spin_mode:
+                    or int(stored.get("seed", -1)) != args.seed:
                 raise ValueError(
-                    "evaluate-only variant/seed/spin-mode does not match "
+                    "evaluate-only variant/seed does not match "
                     "result.json"
                 )
             recipe = stored.get("recipe", recipe)
@@ -663,7 +648,6 @@ def main():
                        [frame for frame in train if "group" in frame], True)
         _write_config(
             config_file, args.epochs, args.lambda_m, args.stage2_lambda_m,
-            spin_mode=args.spin_mode,
         )
         _train_with_internal_generator_weight(
             recipe,
@@ -675,7 +659,6 @@ def main():
         )
     result = {
         "variant": args.variant, "seed": args.seed, "epochs": args.epochs,
-        "spin_mode": args.spin_mode,
         "recipe": recipe,
         "metrics": _evaluate(
             model_dir / "nep_best.txt", blind, valid, args.device

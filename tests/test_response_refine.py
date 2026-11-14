@@ -41,10 +41,10 @@ def test_refinement_invalid_inputs(tmp_path):
     path = tmp_path/"nep.in"
     for entry in ("response_refine 2", "response_refine_steps 0",
                   "response_preserve_scale 1 2", "response_preserve_scale 1 nan 2"):
-        path.write_text("type 1 Fe\nspin_mode 3\n"+entry+"\n")
+        path.write_text("type 1 Fe\nmodel nep_spin\nspin_version 1\n"+entry+"\n")
         with pytest.raises(ValueError):
             parse_nep_in(str(path))
-    path.write_text("type 1 Fe\nspin_mode 3\nresponse_refine 1\n")
+    path.write_text("type 1 Fe\nmodel nep_spin\nspin_version 1\nresponse_refine 1\n")
     with pytest.raises(ValueError, match="finetune_from"):
         train_nep(str(path),"unused.xyz",output_dir=str(tmp_path/"out"))
 
@@ -70,7 +70,7 @@ def test_cache_inactive_species_magnetic_dof(tmp_path):
     from torchnep.response_refine import FrozenCache
     config, xyz, _ = _write_case(tmp_path)
     config.write_text(config.read_text().replace("type 1 Fe", "type 2 Fe O")+
-                      "\nspin_dof_type Fe\nspin_env_type Fe O\n")
+                      "\nspin_type Fe\n")
     xyz.write_text(xyz.read_text().replace("Fe 1.4", "O 1.4"))
     cfg = parse_nep_in(str(config))
     dev = torch.device(os.environ.get("JOINT_TEST_DEVICE", "cuda"))

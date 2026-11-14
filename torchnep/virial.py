@@ -18,13 +18,13 @@ VIRIAL6_INDICES = (0, 4, 8, 1, 5, 6)
 def virial6_for_labels(virial: torch.Tensor, spin_mode: int) -> torch.Tensor:
     """Project a raw9 virial onto the six components compared with labels.
 
-    ``spin_mode 2`` retains its historical single-triangular convention.
-    ``spin_mode 3`` compares the symmetric strain derivative supplied by DFT
+    Spin models compare the symmetric strain derivative supplied by DFT
     labels while leaving the antisymmetric raw virial available internally.
+    Ordinary models retain their established six-component projection.
     """
     if virial.shape[-1] != 9:
         raise ValueError("virial projection expects a row-major raw9 tensor")
-    if spin_mode != 3:
+    if spin_mode != 1:
         return virial[..., VIRIAL6_INDICES]
     half = virial.new_tensor(0.5)
     return torch.stack((
@@ -42,7 +42,7 @@ def virial9_to_6_numpy(v9: np.ndarray, spin_mode: int) -> np.ndarray:
     v9 = np.asarray(v9)
     if v9.shape[-1] != 9:
         raise ValueError("virial projection expects a row-major raw9 array")
-    if spin_mode != 3:
+    if spin_mode != 1:
         return v9[..., VIRIAL6_INDICES]
     out = np.empty(v9.shape[:-1] + (6,), dtype=v9.dtype)
     out[..., 0] = v9[..., 0]

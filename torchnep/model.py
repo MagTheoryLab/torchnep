@@ -18,7 +18,6 @@ Supports per-type NN architecture with ZBL (including typewise cutoffs).
 Uses ops module for core computations (pure PyTorch or CUDA).
 """
 
-import os
 import warnings
 
 import torch
@@ -30,13 +29,9 @@ from .constants import (
     ELEMENTS, C3B, C4B, C5B, C4B2, COVALENT_RADIUS,
 )
 from . import ops
-from .spin_schema import (
-    make_spin_descriptor,
-    normalize_spin_cutoff,
-    spin_projection_parameters,
-    spin_projection_size,
-    spin_checkpoint_lines,
-)
+from .spin_schema import (normalize_spin_config, spin_projection_parameters,
+                          read_nep_model, load_nep_weights, save_nep_model)
+from .magnetic_polynomial import MagneticPolynomialDescriptor
 
 
 class FittingNet(nn.Module):
@@ -72,6 +67,7 @@ class NEPModel(nn.Module):
 
     def __init__(self, config: dict):
         super().__init__()
+        config = normalize_spin_config(config)
         self.num_types = config["num_types"]
         self.type_names = config["type_names"]
         self.rc_radial = config["cutoff_radial"]
@@ -90,92 +86,15 @@ class NEPModel(nn.Module):
         self.has_q_134  = 1 if (len(lm) > 6 and lm[6] > 0) else 0
         self.num_neurons = config["neuron"]
 
-        # Retired training option: tolerate old disabled config dictionaries.
-        if config.get("spin_curriculum", False):
-            raise ValueError("spin_curriculum has been removed; delete this option")
-
-        # Versioned O/C spin descriptor protocol.
-        if "spin_descriptor" in config:
-            raise ValueError(
-                "spin_descriptor is not supported; use spin_mode 2 or 3")
-        self.spin_mode = int(config.get("spin_mode", 0))
-        if self.spin_mode not in (0, 2, 3):
-            raise ValueError("spin_mode must be 0, 2, or 3")
-        spin_only_keys = {
-            "spin_compress", "spin_basis_size", "spin_l_max",
-            "spin_order", "spin_soc", "spin_cutoff", "spin_dof_type",
-            "spin_cutoff_by_type", "spin_env_type",
-        }
-        explicit_keys = config.get("_explicit")
-        supplied_spin_keys = (
-            set(config) if explicit_keys is None else set(explicit_keys)
-        ) & spin_only_keys
-        if self.spin_mode not in (2, 3) and supplied_spin_keys:
-            raise ValueError(
-                "O/C spin parameters require spin_mode 2 or 3; otherwise they "
-                "would be silently ignored: "
-                + ", ".join(sorted(supplied_spin_keys))
-            )
-        self.spin_order = int(config.get(
-            "spin_order", 3 if self.spin_mode in (2, 3) else 1
-        ))
-        self.spin_soc = int(config.get(
-            "spin_soc", 1 if self.spin_mode in (2, 3) else 0
-        ))
-        if self.spin_mode in (2, 3) and self.spin_order not in (1, 2, 3):
-            raise ValueError("spin_order must be 1, 2, or 3")
-        if self.spin_mode in (2, 3) and self.spin_soc not in (0, 1):
-            raise ValueError("spin_soc must be 0 or 1")
-        self.spin_descriptor_kind = (
-            "magnetic_polynomial"
-            if self.spin_mode == 2
-            else "magnetic_polynomial_v3"
-            if self.spin_mode == 3
-            else None
-        )
-        self.spin_compress = int(config.get("spin_compress", 2))
-        if self.spin_compress < 1:
-            raise ValueError("spin_compress must be >= 1")
-
-        def _spin_int_list(key, default, size):
-            values = list(config.get(key, default))
-            if len(values) != size:
-                raise ValueError(f"{key} requires {size} values")
-            return [int(value) for value in values]
-
-        self.spin_basis_size = _spin_int_list(
-            "spin_basis_size", [8, 0], 2)
-        max_spin_compress = self.spin_basis_size[0] + 1
-        if self.spin_compress > max_spin_compress:
-            raise ValueError(
-                "spin_compress must be in [1, "
-                f"{max_spin_compress}] for the fixed magnetic radial "
-                f"basis B={self.spin_basis_size[0]}"
-            )
-        self.spin_l_max = _spin_int_list("spin_l_max", [2, 0, 0], 3)
-        legacy_spin_cutoff = list(config.get(
-            "spin_cutoff",
-            ([6.0, 6.0] if self.spin_mode in (2, 3)
-             else [self.rc_radial, self.rc_angular]),
-        ))
-        if self.spin_mode in (2, 3):
-            raw_spin_cutoff = config.get(
-                "spin_cutoff_by_type", [legacy_spin_cutoff[0]]
-            )
-            self.spin_cutoff_by_type = normalize_spin_cutoff(
-                raw_spin_cutoff, self.num_types
-            )
-            spin_cutoff_max = max(self.spin_cutoff_by_type)
-            self.spin_cutoff = [spin_cutoff_max, spin_cutoff_max]
-        else:
-            if len(legacy_spin_cutoff) != 2:
-                raise ValueError("spin_cutoff requires two values")
-            self.spin_cutoff = [float(value) for value in legacy_spin_cutoff]
-            if min(self.spin_cutoff) <= 0.0:
-                raise ValueError("spin_cutoff values must be > 0")
-            self.spin_cutoff_by_type = [
-                self.spin_cutoff[0]
-            ] * self.num_types
+        self.spin_mode = config.get("spin_mode", 0)
+        self.spin_version = 1 if self.spin_mode else None
+        self.spin_order = config.get("spin_order", 2)
+        self.spin_soc = config.get("spin_soc", 1)
+        self.spin_compress = config.get("spin_compress", 3)
+        self.spin_basis_size = config.get("spin_basis_size", [self.basis_size_angular, 0])
+        self.spin_l_max = config.get("spin_l_max", [2, 0, 0])
+        self.spin_cutoff_by_type = config.get("spin_cutoff_by_type", [self.rc_radial]*self.num_types)
+        self.spin_cutoff = config.get("spin_cutoff", [self.rc_radial, self.rc_angular])
         spin_cutoff_type = torch.tensor(
             self.spin_cutoff_by_type, dtype=torch.float64
         )
@@ -191,40 +110,9 @@ class NEPModel(nn.Module):
             for value in self.spin_cutoff_by_type[1:]
         )
 
-        def _active_types(key, default=None):
-            names = config.get(key)
-            if names is None:
-                names = default
-            active = torch.ones(self.num_types, dtype=torch.bool)
-            is_set = config.get(key) is not None
-            if names is not None:
-                if not names:
-                    raise ValueError(f"{key} must enable at least one type")
-                unknown = [name for name in names if name not in self.type_names]
-                if unknown:
-                    raise ValueError(f"{key} contains unknown type(s): {unknown}")
-                active.zero_()
-                for name in names:
-                    active[self.type_names.index(name)] = True
-            return active, is_set
-
-        self.is_spin_dof_type_set = False
-        self.is_spin_env_type_set = False
-        if self.spin_mode:
-            spin_dof, self.is_spin_dof_type_set = _active_types(
-                "spin_dof_type")
-            spin_env, self.is_spin_env_type_set = _active_types(
-                "spin_env_type",
-                config.get("spin_dof_type", None),
-            )
-            if bool((spin_dof & ~spin_env).any().item()):
-                raise ValueError(
-                    "spin_dof_type must be a subset of spin_env_type")
-            self.register_buffer("spin_dof_type_active", spin_dof)
-            self.register_buffer("spin_env_type_active", spin_env)
-        else:
-            self.spin_dof_type_active = None
-            self.spin_env_type_active = None
+        active = torch.tensor([name in config.get("spin_type", self.type_names)
+                               for name in self.type_names], dtype=torch.bool)
+        self.register_buffer("spin_dof_type_active", active if self.spin_mode else None)
 
         # q_123 / q_233 (extra 4-body bispectrum) need L=3 moments.
         if (self.has_q_123 or self.has_q_233) and self.l_max_3b < 3:
@@ -233,7 +121,7 @@ class NEPModel(nn.Module):
         if self.has_q_134 and self.l_max_3b < 4:
             raise ValueError("q_134 requires l_max_3b >= 4")
         # q_1111 is redundant: it equals const * (3-body L=1 descriptor)^2,
-        # so it adds no information. Kept for backward compatibility, but warn.
+        # so it adds no information. It remains a supported c516 descriptor channel.
         if self.has_q_1111:
             warnings.warn(
                 "has_q_1111 (l_max field 3) is set but is redundant — it "
@@ -242,6 +130,7 @@ class NEPModel(nn.Module):
                 stacklevel=2)
 
         # ZBL
+        self.zbl_typewise_factor = None
         self.zbl = config.get("zbl", None)
         if self.zbl is not None:
             # Real atomic numbers (H=1). ZBL needs physical Z in Z*Z', Z^0.23.
@@ -311,17 +200,19 @@ class NEPModel(nn.Module):
         self.spin_descriptor = None
         self.spin_dim = 0
         if self.spin_mode:
-            self.spin_descriptor = make_spin_descriptor(
-                self.spin_mode,
+            self.spin_descriptor = MagneticPolynomialDescriptor(
                 spin_compress=self.spin_compress,
                 spin_l_max=self.spin_l_max[0],
                 spin_order=self.spin_order,
                 spin_soc=bool(self.spin_soc),
                 basis_size_radial=self.spin_basis_size[0],
                 cutoff_radial=self.spin_cutoff[0],
+                n_max_angular=self.n_max_angular,
             )
             self.spin_dim = self.spin_descriptor.dim
         self.dim = self.struct_dim + self.spin_dim
+        if self.spin_mode and self.dim > 199:
+            raise ValueError("GPUMD supports at most 199 total descriptors")
         self.num_lm = sum(2 * ll + 1 for ll in range(1, self.l_max_3b + 1))
 
         nt = self.num_types
@@ -330,20 +221,9 @@ class NEPModel(nn.Module):
         self.c_param_3 = nn.Parameter(torch.empty(
             nt, nt, self.n_max_angular + 1, self.basis_size_angular + 1)
         ) if self.l_max_3b > 0 else None
-        self.c_param_spin = None
-        if self.spin_mode:
-            # Structural NEP uses c_param_{2,3}[center, neighbor, n, k].
-            # Spin uses the same ordered-pair contraction before constructing
-            # any tensor density.  The leading singleton is the established
-            # serialized family axis; descriptor width remains spin_compress.
-            self.c_param_spin = nn.Parameter(torch.empty(
-                1, nt, nt, self.spin_compress,
-                self.spin_basis_size[0] + 1))
         nn.init.normal_(self.c_param_2, std=0.1)
         if self.c_param_3 is not None:
             nn.init.normal_(self.c_param_3, std=0.1)
-        if self.c_param_spin is not None:
-            self._initialize_magnetic_polynomial_radial()
 
         # Per-type fitting networks (no per-type bias — shared b1 below)
         self.fitting_nets = nn.ModuleList([
@@ -355,11 +235,7 @@ class NEPModel(nn.Module):
 
         # q_scaler (computed from data, not learned)
         self.register_buffer("q_scaler", torch.ones(self.dim))
-        if self.spin_mode:
-            self.register_buffer(
-                "energy_baseline", torch.zeros(self.num_types))
-        else:
-            self.energy_baseline = None
+        self.register_buffer("energy_baseline", torch.zeros(self.num_types), persistent=True)
         self.register_buffer("_c3b", torch.tensor(C3B[:self.num_lm]))
         self.register_buffer("_c4b", torch.tensor(C4B))
         self.register_buffer("_c5b", torch.tensor(C5B))
@@ -368,7 +244,7 @@ class NEPModel(nn.Module):
     def architecture_signature(self):
         """Return the semantic architecture contract for binary checkpoints."""
         signature = {
-            "format": "torchnep-nep4-v1",
+            "format": "torchnep-c516-v1",
             "type_names": list(self.type_names),
             "cutoff": [self.rc_radial, self.rc_angular],
             "n_max": [self.n_max_radial, self.n_max_angular],
@@ -388,8 +264,9 @@ class NEPModel(nn.Module):
                 }
             ),
         }
-        if self.spin_mode in (2, 3):
+        if self.spin_mode:
             signature["spin"] = {
+                "version": self.spin_version,
                 "order": self.spin_order,
                 "compress": self.spin_compress,
                 "l_max": self.spin_l_max[0],
@@ -400,63 +277,13 @@ class NEPModel(nn.Module):
                     else self.spin_cutoff[0]
                 ),
                 "soc": self.spin_soc,
-                "dof_type": [
+                "type": [
                     name for index, name in enumerate(self.type_names)
                     if bool(self.spin_dof_type_active[index].item())
                 ],
-                "env_type": [
-                    name for index, name in enumerate(self.type_names)
-                    if bool(self.spin_env_type_active[index].item())
-                ],
-                "channels": [
-                    token.name for token in self.spin_descriptor.schema
-                ],
+
             }
         return signature
-
-    @torch.no_grad()
-    def _initialize_magnetic_polynomial_radial(self):
-        """Initialize every element pair with the same stable radial frame.
-
-        spin3 uses one continuous family, ``x**c * fc``, for every contracted
-        rank. spin2 retains its historical third direction, ``(x * fc)**2``,
-        and its existing higher-rank continuation. This is a deterministic
-        conditioning choice, not a user-facing physics switch;
-        element-conditioned coefficients remain trainable afterwards.
-        """
-        distance = torch.linspace(
-            0.0,
-            self.spin_cutoff[0] * (1.0 - 1.0e-7),
-            4096,
-            dtype=torch.float64,
-            device=self.c_param_spin.device,
-        )
-        basis = ops.chebyshev_basis(
-            distance, self.spin_cutoff[0], self.spin_basis_size[0]
-        )
-        x = distance / self.spin_cutoff[0]
-        envelope = 0.5 * (torch.cos(torch.pi * x) + 1.0)
-        if self.spin_mode == 3:
-            # spin3 defines one continuous family for every supported C:
-            # w_c(r) = (r/rc)^c fc(r).  spin2 keeps its historical C >= 3
-            # initialization byte-for-byte; production C=2 is identical.
-            targets = [
-                x.pow(degree) * envelope
-                for degree in range(self.spin_compress)
-            ]
-        else:
-            targets = [envelope, x * envelope, (x * envelope).square()]
-            targets.extend(
-                x.pow(degree) * envelope
-                for degree in range(3, self.spin_compress)
-            )
-        target = torch.stack(targets[:self.spin_compress], dim=-1)
-        projection = torch.linalg.lstsq(basis, target).solution.T
-        self.c_param_spin.copy_(
-            projection.to(self.c_param_spin).reshape(
-                1, 1, 1, self.spin_compress, self.spin_basis_size[0] + 1
-            ).expand_as(self.c_param_spin)
-        )
 
     @torch.no_grad()
     def set_q_scaler(
@@ -466,65 +293,19 @@ class NEPModel(nn.Module):
         q_rms: Optional[torch.Tensor] = None,
     ):
         diff = q_max - q_min
-        if self.spin_mode == 2:
-            magnitude = torch.maximum(
-                torch.maximum(q_min.abs(), q_max.abs()),
-                torch.ones_like(diff),
-            )
-            resolved = diff > (
-                64.0 * torch.finfo(diff.dtype).eps * magnitude)
-            scaler = torch.where(
-                resolved, diff.reciprocal(), torch.ones_like(diff))
-        elif self.spin_mode == 3:
+        scaler = torch.clamp(diff, min=1e-10).reciprocal()
+        if self.spin_mode:
             if q_rms is None or q_rms.shape != diff.shape:
-                raise ValueError(
-                    "spin_mode 3 q_scaler requires one RMS value per "
-                    "descriptor channel"
-                )
-            # Keep the structural block on the established range convention,
-            # including its relative-resolution guard for constant columns.
-            magnitude = torch.maximum(
-                torch.maximum(q_min.abs(), q_max.abs()),
-                torch.ones_like(diff),
-            )
-            resolved = diff > (
-                64.0 * torch.finfo(diff.dtype).eps * magnitude
-            )
-            scaler = torch.where(
-                resolved, diff.clamp_min(torch.finfo(diff.dtype).tiny).reciprocal(),
-                torch.ones_like(diff),
-            )
-
-            # The magnetic block cannot be centered: q_spin=0 must remain the
-            # exact zero-spin limit.  RMS normalizes a large fixed-moment
-            # offset and range protects against sparse tails.  Only channels
-            # unresolved at the dtype's relative precision keep unit scale;
-            # an absolute unit floor would suppress physically small SOC
-            # channels before they reach the ANN.
-            spin_slice = slice(self.struct_dim, None)
-            spin_rms = q_rms[spin_slice]
-            spin_span = torch.maximum(spin_rms, diff[spin_slice])
-            spin_peak = torch.maximum(
-                q_min[spin_slice].abs(), q_max[spin_slice].abs()
-            )
-            resolution = 64.0 * torch.finfo(diff.dtype).eps * torch.maximum(
-                spin_peak, torch.ones_like(spin_peak)
-            )
-            unresolved = spin_span <= resolution
-            scaler[spin_slice] = torch.where(
-                unresolved,
-                torch.ones_like(spin_span),
-                spin_span.clamp_min(torch.finfo(diff.dtype).tiny).reciprocal(),
-            )
-        else:
-            scaler = torch.clamp(diff, min=1e-10).reciprocal()
+                raise ValueError("nep_spin q_scaler requires one RMS value per channel")
+            spin = slice(self.struct_dim, None)
+            scaler[spin] = torch.maximum(q_rms[spin], diff[spin]).clamp_min(1).reciprocal()
         self.q_scaler.copy_(scaler)
 
     @torch.no_grad()
     def set_energy_baseline(self, baseline: torch.Tensor):
         if self.energy_baseline is None:
             raise ValueError(
-                "energy baseline is only defined for spin_mode 2 or 3")
+                "model has no energy reference buffer")
         self.energy_baseline.copy_(baseline.to(
             dtype=self.energy_baseline.dtype,
             device=self.energy_baseline.device,
@@ -583,8 +364,7 @@ class NEPModel(nn.Module):
         )
         q_spin = self.spin_descriptor(
             descriptor_rij_spin, pi_spin, pj_spin, spins, N, atom_types,
-            self.c_param_spin, None,
-            self.spin_dof_type_active, self.spin_env_type_active,
+            self.c_param_3, self.spin_dof_type_active,
         )
         return torch.cat((q_struct, q_spin), dim=-1)
 
@@ -605,28 +385,13 @@ class NEPModel(nn.Module):
         dummy_accum = torch.zeros((), dtype=q.dtype, device=q.device)
         dummy_q = q_scaled[:1] if q_scaled.shape[0] > 0 else torch.zeros(
             1, self.dim, dtype=q.dtype, device=q.device)
-        if os.environ.get("TORCHNEP_OC_CUDA_GRAPH", "0") == "1":
-            # Branch-free, capture-safe multi-element ANN. Boolean indexing
-            # lowers to a dynamic nonzero allocation, which CUDA Graphs reject.
-            # Gathering the per-type weights keeps the ragged atom dimension
-            # explicit and also handles types absent from this batch.
-            w0 = torch.stack([net.w0 for net in self.fitting_nets])
-            b0 = torch.stack([net.b0 for net in self.fitting_nets])
-            w1 = torch.stack([net.w1 for net in self.fitting_nets])
-            atom_w0 = w0[atom_types]
-            hidden = torch.tanh(
-                torch.bmm(q_scaled.unsqueeze(1), atom_w0).squeeze(1)
-                - b0[atom_types]
-            )
-            Ei = (hidden * w1[atom_types]).sum(dim=1)
-        else:
-            for t in range(self.num_types):
-                mask = atom_types == t
-                net = self.fitting_nets[t]
-                if mask.any():
-                    Ei[mask] = net(q_scaled[mask])
-                else:
-                    dummy_accum = dummy_accum + net(dummy_q).sum()
+        for t in range(self.num_types):
+            mask = atom_types == t
+            net = self.fitting_nets[t]
+            if mask.any():
+                Ei[mask] = net(q_scaled[mask])
+            else:
+                dummy_accum = dummy_accum + net(dummy_q).sum()
         Ei = Ei + dummy_accum * 0.0
         Ei = Ei - self.b1
         if include_baseline and self.energy_baseline is not None:
@@ -902,10 +667,10 @@ class NEPModel(nn.Module):
         (branch-free table variant), only the per-structure energy
         reduction below stays eager.
         """
-        if self.spin_mode in (2, 3):
+        if self.spin_mode:
             # O/C responses are derivatives of the same atomic-energy model.
-            # Keep this full autograd route for E/F/V/MF/Tau training; custom
-            # CUDA sector Functions replace its hot contraction subgraphs.
+            # Keep full autograd for E/F/V/MF/Tau. Structural center
+            # contractions can still use their analytic CUDA pullbacks.
             caller_grad_enabled = torch.is_grad_enabled()
             with torch.enable_grad():
                 result = self.compute_properties(
@@ -961,360 +726,11 @@ class NEPModel(nn.Module):
             model.load_weights_from_nep_txt("pretrained/nep.txt")
             # then call train_nep(..., finetune_from="pretrained/nep.txt")
         """
-        with open(path) as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-
-        spin_baseline_values = None
-        declared_projection_size = None
-        first_header = lines[0].split()
-        model_tag = first_header[0]
-        file_spin_mode = (
-            3 if "spin3" in model_tag
-            else 2 if "spin2" in model_tag
-            else 0
-        )
-        if file_spin_mode != self.spin_mode:
-            raise ValueError(
-                f"model format has spin_mode {file_spin_mode}, but the "
-                f"target model was built with spin_mode {self.spin_mode}"
-            )
-        file_has_zbl = "zbl" in model_tag
-        if file_has_zbl != (self.zbl is not None):
-            raise ValueError(
-                "model ZBL setting does not match target config")
-        if (len(first_header) < 2
-                or int(first_header[1]) != self.num_types
-                or first_header[2:] != self.type_names):
-            raise ValueError(
-                "model element count/order does not match target config: "
-                f"{first_header[2:]} != {self.type_names}"
-            )
-        spin_metadata = {}
-        structural_metadata = {}
-        allowed_spin_metadata = {
-            "spin_mode", "spin_baseline", "spin_basis_size", "spin_l_max",
-            "spin_compress", "spin_cutoff", "spin_order", "spin_soc",
-            "spin_projection_size", "spin_scaler", "spin_dof_type",
-            "spin_env_type",
-        }
-        numeric_start = len(lines)
-        for line_index, line in enumerate(lines[1:], start=1):
-            try:
-                float(line)
-                numeric_start = line_index
-                break
-            except ValueError:
-                pass
-        if self.spin_mode:
-            if len(lines) < 2 or lines[1].split()[0] != "spin_mode":
-                raise ValueError(
-                    f"nep4_spin{self.spin_mode} requires spin_mode as the "
-                    "first metadata line")
-            mode_parts = lines[1].split()
-            if len(mode_parts) != 3:
-                raise ValueError(
-                    "spin_mode metadata must declare mode and line count")
-            declared_block_size = int(mode_parts[2])
-            block_end = 2 + declared_block_size
-            if block_end > numeric_start:
-                raise ValueError("truncated counted spin_mode block")
-            allowed_block_keys = allowed_spin_metadata - {"spin_mode"}
-            for block_line in lines[2:block_end]:
-                block_key = block_line.split()[0]
-                if block_key not in allowed_block_keys:
-                    raise ValueError(
-                        "non-spin metadata found inside counted spin_mode "
-                        f"block: {block_key}")
-            misplaced = [
-                line.split()[0] for line in lines[block_end:numeric_start]
-                if line.split()[0].startswith("spin_")
-            ]
-            if misplaced:
-                raise ValueError(
-                    "spin_mode metadata count does not match its block; "
-                    "spin metadata found outside the counted block: "
-                    + ", ".join(misplaced))
-        else:
-            misplaced = [
-                line.split()[0] for line in lines[1:numeric_start]
-                if line.split()[0].startswith("spin_")
-            ]
-            if misplaced:
-                raise ValueError(
-                    "non-spin model contains spin metadata: "
-                    + ", ".join(misplaced))
-        for line in lines:
-            parts = line.split()
-            if not parts:
-                continue
-            try:
-                float(parts[0])
-                break
-            except ValueError:
-                pass
-            if parts[0] == "spin_descriptor":
-                raise ValueError(
-                    "spin_descriptor is not supported by the versioned "
-                    "O/C spin protocol")
-            key = parts[0]
-            key_lower = key.lower()
-            if key_lower in {"cutoff", "n_max", "basis_size", "l_max", "ann"}:
-                if key_lower in structural_metadata:
-                    raise ValueError(
-                        f"duplicate model metadata: {key_lower}")
-                structural_metadata[key_lower] = parts[1:]
-            if parts[0].startswith("spin_"):
-                if parts[0] not in allowed_spin_metadata:
-                    raise ValueError(
-                        f"unknown O/C model metadata: {parts[0]}")
-                if parts[0] in spin_metadata:
-                    raise ValueError(
-                        f"duplicate O/C model metadata: {parts[0]}")
-                spin_metadata[parts[0]] = parts[1:]
-            if parts[0] == "spin_baseline":
-                if len(parts) != self.num_types + 1:
-                    raise ValueError(
-                        "spin_baseline must have one value per type")
-                spin_baseline_values = [
-                    float(value) for value in parts[1:]
-                ]
-            elif parts[0] == "spin_projection_size":
-                declared_projection_size = int(parts[1])
-        if self.spin_mode and spin_baseline_values is None:
-            raise ValueError("spin model is missing spin_baseline")
-        if self.spin_mode:
-            spin_mode_values = spin_metadata.get("spin_mode", [])
-            if len(spin_mode_values) != 2:
-                raise ValueError(
-                    "spin_mode metadata must declare mode and line count")
-            declared_spin_lines = int(spin_mode_values[1])
-            actual_spin_lines = len(spin_metadata) - 1
-            if declared_spin_lines != actual_spin_lines:
-                raise ValueError(
-                    "spin_mode metadata count does not match its block: "
-                    f"{declared_spin_lines} != {actual_spin_lines}")
-
-        required_structural = {
-            "cutoff", "n_max", "basis_size", "l_max", "ann"
-        }
-        missing_structural = sorted(
-            required_structural - set(structural_metadata)
-        )
-        if missing_structural:
-            raise ValueError(
-                "model is missing structural metadata: "
-                + ", ".join(missing_structural)
-            )
-        cutoff_values = structural_metadata["cutoff"]
-        if len(cutoff_values) < 2 or not np.allclose(
-                [float(value) for value in cutoff_values[:2]],
-                [self.rc_radial, self.rc_angular],
-                rtol=0.0, atol=1.0e-12):
-            raise ValueError("cutoff does not match target config")
-        n_max_values = [
-            int(value) for value in structural_metadata["n_max"][:2]
-        ]
-        if n_max_values != [self.n_max_radial, self.n_max_angular]:
-            raise ValueError("n_max does not match target config")
-        basis_values = [
-            int(value) for value in structural_metadata["basis_size"][:2]
-        ]
-        if basis_values != [
-                self.basis_size_radial, self.basis_size_angular]:
-            raise ValueError("basis_size does not match target config")
-        file_lmax = [
-            int(value) for value in structural_metadata["l_max"]
-        ]
-        file_lmax.extend([0] * (7 - len(file_lmax)))
-        file_lmax = [file_lmax[0], int(file_lmax[1] > 0)] + file_lmax[2:7]
-        expected_lmax = [
-            self.l_max_3b, self.has_q_222, self.has_q_1111,
-            self.has_q_112, self.has_q_123, self.has_q_233,
-            self.has_q_134,
-        ]
-        if file_lmax != expected_lmax:
-            raise ValueError("l_max does not match target config")
-        ann_values = structural_metadata["ann"]
-        if not ann_values or int(ann_values[0]) != self.num_neurons:
-            raise ValueError("ANN does not match target config")
-        if file_has_zbl:
-            zbl_lines = [
-                line.split() for line in lines
-                if line.split() and line.split()[0] == "zbl"
-            ]
-            if len(zbl_lines) != 1:
-                raise ValueError("ZBL model must contain exactly one zbl line")
-            zbl_values = zbl_lines[0][1:]
-            expected_zbl = [self.zbl / 2.0, self.zbl]
-            if len(zbl_values) not in (2, 3) or not np.allclose(
-                    [float(value) for value in zbl_values[:2]],
-                    expected_zbl, rtol=0.0, atol=1.0e-12):
-                raise ValueError("ZBL cutoff does not match target config")
-            file_factor = (
-                float(zbl_values[2]) if len(zbl_values) == 3 else None)
-            if file_factor != self.zbl_typewise_factor:
-                raise ValueError(
-                    "ZBL typewise factor does not match target config")
-        if self.spin_mode:
-            required = {
-                "spin_mode": self.spin_mode,
-                "spin_basis_size": self.spin_basis_size[0],
-                "spin_l_max": self.spin_l_max[0],
-                "spin_compress": self.spin_compress,
-                "spin_order": self.spin_order,
-                "spin_soc": self.spin_soc,
-                "spin_scaler": 1,
-            }
-            for key, expected in required.items():
-                values = spin_metadata.get(key)
-                if not values or int(values[0]) != expected:
-                    actual = None if not values else values[0]
-                    raise ValueError(
-                        f"{key} does not match target config: "
-                        f"{actual} != {expected}"
-                    )
-            cutoff = spin_metadata.get("spin_cutoff")
-            file_spin_cutoff = (
-                None if not cutoff
-                else normalize_spin_cutoff(cutoff, self.num_types)
-            )
-            if (file_spin_cutoff is None or not np.allclose(
-                    file_spin_cutoff, self.spin_cutoff_by_type,
-                    rtol=0.0, atol=1.0e-12)):
-                actual = file_spin_cutoff
-                raise ValueError(
-                    "spin_cutoff does not match target config: "
-                    f"{actual} != {self.spin_cutoff_by_type}"
-                )
-            expected_dof = [
-                name for index, name in enumerate(self.type_names)
-                if bool(self.spin_dof_type_active[index].item())
-            ]
-            expected_env = [
-                name for index, name in enumerate(self.type_names)
-                if bool(self.spin_env_type_active[index].item())
-            ]
-            file_dof = spin_metadata.get(
-                "spin_dof_type", list(self.type_names))
-            file_env = spin_metadata.get("spin_env_type", file_dof)
-            if file_dof != expected_dof:
-                raise ValueError(
-                    "spin_dof_type does not match target config: "
-                    f"{file_dof} != {expected_dof}"
-                )
-            if file_env != expected_env:
-                raise ValueError(
-                    "spin_env_type does not match target config: "
-                    f"{file_env} != {expected_env}"
-                )
-            self.energy_baseline.copy_(torch.tensor(
-                spin_baseline_values,
-                dtype=self.energy_baseline.dtype,
-                device=self.energy_baseline.device,
-            ))
-
-        # Count header lines (non-numeric lines at the top)
-        header_lines = 0
-        for ln in lines:
-            try:
-                float(ln)
-                break
-            except ValueError:
-                header_lines += 1
-
-        # Use float64 as the numpy transport dtype so we preserve every digit
-        # written to nep.txt; the target .copy_() downcasts to the parameter's
-        # actual dtype (float32 or float64) without going through float32 first.
-        vals = np.asarray([float(ln) for ln in lines[header_lines:]],
-                          dtype=np.float64)
-        idx = 0
-        dim = self.dim
-        neurons = self.num_neurons
-
-        for t in range(self.num_types):
-            # w0 stored as (neurons, dim) row-major; model keeps (dim, neurons)
-            n_w0 = neurons * dim
-            w0 = vals[idx:idx + n_w0].reshape(neurons, dim).T
-            self.fitting_nets[t].w0.data.copy_(torch.from_numpy(w0.copy()))
-            idx += n_w0
-
-            b0 = vals[idx:idx + neurons]
-            self.fitting_nets[t].b0.data.copy_(torch.from_numpy(b0.copy()))
-            idx += neurons
-
-            w1 = vals[idx:idx + neurons]
-            self.fitting_nets[t].w1.data.copy_(torch.from_numpy(w1.copy()))
-            idx += neurons
-
-        # Shared output bias
-        self.b1.data.fill_(float(vals[idx]))
-        idx += 1
-
-        # c_param_2: saved as (n_rad+1, bs_rad+1, nt, nt), model: (nt, nt, n+1, b+1)
-        nt = self.num_types
-        n_c2 = (self.n_max_radial + 1) * (self.basis_size_radial + 1) * nt * nt
-        c2 = vals[idx:idx + n_c2].reshape(
-            self.n_max_radial + 1, self.basis_size_radial + 1, nt, nt)
-        self.c_param_2.data.copy_(
-            torch.from_numpy(np.ascontiguousarray(np.transpose(c2, (2, 3, 0, 1)))))
-        idx += n_c2
-
-        if self.c_param_3 is not None:
-            n_c3 = (self.n_max_angular + 1) * (self.basis_size_angular + 1) * nt * nt
-            c3 = vals[idx:idx + n_c3].reshape(
-                self.n_max_angular + 1, self.basis_size_angular + 1, nt, nt)
-            self.c_param_3.data.copy_(
-                torch.from_numpy(np.ascontiguousarray(np.transpose(c3, (2, 3, 0, 1)))))
-            idx += n_c3
-
-        if self.c_param_spin is not None:
-            n_cs = self.c_param_spin.numel()
-            cs = vals[idx:idx + n_cs].reshape(
-                1, self.spin_compress, self.spin_basis_size[0] + 1,
-                nt, nt,
-            )
-            self.c_param_spin.data.copy_(torch.from_numpy(
-                np.ascontiguousarray(np.transpose(cs, (0, 3, 4, 1, 2)))))
-            idx += n_cs
-
-        projection_parameters = spin_projection_parameters(self)
-        expected_projection_size = spin_projection_size(self)
-        if self.spin_mode in (2, 3):
-            if declared_projection_size is None:
-                raise ValueError(
-                    f"nep4_spin{self.spin_mode} model is missing "
-                    "spin_projection_size"
-                )
-            if declared_projection_size != expected_projection_size:
-                raise ValueError(
-                    "spin_projection_size does not match the descriptor: "
-                    f"{declared_projection_size} != "
-                    f"{expected_projection_size}"
-                )
-        for parameter in projection_parameters:
-            size = parameter.numel()
-            values = vals[idx:idx + size]
-            if values.size != size:
-                raise ValueError("truncated O/C projection weights")
-            parameter.data.copy_(
-                torch.from_numpy(values.reshape(parameter.shape).copy())
-            )
-            idx += size
-
-        # q_scaler (buffer — kept; the weights were trained against it)
-        q_scaler = vals[idx:idx + dim]
-        if q_scaler.size != dim:
-            raise ValueError("truncated q_scaler")
-        self.q_scaler.copy_(torch.from_numpy(q_scaler.copy()))
-        idx += dim
-        if idx != vals.size:
-            raise ValueError(
-                f"unexpected trailing numeric values: {vals.size - idx}"
-            )
+        load_nep_weights(self, path)
 
     def save_nep_txt(self, path: str, max_NN_radial: int,
                      max_NN_angular: int):
-        """Save model to GPUMD nep4 nep.txt format.
+        """Save model to the GPUMD c516 format_version 1 named-block format.
 
         ``max_NN_radial`` / ``max_NN_angular`` are mandatory: GPUMD's nep.txt
         parser requires the cutoff line to always carry 4 numbers
@@ -1322,108 +738,8 @@ class NEPModel(nn.Module):
         Compute them from the training set via
         :func:`torchnep.train.compute_max_neighbors`.
         """
-        if max_NN_radial <= 0 or max_NN_angular <= 0:
-            raise ValueError(
-                "save_nep_txt requires max_NN_radial > 0 and "
-                "max_NN_angular > 0 (GPUMD's nep.txt format mandates the "
-                f"cutoff line to carry both); got "
-                f"max_NN_radial={max_NN_radial}, "
-                f"max_NN_angular={max_NN_angular}. "
-                "Use torchnep.train.compute_max_neighbors(structures) to "
-                "obtain them.")
-        lines = []
-        zbl_suffix = "_zbl" if self.zbl is not None else ""
-        model_tag = (
-            f"nep4_spin{self.spin_mode}"
-            if self.spin_mode
-            else "nep4"
-        )
-        lines.append(f"{model_tag}{zbl_suffix} {self.num_types} "
-                     + " ".join(self.type_names))
-        if self.spin_mode:
-            spin_lines = spin_checkpoint_lines(self)
-            lines.append(
-                f"spin_mode {self.spin_mode} {len(spin_lines)}"
-            )
-            lines.extend(spin_lines)
+        save_nep_model(self, path, max_NN_radial, max_NN_angular)
 
-        if self.zbl is not None:
-            tw = self.zbl_typewise_factor
-            rc_inner_out = self.zbl / 2.0
-            rc_outer_out = self.zbl
-            if tw is not None:
-                lines.append(f"zbl {rc_inner_out} {rc_outer_out} {tw}")
-            else:
-                lines.append(f"zbl {rc_inner_out} {rc_outer_out}")
-
-        # Format cutoff: integer if whole number (matches GPUMD style).
-        # Always emit 4 fields — GPUMD's nep.txt parser requires both
-        # max_NN_radial and max_NN_angular on the cutoff line.
-        def _fmt(v):
-            return str(int(v)) if v == int(v) else str(v)
-        lines.append(
-            f"cutoff {_fmt(self.rc_radial)} {_fmt(self.rc_angular)} "
-            f"{max_NN_radial} {max_NN_angular}")
-        lines.append(f"n_max {self.n_max_radial} {self.n_max_angular}")
-        lines.append(f"basis_size {self.basis_size_radial} "
-                     f"{self.basis_size_angular}")
-        # l_max line: L_max + GPUMD-core flags + q_123 / q_233 / q_134.
-        #
-        # Field 2 (has_q_222) is written with the legacy encoding "2 if on
-        # else 0" — this matches GPUMD's fitness.cu (``has_q_222 ? 2 : 0``)
-        # so that older GPUMD builds (which read this field as ``L_max_4body``
-        # and treated >=2 as "enable q_222") still load the model correctly.
-        #
-        # Trailing zero flags are trimmed to >=3 fields so a baseline model
-        # with no extras prints exactly the classic ``l_max L_3b 2 0``
-        # three-token line that older GPUMD builds produced and parsed.
-        lmax_flags = [self.l_max_3b,
-                      2 if self.has_q_222 else 0,
-                      self.has_q_1111,
-                      self.has_q_112,
-                      self.has_q_123, self.has_q_233, self.has_q_134]
-        while len(lmax_flags) > 3 and lmax_flags[-1] == 0:
-            lmax_flags.pop()
-        lines.append("l_max " + " ".join(str(x) for x in lmax_flags))
-        lines.append(f"ANN {self.num_neurons} 0")
-
-        # Per-type NN weights
-        for t in range(self.num_types):
-            net = self.fitting_nets[t]
-            w0 = net.w0.detach().cpu().numpy().T  # (neurons, dim)
-            for v in w0.flat:
-                lines.append(f"  {v:.10e}")
-            for v in net.b0.detach().cpu().numpy():
-                lines.append(f"  {v:.10e}")
-            for v in net.w1.detach().cpu().numpy():
-                lines.append(f"  {v:.10e}")
-
-        # Common output bias (shared across all types — GPUMD convention)
-        lines.append(f"  {self.b1.item():.10e}")
-
-        # c2: stored as (n_max+1, basis+1, nt, nt)
-        c2 = self.c_param_2.detach().cpu().numpy().transpose(2, 3, 0, 1)
-        for v in c2.flat:
-            lines.append(f"  {v:.10e}")
-        if self.c_param_3 is not None:
-            c3 = self.c_param_3.detach().cpu().numpy().transpose(2, 3, 0, 1)
-            for v in c3.flat:
-                lines.append(f"  {v:.10e}")
-        if self.c_param_spin is not None:
-            c_spin = self.c_param_spin.detach().cpu().numpy().transpose(
-                0, 3, 4, 1, 2)
-            for v in c_spin.flat:
-                lines.append(f"  {v:.10e}")
-
-        for parameter in spin_projection_parameters(self):
-            for value in parameter.detach().cpu().numpy().flat:
-                lines.append(f"  {value:.10e}")
-
-        for v in self.q_scaler.detach().cpu().numpy():
-            lines.append(f"  {v:.10e}")
-
-        with open(path, "w") as f:
-            f.write("\n".join(lines) + "\n")
 
 
 @torch.no_grad()
@@ -1440,8 +756,8 @@ def gpumd_init_parameters(model: NEPModel) -> None:
     torch.nn.init.uniform_(model.c_param_2, -1.0, 1.0)
     if model.c_param_3 is not None:
         torch.nn.init.uniform_(model.c_param_3, -1.0, 1.0)
-    if model.c_param_spin is not None:
-        torch.nn.init.uniform_(model.c_param_spin, -1.0, 1.0)
+    for parameter in spin_projection_parameters(model):
+        torch.nn.init.uniform_(parameter, -1.0, 1.0)
     for net in model.fitting_nets:
         torch.nn.init.uniform_(net.w0, -1.0, 1.0)
         torch.nn.init.uniform_(net.b0, -1.0, 1.0)
@@ -1497,7 +813,8 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
             new_config["typewise_cutoff_zbl_factor"] = model.zbl_typewise_factor
     if model.spin_mode:
         new_config.update({
-            "spin_mode": model.spin_mode,
+            "model": "nep_spin",
+            "spin_version": 1,
             "spin_compress": model.spin_compress,
             "spin_basis_size": list(model.spin_basis_size),
             "spin_l_max": list(model.spin_l_max),
@@ -1507,16 +824,8 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
             ],
             "spin_order": model.spin_order,
             "spin_soc": model.spin_soc,
-            "spin_dof_type": [
-                model.type_names[index]
-                for index in keep_idx
-                if bool(model.spin_dof_type_active[index].item())
-            ],
-            "spin_env_type": [
-                model.type_names[index]
-                for index in keep_idx
-                if bool(model.spin_env_type_active[index].item())
-            ],
+            "spin_type": [model.type_names[index] for index in keep_idx
+                          if bool(model.spin_dof_type_active[index].item())],
         })
 
     dev = model.b1.device
@@ -1543,13 +852,7 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
         new_model.c_param_2.data.copy_(model.c_param_2.data[ix][:, ix])
         if new_model.c_param_3 is not None:
             new_model.c_param_3.data.copy_(model.c_param_3.data[ix][:, ix])
-        if new_model.c_param_spin is not None:
-            new_model.c_param_spin.data.copy_(
-                model.c_param_spin.data[:, ix][:, :, ix])
-            for target, source in zip(
-                spin_projection_parameters(new_model),
-                spin_projection_parameters(model),
-            ):
-                target.copy_(source)
+        for target, source in zip(spin_projection_parameters(new_model), spin_projection_parameters(model)):
+            target.copy_(source)
 
     return new_model

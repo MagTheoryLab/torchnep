@@ -15,37 +15,12 @@
 Core NEP operations — pure PyTorch on CPU / CUDA / MPS.
 """
 
-import os
-
 import torch
 from typing import List, Literal, Optional, Tuple
 
 from .constants import (PI, K_C_SP, ZBL_PARA, Z_COEFFICIENT, MAX_L3B,
                         Q123_TERMS, Q233_TERMS, Q134_TERMS)
 from .oc_cuda_struct_center import structural_center_sector
-
-
-# Keep the magnetic descriptor's internal dependency surface limited to this
-# operations module.  Imports stay lazy so the pure-Torch reference does not
-# load CUDA extension wrappers unless the corresponding sector is reached.
-def oc_cuda_density_bank(*args, **kwargs):
-    from .oc_cuda_bank import density_bank
-    return density_bank(*args, **kwargs)
-
-
-def oc_cuda_center_sector(*args, **kwargs):
-    from .oc_cuda_center import center_sector
-    return center_sector(*args, **kwargs)
-
-
-def oc_cuda_full_descriptor(*args, **kwargs):
-    from .oc_cuda_full import full_descriptor
-    return full_descriptor(*args, **kwargs)
-
-
-def oc_cuda_moment_gate(*args, **kwargs):
-    from .oc_cuda_train import moment_gate
-    return moment_gate(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1030,19 +1005,6 @@ def _eval_extra(s, terms):
     s: (N, n_ap1, num_lm). q = Σ_t coeff_t · Π_p s[:, :, idx[t, p]].
     Vectorised: gather all monomial factors, take the product over the
     degree axis, weight by coeffs and sum over terms."""
-    if os.environ.get("TORCHNEP_OC_CUDA_GRAPH", "0") == "1" and s.is_cuda:
-        # Advanced-index backward for the packed formulation is not CUDA-Graph
-        # capture safe on V100/PyTorch 2.8.  The term table is a small static
-        # polynomial, so expand it without device-side index scatter.  This
-        # preserves ordinary and double backward and is the fail-closed graph
-        # path until these families move into the generic sector kernel.
-        result = torch.zeros_like(s[:, :, 0])
-        for coefficient, indices in terms:
-            monomial = s[:, :, indices[0]]
-            for index in indices[1:]:
-                monomial = monomial * s[:, :, index]
-            result = result + coefficient * monomial
-        return result
     coeffs, idx, _ = _pack_terms(terms, s.device)
     g = s[:, :, idx]                          # (N, n_ap1, T, d)
     prod = g.prod(dim=-1)                     # (N, n_ap1, T)

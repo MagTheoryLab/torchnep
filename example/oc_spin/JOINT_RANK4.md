@@ -3,7 +3,8 @@
 Enable in `nep.in` (TorchNEP only):
 
 ```text
-spin_mode 3
+model nep_spin
+spin_version 1
 joint_rank4 1
 lambda_spin_response 0
 ```
@@ -24,18 +25,16 @@ Independent per-rank Rademacher probes are SUM-reduced using global label
 counts; padding contributes no observations. Sketch draws do not consume the
 training RNG. Both single-device and sharded trainers use the same helper.
 
-Checkpoints include the sketch, its age, counters and objective token. Exact
+Current version-2 joint-update checkpoints include the sketch, its age, counters
+and objective token. Earlier cache versions are rejected without migration. Exact
 resume requires the same setting; use `finetune_from` when changing optimizers.
 The extra VJPs use eager autograd even when the ordinary compute is compiled.
 CUDA-graph optimizer capture is currently rejected rather than silently
 approximated. Nonzero `lambda_spin_response` is supported for energy, mforce
 and combined targets; see [response targets](RESPONSE_TARGETS.md).
 The sketch includes the weighted response residuals. E/F/V/MF/torque masks and the
-spin3 symmetric six-component virial convention are preserved.
+spin symmetric six-component virial convention are preserved.
 
-The motivating matched 600-epoch BFO experiment reduced full-training MF RMSE
-from 33.224 to 25.370 meV/μB and torque RMSE from 9.749 to 7.188 meV, with
-observed wall time 51.15 versus 54.16 min on separate four-V100 allocations.
-These are training-set results, not a generalization certificate or matched-node
-speed benchmark. Easy-plane and short-wavelength spiral failures remained;
-rank-4 training must not be presented as resolving those physical deficiencies.
+Historical experiments used the removed spin3 descriptor and do not validate
+the current c516 descriptor. Revalidate convergence and physical responses for
+the current model before relying on an optimizer comparison.

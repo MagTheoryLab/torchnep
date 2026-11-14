@@ -1,23 +1,27 @@
-# O/C spin production invariants
+# GPUMD c516 spin production invariants
 
-These rules apply to changes that touch the versioned `nep4_spin2` path.
+These rules apply to `model nep_spin / spin_version 1`, synchronized with GPUMD c516.
 
 - Keep `MagneticPolynomialDescriptor` independent. Do not make it inherit an
   older magnetic descriptor or reintroduce experimental descriptor registries.
-- Preserve order nesting: O2-C2 is the exact first 37 magnetic channels of
-  O3-C2; the O3-C2 production width is 49 magnetic channels.
+- Match `spin_layout.cuh` primitive, sector and parameter ordering. Default
+  C3/L2/O2 has 34 SOC or 31 non-SOC magnetic coordinates; orders are not prefixes.
 - Keep one scalar, element-conditioned atomic-energy ANN. Forces, virial,
   magnetic forces, and torques must remain derivatives of that same energy.
-- A zero-spin input must make every magnetic descriptor channel exactly zero.
+- Match GPUMD at zero spin: degree-zero geometric channels remain; all spin
+  derivatives must be finite. Excluded `spin_type` inputs have zero effective spin.
 - Keep the public truncation surface narrow: `spin_compress`, `spin_l_max`,
   `spin_order`, `spin_soc`, and `spin_cutoff`. Research block switches do not
   belong in `nep.in` or the serialized model format.
 - Train the complete configured O/C representation from the first epoch.
   Do not reintroduce staged order gates, zeroed O3 ANN initialization, or
-  curriculum-triggered scaler refresh. The retired `spin_curriculum 0`
-  spelling is accepted only as a deprecated no-op for old inputs.
-- `spin_mode 2` uses self-consistent descriptor scaling; do not enable the
-  generation-0 GPUMD q-scaler for it.
+  curriculum-triggered scaler refresh. Reject every `spin_curriculum` input,
+  including disabled spellings and disabled config dictionaries.
+- Spin scaling is `1/max(RMS, range, 1)`, without centering. Reuse structural
+  angular coefficients; do not add independent magnetic radial coefficients.
+- Read and write ordinary and magnetic models only in the c516 named-block
+  format. Do not add old-text readers, unsigned checkpoint fallbacks, default
+  state injection, DDP-prefix rewriting, or retired schedule/cache migrations.
 - Stage 2, per-element LS conditioning, and grouped
   validation are training semantics, not inference/model-format switches.
 - Controlled J-like, D-like, anisotropy, strain, and volume scans are a data

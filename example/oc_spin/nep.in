@@ -5,14 +5,14 @@ basis_size 8 8
 l_max 4 2 0
 neuron 30
 
-spin_mode 3
+model nep_spin
+spin_version 1
 spin_cutoff 6
 spin_l_max 2
-spin_compress 2
-spin_order 3
+spin_compress 3
+spin_order 2
 spin_soc 1
-spin_dof_type Fe Ge
-spin_env_type Fe Ge
+spin_type Fe Ge
 
 epoch 600
 batch 32

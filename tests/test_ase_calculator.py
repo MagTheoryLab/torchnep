@@ -42,7 +42,7 @@ from torchnep.model import NEPModel                     # noqa: E402
 from _common import FIXTURES, load_reference            # noqa: E402
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-# CrCoNi: nep4_zbl, typewise ZBL — exercises the NEP+ZBL split.
+# CrCoNi: model nep with typewise ZBL — exercises the NEP+ZBL split.
 ZBL_FIX = next(f for f in FIXTURES if f["name"] == "CrCoNi")
 
 
@@ -152,9 +152,9 @@ def test_spin_zbl_component_split_sums_to_total(tmp_path):
         "basis_size_angular": 3,
         "l_max": [2, 0, 0],
         "neuron": 4,
-        "spin_mode": 2,
+        "model": "nep_spin",
         "spin_compress": 2,
-        "spin_basis_size": [8, 0],
+        "spin_basis_size": [3, 0],
         "spin_l_max": [2, 0, 0],
         "spin_cutoff": [4.0, 4.0],
         "spin_order": 3,
@@ -162,7 +162,7 @@ def test_spin_zbl_component_split_sums_to_total(tmp_path):
         "zbl": 2.5,
     }
     model = NEPModel(config).double().eval()
-    path = tmp_path / "spin2_zbl.txt"
+    path = tmp_path / "spin_zbl.txt"
     model.save_nep_txt(path, max_NN_radial=16, max_NN_angular=16)
 
     atoms = Atoms(
@@ -198,13 +198,13 @@ def test_non_periodic_has_no_stress():
     assert "stress" not in atoms.calc.results
 
 
-def test_spin3_ase_stress_uses_symmetric_strain_projection():
+def test_spin_ase_stress_uses_symmetric_strain_projection():
     raw9 = torch.tensor([[
         1.0, 2.0, 3.0,
         4.0, 5.0, 6.0,
         7.0, 8.0, 9.0,
     ]], dtype=torch.float64)
-    stress = NEP._stress_from_virial(raw9, volume=2.0, spin_mode=3)
+    stress = NEP._stress_from_virial(raw9, volume=2.0, spin_mode=1)
     # ASE Voigt order is xx, yy, zz, yz, xz, xy.
     np.testing.assert_array_equal(
         stress, -np.array([1.0, 5.0, 9.0, 7.0, 5.0, 3.0]) / 2.0
@@ -216,7 +216,7 @@ def test_non_periodic_vacuum_uses_largest_spin_cutoff():
     calc.nep = SimpleNamespace(
         rc_radial=3.0,
         rc_angular=4.0,
-        spin_mode=2,
+        spin_mode=1,
         spin_cutoff=[7.0, 7.0],
     )
     atoms = Atoms(
