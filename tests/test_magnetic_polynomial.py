@@ -30,6 +30,24 @@ def test_c516_default_layout(soc, dimension, paths, components):
     assert descriptor.center_mix.shape == (3,3)
 
 
+@torch.random.fork_rng(devices=[])
+def test_all_declared_c516_truncations():
+    # SOC widths per radial channel, frozen from c516's layout (72dc784).
+    soc_widths = [(2,2,2,2), (6,6,6,6), (9,11,11,11),
+                  (12,15,15,15), (15,19,19,19)]
+    dimensions = []
+    for compress in range(1,10):
+        for lmax in range(5):
+            for order in range(1,5):
+                for soc in (0,1):
+                    descriptor = MagneticPolynomialDescriptor(compress,lmax,order,soc)
+                    width = soc_widths[lmax][order-1] if soc else (lmax+1)*(min(lmax,order)+1)+1
+                    assert descriptor.dim == order//2 + compress*width
+                    dimensions.append(descriptor.dim)
+    assert len(dimensions) == 360
+    assert max(dimensions) == 236
+
+
 @pytest.mark.parametrize('soc', [0,1])
 @pytest.mark.parametrize('reflection', [False,True])
 def test_rotation_inversion_and_time_reversal(soc, reflection):

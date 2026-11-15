@@ -182,7 +182,7 @@ def test_single_device_oc_training_smoke(tmp_path):
     _assert_outputs(output)
     log = (output / "output.log").read_text()
     assert "O3 curriculum" not in log
-    assert "forces: autograd" in log
+    assert "forces: analytical" in log
     assert "generator curves: 3 training frames, 3 validation frames" in log
     from torchnep.response_training import GENERATOR_CURVE_SCHEMA
     assert GENERATOR_CURVE_SCHEMA in log

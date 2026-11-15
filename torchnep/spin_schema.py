@@ -13,8 +13,8 @@ def normalize_spin_cutoff(values, num_types):
         cutoffs *= num_types
     if len(cutoffs) != num_types:
         raise ValueError(f"spin_cutoff requires one value or one value per element type ({num_types})")
-    if not cutoffs or any(not math.isfinite(value) or value <= 0 for value in cutoffs):
-        raise ValueError("spin_cutoff values must be finite and > 0")
+    if not cutoffs or any(not math.isfinite(value) or value < 3 for value in cutoffs):
+        raise ValueError("spin_cutoff values must be finite and >= 3 A")
     return cutoffs
 
 

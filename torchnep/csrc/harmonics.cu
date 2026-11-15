@@ -33,9 +33,10 @@ __global__ void harmonics_kernel(
     for (int64_t t = offsets[d]; t < offsets[d + 1]; ++t) {
       int e[3] = {int(powers[3*t]), int(powers[3*t+1]), int(powers[3*t+2])};
       const T c = coefficients[t];
-      if (Mode == 0) {
+      if (Mode == 0 || Mode == 3) {
         value += monomial(p, e[0], e[1], e[2], c);
-      } else {
+      }
+      if (Mode != 0) {
         for (int k = 0; k < 3; ++k) {
           const int ek = e[k];
           if (!ek) continue;
@@ -55,8 +56,12 @@ __global__ void harmonics_kernel(
         }
       }
     }
-    if (Mode == 0) {
+    if (Mode == 0 || Mode == 3) {
       output[row * channels + d] = value;
+      if (Mode == 3) {
+        for (int k = 0; k < 3; ++k)
+          grad_xyz[(row * channels + d) * 3 + k] = jacobian[k];
+      }
     } else {
       for (int k = 0; k < 3; ++k) {
         gx[k] += pull[row * channels + d] *
@@ -66,7 +71,7 @@ __global__ void harmonics_kernel(
       if (Mode == 2) output[row * channels + d] = value;
     }
   }
-  if (Mode != 0) {
+  if (Mode == 1 || Mode == 2) {
     for (int k = 0; k < 3; ++k) grad_xyz[3 * row + k] = gx[k];
   }
 }
@@ -98,18 +103,19 @@ std::vector<at::Tensor> evaluate(
     at::Tensor pull = {}, at::Tensor tangent = {}) {
   check(xyz, c, p, o);
   const int channels = o.numel() - 1;
-  if (Mode != 0) check_derivative(pull, xyz, channels);
+  if (Mode == 1 || Mode == 2) check_derivative(pull, xyz, channels);
   if (Mode == 2) check_derivative(tangent, xyz, 3);
   c10::cuda::CUDAGuard guard(xyz.device());
   auto output = Mode == 1 ? at::Tensor() : at::empty({xyz.size(0), channels}, xyz.options());
-  auto grad = Mode == 0 ? at::Tensor() : at::empty_like(xyz);
+  auto grad = Mode == 0 ? at::Tensor() : Mode == 3
+      ? at::empty({xyz.size(0), channels, 3}, xyz.options()) : at::empty_like(xyz);
   const int threads = 128;
   const int blocks = (xyz.size(0) + threads - 1) / threads;
   if (blocks) {
     AT_DISPATCH_FLOATING_TYPES(xyz.scalar_type(), "c516_harmonics", [&] {
       harmonics_kernel<scalar_t, Mode><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
           xyz.data_ptr<scalar_t>(), c.data_ptr<scalar_t>(), p.data_ptr<int64_t>(),
-          o.data_ptr<int64_t>(), Mode ? pull.data_ptr<scalar_t>() : nullptr,
+          o.data_ptr<int64_t>(), (Mode == 1 || Mode == 2) ? pull.data_ptr<scalar_t>() : nullptr,
           Mode == 2 ? tangent.data_ptr<scalar_t>() : nullptr,
           xyz.size(0), channels, Mode == 1 ? nullptr : output.data_ptr<scalar_t>(),
           Mode ? grad.data_ptr<scalar_t>() : nullptr);
@@ -132,4 +138,8 @@ std::vector<at::Tensor> harmonics_double_backward(
     at::Tensor g, at::Tensor x, at::Tensor c,
     at::Tensor p, at::Tensor o, at::Tensor h) {
   return evaluate<2>(x,c,p,o,g,h);
+}
+
+std::vector<at::Tensor> harmonics_jacobian(at::Tensor x, at::Tensor c, at::Tensor p, at::Tensor o) {
+  return evaluate<3>(x,c,p,o);
 }

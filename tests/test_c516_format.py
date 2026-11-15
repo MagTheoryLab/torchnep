@@ -73,6 +73,62 @@ def test_named_format_roundtrip_and_parameter_order(tmp_path,spin):
     np.testing.assert_array_equal(blocks['parameters'][start:start+expected.size],expected)
 
 
+@pytest.mark.parametrize('lmax,order,soc,magnetic',[(2,2,1,100),(4,4,0,236),(4,4,1,173)])
+@torch.random.fork_rng(devices=[])
+def test_extended_spin_shape_roundtrip(tmp_path,lmax,order,soc,magnetic):
+    config,_,_=read_nep_model(DATA/'spin_c516/c3l2s2.nep')
+    config.update(spin_compress=9,spin_l_max=[lmax,0,0],spin_order=order,spin_soc=soc,
+                  n_max_radial=12,n_max_angular=8,basis_size_radial=0,
+                  l_max=[8,2,1],neuron=4)
+    model=NEPModel(config).double()
+    assert model.dim == 103+magnetic
+    path=tmp_path/'extended.nep'
+    model.save_nep_txt(path,128,128)
+    parsed,blocks,_=read_nep_model(path)
+    assert len(blocks['q_scaler']) == model.dim
+    restored=NEPModel(parsed).double()
+    restored.load_weights_from_nep_txt(path)
+    for name,value in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name],value,rtol=0,atol=0)
+    assert NEPCalculator(path).dim == model.dim
+
+
+@pytest.mark.parametrize('cutoffs',[[3.],[3.,4.,6.]])
+@torch.random.fork_rng(devices=[])
+def test_spin_cutoff_lower_boundary_roundtrip(tmp_path,cutoffs):
+    path=tmp_path/'nep.in'
+    path.write_text('type 3 Fe Bi O\nmodel nep_spin\ncutoff 6 5\nspin_cutoff '+
+                    ' '.join(map(str,cutoffs))+'\n')
+    config=parse_nep_in(path)
+    expected=cutoffs*3 if len(cutoffs)==1 else cutoffs
+    assert config['spin_cutoff_by_type'] == expected
+    model=NEPModel(config)
+    path=tmp_path/'cutoff.nep'
+    model.save_nep_txt(path,128,128)
+    assert read_nep_model(path)[0]['spin_cutoff_by_type'] == expected
+    assert NEPCalculator(path).spin_cutoff_by_type == expected
+
+
+@pytest.mark.parametrize('cutoff',[0.,2.999999,1e-100,float('nan'),float('inf'),6.001])
+@pytest.mark.parametrize('position',['uniform','first','last'])
+@torch.random.fork_rng(devices=[])
+def test_spin_cutoff_contract_rejected_at_all_entry_points(tmp_path,cutoff,position):
+    cutoffs={'uniform':[cutoff],'first':[cutoff,6.,6.],'last':[6.,6.,cutoff]}[position]
+    values=' '.join(map(str,cutoffs))
+    path=tmp_path/'nep.in'
+    path.write_text('type 3 Fe Bi O\nmodel nep_spin\ncutoff 6 5\nspin_cutoff '+values+'\n')
+    with pytest.raises(ValueError,match='spin_cutoff'):
+        parse_nep_in(path)
+    config,_,_=read_nep_model(DATA/'spin_c516/c3l2s2.nep')
+    config['spin_cutoff_by_type']=cutoffs
+    with pytest.raises(ValueError,match='spin_cutoff'):
+        NEPModel(config)
+    path=tmp_path/'invalid.nep'
+    path.write_text((DATA/'spin_c516/c3l2s2.nep').read_text().replace('spin_cutoff 6\n','spin_cutoff '+values+'\n'))
+    with pytest.raises(ValueError,match='spin_cutoff'):
+        NEPCalculator(path)
+
+
 @pytest.mark.parametrize('field,value',[('spin_order','1'),('spin_soc','0'),('spin_cutoff','5'),('spin_type','Bi'),('spin_version','2')])
 def test_semantic_mismatch_fails_before_mutation(tmp_path,field,value):
     source=DATA/'spin_c516/c3l2s2.nep'
@@ -99,9 +155,15 @@ def test_ordinary_energy_reference_survives_all_prediction_paths_and_checkpoint(
     config=dict(num_types=2,type_names=['Fe','Ge'],cutoff_radial=6.,cutoff_angular=5.,
                 n_max_radial=2,n_max_angular=2,basis_size_radial=3,basis_size_angular=3,
                 l_max=[2,0,0],neuron=4)
-    model=NEPModel(config).double()
+    # Match the calculator's FP64 constants, rather than upcasting rounded FP32.
+    previous_dtype=torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        model=NEPModel(config)
+        restored=NEPModel(config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
     model.energy_baseline.copy_(torch.tensor([.25,-.5],dtype=torch.float64))
-    restored=NEPModel(config).double()
     restored.load_state_dict(model.state_dict())
     torch.testing.assert_close(restored.energy_baseline,model.energy_baseline,rtol=0,atol=0)
     incomplete=dict(model.state_dict());incomplete.pop('energy_baseline')

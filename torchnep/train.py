@@ -626,19 +626,7 @@ class StreamDataStore:
         depend on how the dataset is batched. ``compile_basis`` may swap in
         a torch.compile'd version of this same method.
         """
-        dr = torch.norm(rij_r, dim=-1)
-        fk_r, fkp_r = ops.chebyshev_basis_and_deriv(dr, self._rc_r, self._bs_r)
-        da = torch.norm(rij_a, dim=-1)
-        fk_a, fkp_a = ops.chebyshev_basis_and_deriv(da, self._rc_a, self._bs_a)
-        dinv_a = 1.0 / da
-        if self._num_lm > 0:
-            blm = ops.angular_basis(
-                rij_a[:, 0] * dinv_a, rij_a[:, 1] * dinv_a,
-                rij_a[:, 2] * dinv_a, self._l3)
-        else:
-            blm = torch.zeros(rij_a.shape[0], 0, dtype=self.dtype,
-                              device=self.device)
-        return fk_r, fkp_r, 1.0 / dr, fk_a, fkp_a, dinv_a, blm
+        return ops.structural_basis(rij_r,rij_a,self._rc_r,self._rc_a,self._bs_r,self._bs_a,self._l3)
 
     def compile_basis(self):
         """torch.compile the per-batch basis compute (~4x fewer kernel
@@ -2310,10 +2298,6 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode == 1 and not use_autograd_forces:
-        use_autograd_forces = True
-        _log(f"  spin_mode {model.spin_mode}: using the full autograd "
-             "E/F/V/MF/Tau path")
     if energy_baseline_values is not None:
         model.set_energy_baseline(torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev))
@@ -2472,6 +2456,9 @@ def train_nep(
             # leaves 3 graph breaks (per-type masks + ZBL autograd.grad) and
             # ~2.7x the kernel launches.
             import functools
+            if raw_model.spin_mode:
+                from .compiled_autograd import apply_compile_patches
+                apply_compile_patches()
             _compiled_core = torch.compile(raw_model._cached_core,
                                            dynamic=True)
             compute_props_cached = functools.partial(

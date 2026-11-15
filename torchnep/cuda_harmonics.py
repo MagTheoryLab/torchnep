@@ -98,3 +98,23 @@ def fused_harmonics(xyz, lmax, structural=False):
     flat = xyz.reshape(-1, 3).contiguous()
     return _Harmonics.apply(flat, *_tables(flat, lmax, structural)).reshape(
         *xyz.shape[:-1], (lmax+1)**2 - int(structural))
+
+
+@torch.no_grad()
+def harmonic_basis_and_derivatives(xyz, lmax, structural=False):
+    """Fixed-input values and Cartesian Jacobian for the training batch cache."""
+    flat = xyz.reshape(-1,3).contiguous()
+    c, powers, offsets = _tables(flat,lmax,structural)
+    if xyz.is_cuda and lmax <= 4 and os.environ.get('TORCHNEP_CUDA_HARMONICS','1') != '0':
+        return _extension().jacobian(flat,c,powers,offsets)
+    columns = torch.repeat_interleave(torch.arange(len(offsets)-1,device=xyz.device),
+                                      offsets[1:]-offsets[:-1])
+    monomials = flat[:,None,:].pow(powers[None,:,:]).prod(-1) * c
+    value = flat.new_zeros(len(flat),len(offsets)-1).index_add(1,columns,monomials)
+    derivatives = []
+    for axis in range(3):
+        exponents = powers.clone()
+        exponents[:,axis] = (exponents[:,axis]-1).clamp_min(0)
+        terms = flat[:,None,:].pow(exponents[None,:,:]).prod(-1) * (c*powers[:,axis])
+        derivatives.append(torch.zeros_like(value).index_add(1,columns,terms))
+    return value, torch.stack(derivatives,-1)

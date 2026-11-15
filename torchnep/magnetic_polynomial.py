@@ -8,7 +8,7 @@ import torch
 
 from . import ops
 from .spin_tables import COUPLINGS, HARMONICS
-from .cuda_harmonics import fused_harmonics
+from .cuda_harmonics import fused_harmonics, harmonic_basis_and_derivatives
 
 
 class MagneticPolynomialDescriptor(torch.nn.Module):
@@ -60,8 +60,6 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             self.sectors.append((key, components, width, self.dim, scalar_column))
             self.dim += spin_compress
             components += width
-        if self.dim > 96:
-            raise ValueError("GPUMD supports at most 96 spin descriptors")
         self.components = components
         self.spin_components = spin_components
         terms, centers = [], []
@@ -99,6 +97,9 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
         self.register_buffer("coupling", torch.tensor([t[5] for t in terms], dtype=torch.float64), persistent=False)
         for i, name in enumerate(("center_spin", "center_output", "center_weight")):
             self.register_buffer(name, torch.tensor([t[i] for t in centers], dtype=torch.long), persistent=False)
+        self.register_buffer("local_spin", torch.tensor(self.local_primitives,dtype=torch.long),persistent=False)
+        self.register_buffer("density_index", self.geometry*spin_components+self.spin,persistent=False)
+        self.register_buffer("center_density_index", self.geometry*spin_components,persistent=False)
         self.radial_mix = torch.nn.Parameter(torch.empty(n_max_angular+1, spin_compress))
         self.weights = torch.nn.Parameter(torch.empty(path, spin_compress))
         self.center_mix = torch.nn.Parameter(torch.empty(len(self.primitives)-1, spin_compress))
@@ -123,22 +124,28 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
 
     def forward(self, rij, pair_i, pair_j, spins, n_atoms, atom_types,
                 c_angular, spin_type_active=None):
+        if n_atoms != spins.shape[0]:
+            raise ValueError('n_atoms must match the number of spin rows')
         if spin_type_active is not None:
             spins = spins * spin_type_active[atom_types].to(spins).unsqueeze(-1)
         phi = self._primitives(spins)
         distance = torch.linalg.vector_norm(rij, dim=-1).clamp_min(1e-12)
         geometry = self._harmonics(rij / distance.unsqueeze(-1))
         basis = ops.chebyshev_basis(distance, self.cutoff_radial, self.basis_size_radial)
+        return self._contract(basis, geometry, phi, pair_i, pair_j, atom_types, c_angular)[0]
+
+    def _contract(self, basis, geometry, phi, pair_i, pair_j, atom_types, c_angular):
+        n_atoms = phi.shape[0]
         angular = ops._type_contraction_mulsum(basis, pair_i, pair_j, atom_types, c_angular)
         radial = angular @ self.radial_mix
         edge = torch.einsum('ec,eg,ep->ecgp', radial, geometry, phi[pair_j])
-        density = spins.new_zeros(n_atoms, self.spin_compress,
+        density = phi.new_zeros(n_atoms, self.spin_compress,
                                  geometry.shape[-1], self.spin_components).index_add(0, pair_i, edge)
         neighbor = density[:, :, self.geometry, self.spin]
         center = density[:, :, self.geometry, 0] * phi[:, self.spin].unsqueeze(1)
         values = torch.where(self.neighbor.bool()[None, None, :], neighbor, center)
         values = values * self.coupling * self.weights[self.path].T.unsqueeze(0)
-        tensors = spins.new_zeros(n_atoms, self.spin_compress, self.components).index_add(2, self.output, values)
+        tensors = phi.new_zeros(n_atoms, self.spin_compress, self.components).index_add(2, self.output, values)
         local = phi[:, self.center_spin].unsqueeze(1) * self.center_mix[self.center_weight].T.unsqueeze(0)
         tensors = tensors.index_add(2, self.center_output, local)
         columns = [phi[:, index:index+1] for index in self.local_primitives]
@@ -147,4 +154,65 @@ class MagneticPolynomialDescriptor(torch.nn.Module):
             if scalar_column is not None:
                 columns.append(sector[:, :, 0])
             columns.append(sector.square().sum(-1) / width)
-        return torch.cat(columns, -1)
+        return torch.cat(columns, -1), (density, tensors, radial)
+
+    @torch.no_grad()
+    def prepare_basis(self, rij, spins, scale, active):
+        """Cache input-only primitives/Jacobians; learned projections stay live."""
+        effective = spins * active[:,None]
+        harmonics, dh = harmonic_basis_and_derivatives(effective,self.spin_l_max)
+        s2 = effective.square().sum(-1,keepdim=True)
+        values, derivatives = [], []
+        for degree, rank, _ in self.primitives:
+            power = (degree-rank)//2
+            h = harmonics[:,rank*rank:(rank+1)**2]
+            derivative = dh[:,rank*rank:(rank+1)**2,:] * (s2**power).unsqueeze(-1)
+            if power:
+                derivative = derivative + h.unsqueeze(-1) * (2*power*s2**(power-1)*effective).unsqueeze(1)
+            values.append(s2**power*h)
+            derivatives.append(derivative*active[:,None,None])
+        phi = torch.cat(values,-1)
+        dphi = torch.cat(derivatives,1)
+        scaled = rij*scale[:,None]
+        norm = scaled.norm(dim=-1)
+        distance = norm.clamp_min(1e-12)
+        hat = scaled/distance[:,None]
+        geometry, dy = harmonic_basis_and_derivatives(hat,self.spin_l_max)
+        live_norm = (norm>=1e-12).to(rij.dtype)
+        dy = (dy - (dy*hat[:,None,:]).sum(-1,keepdim=True)*hat[:,None,:]*live_norm[:,None,None])
+        dy = dy*(scale/distance)[:,None,None]
+        fk, fkp = ops.chebyshev_basis_and_deriv(distance,self.cutoff_radial,self.basis_size_radial)
+        fkp = fkp*(scale*live_norm)[:,None]
+        return dict(phi=phi,dphi=dphi,geometry=geometry,dgeometry=dy,
+                    fk=fk,fkp=fkp,hat=hat)
+
+    def pullback(self, fp, basis, intermediates, pair_i, pair_j, atom_types, c_angular):
+        """Exact chain rule to pair coordinates and spins, differentiable in weights."""
+        density, tensors, radial = intermediates
+        phi, geometry = basis['phi'], basis['geometry']
+        n, c = phi.shape[0], self.spin_compress
+        gt = []
+        for _, offset, width, column, scalar in self.sectors:
+            grad = tensors[:,:,offset:offset+width] * (2./width) * fp[:,column:column+c,None]
+            if scalar is not None:
+                direct = torch.cat((fp[:,scalar:scalar+c,None],grad.new_zeros(n,c,width-1)),-1)
+                grad = grad+direct
+            gt.append(grad)
+        gt = torch.cat(gt,-1)
+        neighbor = self.neighbor.bool()[None,None,:]
+        gv = gt[:,:,self.output]*self.coupling*self.weights[self.path].T.unsqueeze(0)
+        gd = phi.new_zeros(n,c,geometry.shape[-1]*self.spin_components)
+        gd = gd.index_add(2,self.density_index,gv*neighbor)
+        gd = gd.index_add(2,self.center_density_index,gv*(~neighbor)*phi[:,self.spin].unsqueeze(1))
+        gp = torch.zeros_like(phi).index_add(1,self.local_spin,fp[:,:len(self.local_primitives)])
+        gp = gp.index_add(1,self.spin,(gv*(~neighbor)*density[:,:,self.geometry,0]).sum(1))
+        gp = gp.index_add(1,self.center_spin,(gt[:,:,self.center_output]*self.center_mix[self.center_weight].T.unsqueeze(0)).sum(1))
+        edge_pull = gd.reshape(n,c,geometry.shape[-1],self.spin_components)[pair_i]
+        gr = torch.einsum('ecgp,eg,ep->ec',edge_pull,geometry,phi[pair_j])
+        gy = torch.einsum('ecgp,ec,ep->eg',edge_pull,radial,phi[pair_j])
+        gp = gp.index_add(0,pair_j,torch.einsum('ecgp,ec,eg->ep',edge_pull,radial,geometry))
+        radial_prime = ops._type_contraction_mulsum(basis['fkp'],pair_i,pair_j,atom_types,c_angular) @ self.radial_mix
+        dr = (gr*radial_prime).sum(-1,keepdim=True)*basis['hat']
+        dr = dr + (gy.unsqueeze(-1)*basis['dgeometry']).sum(1)
+        ds = (gp.unsqueeze(-1)*basis['dphi']).sum(1)
+        return dr, ds

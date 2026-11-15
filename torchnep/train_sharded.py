@@ -132,6 +132,9 @@ class _NEPDDPShim(nn.Module):
                 # Compile the branch-free core; result assembly stays eager
                 # in the wrapper (see NEPModel._cached_core).
                 import functools
+                if model.spin_mode:
+                    from .compiled_autograd import apply_compile_patches
+                    apply_compile_patches()
                 self._compute_cached = functools.partial(
                     model.compute_properties_cached,
                     core_fn=torch.compile(model._cached_core, dynamic=True))
@@ -987,10 +990,6 @@ def train_nep_sharded(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if model.spin_mode == 1 and not use_autograd_forces:
-        use_autograd_forces = True
-        _log(f"  spin_mode {model.spin_mode}: using the full autograd "
-             "E/F/V/MF/Tau path")
     if energy_baseline_values is not None:
         baseline = torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev

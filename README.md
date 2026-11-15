@@ -121,16 +121,28 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_order` | `2` | Maximum primitive spin polynomial degree (`1`–`4`) |
 | `spin_compress` | `3` | Learned radial channels C (`1`–`9`) |
 | `spin_l_max` | `2` | Maximum tensor rank (`0`–`4`) |
-| `spin_cutoff` | radial cutoff | One positive value or one per element; pair cutoffs are arithmetic means; cannot exceed the structural radial cutoff |
+| `spin_cutoff` | radial cutoff | One value or one per element, each between 3 Å and the structural radial cutoff; pair cutoffs are arithmetic means |
 | `spin_soc` | `1` | Joint lattice/spin rotations (`1`) or independent rotations (`0`) |
 | `spin_type` | all types | Elements with independent spins; excluded types retain geometric environments |
 
 Select `model nep_spin` and `spin_version 1`. The C3/L2/O2 default has 34
-magnetic coordinates with SOC, 31 without SOC. Angular structural coefficients
-are reused at the spin cutoff; `spin_basis_size` follows the angular basis and
+magnetic coordinates with SOC, 31 without SOC.
+All 360 combinations of C=1–9, L=0–4, order=1–4 and SOC=0/1 are supported,
+with at most 236 magnetic coordinates (C9/L4/O4 without SOC). Current c516
+supports up to 339 total coordinates, including its maximum 103 structural
+coordinates. Training inputs and model files both enforce the spin cutoff
+range above; models with magnetic cutoffs below 3 Å are rejected.
+
+Angular structural coefficients are reused at the spin cutoff; `spin_basis_size` follows the angular basis and
 may only repeat that value. All configured primitives train from the first
 epoch. Zero spins retain degree-zero geometric channels. Magnetic scaling is
 `1/max(RMS, range, 1)`, without centering.
+
+Truncation keeps complete tensor representations. SOC preserves joint lattice
+and axial-spin rotations; non-SOC also preserves independent lattice and spin
+rotations. Both preserve spatial inversion and global spin time reversal.
+At L=0, spin dependence reduces to magnitudes; with order=1 there is no spin
+dependence, so magnetic forces and torques are zero.
 
 Ordinary and spin exports use the GPUMD c516 named-block format:
 
@@ -155,12 +167,19 @@ See [the magnetic example and response-data contract](example/oc_spin/README.md)
 and [the complete input](example/oc_spin/nep.in). TorchNEP keeps its PyTorch
 training optimizer; matching the descriptor does not reproduce GPUMD SNES runs.
 
-Spin training uses eager autograd, including second derivatives for force
-losses. Its shared angular-coefficient contraction reuses the one-hot matmul
-backend to avoid contended gradient atomics at low element counts; no additional
-configuration is needed. On CUDA, lattice and spin harmonics through L4 use
-fused polynomial evaluation, VJP and double backward. CPU, higher lattice
-orders and compiled force tracing retain the independent tensor reference.
+Spin training caches input-only basis values and Cartesian derivatives in each
+batch, then projects the scalar ANN's derivatives analytically to forces,
+virial, magnetic forces and torque. All descriptor projections and ANN weights
+remain trainable. Input changes invalidate the batch cache; caches are never
+serialized. GPU training compiles the complete cached core by default, just as
+ordinary NEP does. Compilation adds startup time, so short runs may be slower;
+`use_compile=False` selects the eager cached path, while
+`use_autograd_forces=True` retains raw-coordinate autograd as a reference.
+
+The shared angular-coefficient contraction uses one-hot matmul to avoid
+contended gradient atomics at low element counts. On CUDA, lattice and spin
+harmonics through L4 use fused polynomial evaluation and analytic derivatives.
+CPU, higher lattice orders and compiled force tracing retain the tensor reference.
 
 ### Training hyperparameters
 

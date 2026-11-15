@@ -1171,7 +1171,7 @@ def compute_analytical_forces(
     compute_virial: bool = True,
     backend: str = "loop",
     has_q_123: int = 0, has_q_233: int = 0, has_q_134: int = 0,
-    g_extra_ang=None,
+    g_extra_ang=None, dblm_dhat=None,
 ):
     """Compute forces analytically — no create_graph needed, fully differentiable
     through c2, c3 and NN weights (via Fp).
@@ -1276,8 +1276,9 @@ def compute_analytical_forces(
         y_hat = rij_ang[:, 1] * d12inv_ang
         z_hat = rij_ang[:, 2] * d12inv_ang
         # dblm_dhat depends only on geometry -> no-grad context
-        with torch.no_grad():
-            dblm_dhat = _compute_dblm_dhat(x_hat, y_hat, z_hat, l_max_3b)  # (P, num_lm, 3)
+        if dblm_dhat is None:
+            with torch.no_grad():
+                dblm_dhat = _compute_dblm_dhat(x_hat, y_hat, z_hat, l_max_3b)  # (P, num_lm, 3)
         hat = torch.stack([x_hat, y_hat, z_hat], dim=-1)
 
         w_gn = (w_i * gn_ang.unsqueeze(-1)).sum(dim=1)  # (P, num_lm)
@@ -1415,3 +1416,20 @@ def accumulate_forces_virial(
     _acc(pi_rad, pj_rad, rij_rad, g_rad)
     _acc(pi_ang, pj_ang, rij_ang, g_ang)
     return forces, virial
+
+
+def structural_basis(rij_r,rij_a,rc_r,rc_a,bs_r,bs_a,lmax):
+    """Input-only basis cache shared by ordinary and magnetic training batches."""
+    dr = torch.norm(rij_r, dim=-1)
+    fk_r, fkp_r = chebyshev_basis_and_deriv(dr, rc_r, bs_r)
+    da = torch.norm(rij_a, dim=-1)
+    fk_a, fkp_a = chebyshev_basis_and_deriv(da, rc_a, bs_a)
+    dinv_a = 1.0 / da
+    if lmax*(lmax+2) > 0:
+        blm = angular_basis(
+            rij_a[:, 0] * dinv_a, rij_a[:, 1] * dinv_a,
+            rij_a[:, 2] * dinv_a, lmax)
+    else:
+        blm = torch.zeros(rij_a.shape[0], 0, dtype=rij_r.dtype,
+                          device=rij_r.device)
+    return fk_r, fkp_r, 1.0 / dr, fk_a, fkp_a, dinv_a, blm
