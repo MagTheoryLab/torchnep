@@ -18,6 +18,79 @@ def normalize_spin_cutoff(values, num_types):
     return cutoffs
 
 
+def normalize_spin_wall(values, num_types, active_mask, name):
+    """Normalize spin_wall_high / spin_wall_low into per-type (s, k) lists."""
+    if values is None:
+        return [0.0] * num_types, [0.0] * num_types
+    nums = [float(value) for value in values]
+    if any(not math.isfinite(value) or value < 0.0 for value in nums):
+        raise ValueError(f"{name} values must be finite and non-negative")
+    if len(nums) == 2:
+        s_val, k_val = nums
+        if k_val == 0.0:
+            return [0.0] * num_types, [0.0] * num_types
+        if k_val > 0.0 and s_val <= 0.0:
+            raise ValueError(f"{name} requires positive threshold when stiffness > 0")
+        s_list = [s_val if active else 0.0 for active in active_mask]
+        k_list = [k_val if active else 0.0 for active in active_mask]
+        return s_list, k_list
+    if len(nums) == 2 * num_types:
+        s_list = nums[0::2]
+        k_list = nums[1::2]
+        for idx, (s_val, k_val, active) in enumerate(zip(s_list, k_list, active_mask)):
+            if k_val > 0.0:
+                if not active:
+                    raise ValueError(f"{name} stiffness must be 0 for inactive spin type index {idx}")
+                if s_val <= 0.0:
+                    raise ValueError(f"{name} requires positive threshold when stiffness > 0")
+            else:
+                s_list[idx] = 0.0
+        return s_list, k_list
+    raise ValueError(
+        f"{name} requires 2 values (<s_bound> <k>) or {2 * num_types} values "
+        f"(one <s_bound> <k> pair per element type)"
+    )
+
+
+def compute_spin_wall(spins, atom_types, hi_s, hi_k, lo_s, lo_k):
+    """C^2 smooth one-sided longitudinal spin walls: high (s - s_hi)^3 and
+    dimensionless even-function low (1 - s^2 / s_lo^2)^3.
+
+    Returns (e_wall, mforce_wall) where mforce_wall = -d(e_wall)/d(spins).
+    Purely longitudinal (zero spin torque), zero atomic force and virial,
+    and smooth/finite everywhere including spins == 0.
+    """
+    dtype, device = spins.dtype, spins.device
+    s_hi = hi_s[atom_types].to(dtype=dtype, device=device)
+    k_hi = hi_k[atom_types].to(dtype=dtype, device=device)
+    s_lo = lo_s[atom_types].to(dtype=dtype, device=device)
+    k_lo = lo_k[atom_types].to(dtype=dtype, device=device)
+
+    # Rescale before squaring, and keep sqrt away from zero on the inactive branch.
+    scale = spins.detach().abs().amax(dim=-1)
+    nonzero = scale > 0.0
+    scaled = spins / torch.where(nonzero, scale, 1.0).unsqueeze(-1)
+    root = torch.sqrt(torch.where(nonzero, scaled.square().sum(dim=-1), 1.0))
+    norm = scale * root
+
+    high = (k_hi > 0.0) & (s_hi > 0.0)
+    excess = torch.where(high, torch.relu(norm - s_hi), 0.0)
+    f_hi = (k_hi * excess) * excess
+    e_hi = f_hi * (excess / 3.0)
+    mf_hi = -f_hi.unsqueeze(-1) * (scaled / root.unsqueeze(-1))
+
+    # Only scale the low-side inputs inside the wall, where |S / S_lo| <= 1.
+    low = (k_lo > 0.0) & (s_lo > 0.0) & (norm < s_lo)
+    safe_lo = torch.where(low, s_lo, 1.0)
+    scaled_lo = torch.where(low.unsqueeze(-1), spins, 0.0) / safe_lo.unsqueeze(-1)
+    deficit = torch.where(low, torch.relu(1.0 - scaled_lo.square().sum(dim=-1)), 0.0)
+    f_lo = k_lo * deficit.square()
+    e_lo = (f_lo * (safe_lo / 3.0)) * deficit
+    mf_lo = 2.0 * (f_lo.unsqueeze(-1) * scaled_lo)
+
+    return e_hi + e_lo, mf_hi + mf_lo
+
+
 def normalize_spin_config(config):
     config = dict(config)
     config.setdefault("_explicit", set(config))
@@ -29,13 +102,22 @@ def normalize_spin_config(config):
         raise ValueError("model must be nep or nep_spin")
     config["model"] = kind
     config["spin_mode"] = int(kind == "nep_spin")
-    spin_keys = {"spin_version", "spin_basis_size", "spin_compress", "spin_l_max", "spin_order", "spin_soc", "spin_cutoff", "spin_type"}
+    spin_keys = {
+        "spin_version", "spin_basis_size", "spin_compress", "spin_l_max",
+        "spin_order", "spin_soc", "spin_cutoff", "spin_type",
+        "spin_wall_high", "spin_wall_low",
+    }
     explicit = config.get("_explicit", set(config))
     if not config["spin_mode"]:
         if set(explicit) & spin_keys:
             raise ValueError("spin parameters require model nep_spin")
         config["spin_cutoff"] = [config["cutoff_radial"], config["cutoff_angular"]]
         config["spin_cutoff_by_type"] = [config["cutoff_radial"]]*config["num_types"]
+        zeros = [0.0] * config["num_types"]
+        config["spin_wall_high_s"] = list(zeros)
+        config["spin_wall_high_k"] = list(zeros)
+        config["spin_wall_low_s"] = list(zeros)
+        config["spin_wall_low_k"] = list(zeros)
         return config
     if config.setdefault("spin_version", 1) != 1:
         raise ValueError("only spin_version 1 is supported")
@@ -67,9 +149,43 @@ def normalize_spin_config(config):
     names = config.get("spin_type")
     if names is not None and (not names or len(set(names)) != len(names) or set(names) - set(config["type_names"])):
         raise ValueError("spin_type requires distinct declared element names")
+    active_set = set(config["type_names"] if names is None else names)
+    active_mask = [name in active_set for name in config["type_names"]]
+    hi_s, hi_k = normalize_spin_wall(
+        config.get("spin_wall_high"), config["num_types"], active_mask, "spin_wall_high"
+    )
+    lo_s, lo_k = normalize_spin_wall(
+        config.get("spin_wall_low"), config["num_types"], active_mask, "spin_wall_low"
+    )
+    for idx, (sl, kl, sh, kh) in enumerate(zip(lo_s, lo_k, hi_s, hi_k)):
+        if kl > 0.0 and kh > 0.0 and sl >= sh:
+            raise ValueError(
+                f"spin_wall_low threshold ({sl}) must be strictly less than "
+                f"spin_wall_high threshold ({sh}) for element index {idx}"
+            )
+    config["spin_wall_high_s"] = hi_s
+    config["spin_wall_high_k"] = hi_k
+    config["spin_wall_low_s"] = lo_s
+    config["spin_wall_low_k"] = lo_k
     if config["l_max"][0] < 1:
         raise ValueError("nep_spin requires structural angular descriptors")
     return config
+
+
+def slim_type_config(config, keep):
+    """Slice every per-element spin setting in the same order as the types."""
+    indices = [config["type_names"].index(name) for name in keep]
+    result = dict(config, type_names=keep, num_types=len(keep),
+                  spin_cutoff_by_type=[config["spin_cutoff_by_type"][i] for i in indices])
+    active = config.get("spin_type")
+    if active is not None:
+        result["spin_type"] = [name for name in active if name in keep]
+        if config["spin_mode"] and not result["spin_type"]:
+            raise ValueError("slim_types removed every active spin_type")
+    for key in ("spin_wall_high", "spin_wall_low"):
+        if key in config:
+            result[key] = [config[f"{key}_{field}"][i] for i in indices for field in ("s", "k")]
+    return normalize_spin_config(result)
 
 
 def resolve_gpumd_qscaler(spin_mode, requested):
@@ -126,7 +242,7 @@ def read_nep_model(path):
     spin = fields.get("model") == ["nep_spin"]
     if spin:
         required |= {"spin_version", "spin_basis_size", "spin_l_max", "spin_compress", "spin_cutoff", "spin_order", "spin_soc", "spin_scaler", "energy_reference"}
-    optional = {"zbl", "energy_reference"} | ({"spin_type"} if spin else set())
+    optional = {"zbl", "energy_reference"} | ({"spin_type", "spin_wall_high", "spin_wall_low"} if spin else set())
     if required - fields.keys() or fields.keys() - required - optional:
         raise ValueError("missing or unknown model metadata: " + str(sorted((required-fields.keys()) | (fields.keys()-required-optional))))
     if fields["format_version"] != ['1'] or fields["model"] not in (['nep'], ['nep_spin']):
@@ -139,6 +255,9 @@ def read_nep_model(path):
             widths[key] = (1,)
     if "energy_reference" in fields:
         widths["energy_reference"] = (int(header[1]),)
+    for key in ("spin_wall_high", "spin_wall_low"):
+        if key in fields:
+            widths[key] = (2 * int(header[1]),)
     if any(len(fields[key]) not in sizes for key, sizes in widths.items()):
         raise ValueError("malformed model metadata width")
     if blocks.keys() != {"parameters", "q_scaler"} or (blocks['q_scaler'] <= 0).any():
@@ -158,6 +277,9 @@ def read_nep_model(path):
         config['spin_cutoff'] = list(map(float, fields['spin_cutoff']))
     if 'spin_type' in fields:
         config['spin_type'] = fields['spin_type']
+    for key in ('spin_wall_high', 'spin_wall_low'):
+        if key in fields:
+            config[key] = list(map(float, fields[key]))
     baseline = np.asarray(fields.get('energy_reference', [0]*int(header[1])), dtype=np.float64)
     if not np.isfinite(baseline).all():
         raise ValueError("energy_reference must be finite")
@@ -185,7 +307,9 @@ def load_nep_weights(model, path):
     if model.spin_mode:
         expected.update(spin_version=1, spin_compress=model.spin_compress,
                         spin_l_max=model.spin_l_max, spin_order=model.spin_order,
-                        spin_soc=model.spin_soc, spin_cutoff_by_type=model.spin_cutoff_by_type)
+                        spin_soc=model.spin_soc, spin_cutoff_by_type=model.spin_cutoff_by_type,
+                        spin_wall_high_s=model.spin_wall_high_s, spin_wall_high_k=model.spin_wall_high_k,
+                        spin_wall_low_s=model.spin_wall_low_s, spin_wall_low_k=model.spin_wall_low_k)
         file_types = config.get('spin_type', model.type_names)
         expected_types = [name for i, name in enumerate(model.type_names) if model.spin_dof_type_active[i]]
         if set(file_types) != set(expected_types):
@@ -241,6 +365,12 @@ def save_nep_model(model, path, max_radial, max_angular):
                       f'spin_order {model.spin_order}', f'spin_soc {model.spin_soc}', 'spin_scaler 1',
                       'spin_cutoff ' + ' '.join(map(str, model.spin_cutoff_by_type)),
                       'spin_type ' + ' '.join(name for i, name in enumerate(model.type_names) if model.spin_dof_type_active[i])])
+        if model.has_spin_wall_high:
+            pairs = [v for pair in zip(model.spin_wall_high_s, model.spin_wall_high_k) for v in pair]
+            lines.append('spin_wall_high ' + ' '.join(f'{v:.17g}' for v in pairs))
+        if model.has_spin_wall_low:
+            pairs = [v for pair in zip(model.spin_wall_low_s, model.spin_wall_low_k) for v in pair]
+            lines.append('spin_wall_low ' + ' '.join(f'{v:.17g}' for v in pairs))
     tensors = []
     for net in model.fitting_nets:
         tensors.extend((net.w0.T, net.b0, net.w1))

@@ -18,6 +18,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 from torchnep import train_nep
@@ -244,18 +245,21 @@ def test_two_rank_oc_training_smoke(tmp_path):
     assert "one replicated complete group per ordinary optimizer step" in log
 
 
-def test_two_rank_spin_q_scaler_excludes_padding(tmp_path):
+@pytest.mark.parametrize("streamed", [False, True])
+def test_two_rank_spin_q_scaler_excludes_padding(tmp_path, streamed):
     """The DDP-only duplicate frame must not change spin RMS scaling."""
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
-        import pytest
         pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
 
     config, xyz, _ = _write_case(tmp_path)
+    config.write_text(config.read_text().replace("type 1 Fe", "type 3 O Fe Bi") +
+                      "\nspin_type Fe\nspin_wall_high 0 0 .95 2 0 0\n"
+                      "spin_wall_low 0 0 .5 1 0 0\n")
     single = tmp_path / "single-spin"
     train_nep(
         str(config), str(xyz), output_dir=str(single), device="cpu",
         precision="float64", restart=False, prediction_interval=0,
-        run_seed=7,
+        run_seed=7, slim_types=True,
     )
 
     sharded = tmp_path / "sharded-spin"
@@ -263,10 +267,13 @@ def test_two_rank_spin_q_scaler_excludes_padding(tmp_path):
     driver.write_text(
         "import sys\n"
         "from torchnep import train_nep_sharded\n"
+        "if sys.argv[4] == 'streamed':\n"
+        "    from importlib import import_module\n"
+        "    import_module('torchnep.train_sharded')._STREAM_THRESHOLD = 0\n"
         "train_nep_sharded(\n"
         "    sys.argv[1], sys.argv[2], output_dir=sys.argv[3],\n"
         "    precision='float64', restart=False, prediction_interval=0,\n"
-        "    run_seed=7,\n"
+        "    run_seed=7, slim_types=True,\n"
         ")\n"
     )
     env = os.environ.copy()
@@ -285,16 +292,17 @@ def test_two_rank_spin_q_scaler_excludes_padding(tmp_path):
             "--nnodes=1", "--node_rank=0", "--nproc_per_node=2",
             "--master_addr=127.0.0.1", f"--master_port={master_port}",
             str(driver), str(config), str(xyz), str(sharded),
+            "streamed" if streamed else "ordinary",
         ],
         cwd=tmp_path, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=120,
     )
     assert completed.returncode == 0, completed.stdout
 
-    q_single = NEPCalculator(
-        single / "nep_final.txt", dtype=torch.float64
-    ).q_scaler
-    q_sharded = NEPCalculator(
-        sharded / "nep_final.txt", dtype=torch.float64
-    ).q_scaler
-    torch.testing.assert_close(q_sharded, q_single, rtol=2.0e-13, atol=2.0e-13)
+    calc_single = NEPCalculator(single / "nep_final.txt", dtype=torch.float64)
+    calc_sharded = NEPCalculator(sharded / "nep_final.txt", dtype=torch.float64)
+    torch.testing.assert_close(calc_sharded.q_scaler, calc_single.q_scaler, rtol=2e-13, atol=2e-13)
+    for calc in (calc_single, calc_sharded):
+        assert calc.type_names == ["Fe"]
+        assert calc.spin_wall_high_s == [.95] and calc.spin_wall_high_k == [2.0]
+        assert calc.spin_wall_low_s == [.5] and calc.spin_wall_low_k == [1.0]

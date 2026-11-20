@@ -11,7 +11,7 @@ A pure PyTorch implementation of the [NEP4](https://gpumd.org/theory/nep.html) (
 
 ## ✨ Features
 
-- 🔄 **GPUMD-compatible** — output `nep.txt` files load directly into GPUMD for MD simulation
+- 🔄 **GPUMD-compatible** — standard c516 exports load directly into GPUMD for MD simulation
 - 🎯 **Two-stage training** — Stage 1: force-focused; Stage 2: energy-focused
 - 🖥️ **Multi-GPU training** — distributed data parallel (DDP) on one node or multiple nodes
 - ⚡ **Fast on NVIDIA and AMD** — `torch.compile` support with automatic backend selection, tuned on both CUDA and ROCm GPUs
@@ -124,6 +124,13 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 | `spin_cutoff` | radial cutoff | One value or one per element, each between 3 Å and the structural radial cutoff; pair cutoffs are arithmetic means |
 | `spin_soc` | `1` | Joint lattice/spin rotations (`1`) or independent rotations (`0`) |
 | `spin_type` | all types | Elements with independent spins; excluded types retain geometric environments |
+| `spin_wall_high` | off | Longitudinal upper wall. Threshold in μB, stiffness in eV/μB³ |
+| `spin_wall_low` | off | Longitudinal lower wall. Threshold in μB, stiffness in eV/μB |
+
+Each wall accepts one `threshold stiffness` pair for all spin-active elements
+or one pair per element in the `type` order. Zero stiffness disables that wall.
+Exports with an enabled wall carry TorchNEP metadata that current GPUMD c516
+does not read. Existing c516 files without wall metadata load with both walls off.
 
 Select `model nep_spin` and `spin_version 1`. The C3/L2/O2 default has 34
 magnetic coordinates with SOC, 31 without SOC.
@@ -141,8 +148,8 @@ epoch. Zero spins retain degree-zero geometric channels. Magnetic scaling is
 Truncation keeps complete tensor representations. SOC preserves joint lattice
 and axial-spin rotations; non-SOC also preserves independent lattice and spin
 rotations. Both preserve spatial inversion and global spin time reversal.
-At L=0, spin dependence reduces to magnitudes; with order=1 there is no spin
-dependence, so magnetic forces and torques are zero.
+At L=0, spin dependence reduces to magnitudes; with order=1 the ANN has no spin
+dependence.
 
 Ordinary and spin exports use the GPUMD c516 named-block format:
 
@@ -464,6 +471,12 @@ result = calc.compute(
 print(result["mforces"])  # -dE/dS
 print(result["tau"])      # S x mforce
 ```
+
+To add a wall at inference to an existing c516 spin potential, use
+`NEPCalculator("nep.txt", spin_wall_high=(6.12, 0.45))`. The ASE `NEP`
+calculator accepts the same keywords. An omitted keyword uses the value in
+the file, and `(0, 0)` disables that wall. The override applies to that
+calculator instance without rewriting the model file.
 
 ### ASE calculator
 

@@ -30,7 +30,8 @@ from .constants import (
 )
 from . import ops
 from .spin_schema import (normalize_spin_config, spin_projection_parameters,
-                          read_nep_model, load_nep_weights, save_nep_model)
+                          read_nep_model, load_nep_weights, save_nep_model,
+                          compute_spin_wall)
 from .magnetic_polynomial import MagneticPolynomialDescriptor
 
 
@@ -113,6 +114,8 @@ class NEPModel(nn.Module):
         active = torch.tensor([name in config.get("spin_type", self.type_names)
                                for name in self.type_names], dtype=torch.bool)
         self.register_buffer("spin_dof_type_active", active if self.spin_mode else None)
+
+        self._set_spin_walls(config)
 
         # q_123 / q_233 (extra 4-body bispectrum) need L=3 moments.
         if (self.has_q_123 or self.has_q_233) and self.l_max_3b < 3:
@@ -241,6 +244,17 @@ class NEPModel(nn.Module):
         self.register_buffer("_c5b", torch.tensor(C5B))
         self.register_buffer("_c4b2", torch.tensor(C4B2))
 
+    def _set_spin_walls(self, config, *, dtype=torch.float64, device=None):
+        for key in ("spin_wall_high", "spin_wall_low"):
+            for suffix in ("s", "k"):
+                name = f"{key}_{suffix}"
+                values = list(config[name])
+                setattr(self, name, values)
+                self.register_buffer(f"_{name}", torch.tensor(values, dtype=dtype, device=device),
+                                     persistent=False)
+            setattr(self, f"has_{key}", any(k > 0.0 for k in config[f"{key}_k"]))
+        self.has_spin_wall = self.has_spin_wall_high or self.has_spin_wall_low
+
     def architecture_signature(self):
         """Return the semantic architecture contract for binary checkpoints."""
         signature = {
@@ -281,8 +295,17 @@ class NEPModel(nn.Module):
                     name for index, name in enumerate(self.type_names)
                     if bool(self.spin_dof_type_active[index].item())
                 ],
-
             }
+            if self.has_spin_wall_high:
+                signature["spin"]["wall_high"] = [
+                    v for pair in zip(self.spin_wall_high_s, self.spin_wall_high_k)
+                    for v in pair
+                ]
+            if self.has_spin_wall_low:
+                signature["spin"]["wall_low"] = [
+                    v for pair in zip(self.spin_wall_low_s, self.spin_wall_low_k)
+                    for v in pair
+                ]
         return signature
 
     @torch.no_grad()
@@ -427,6 +450,14 @@ class NEPModel(nn.Module):
                           pi_ang, pj_ang, atom_types, N,
                           backend=backend, spins=spins,
                           rij_spin=rij_spin, pi_spin=pi_spin, pj_spin=pj_spin)
+
+        if self.has_spin_wall:
+            e_wall, _ = compute_spin_wall(
+                spins, atom_types,
+                self._spin_wall_high_s, self._spin_wall_high_k,
+                self._spin_wall_low_s, self._spin_wall_low_k,
+            )
+            Ei = Ei + e_wall
 
         if self.zbl is not None:
             Ei = Ei + ops.compute_zbl(
@@ -732,6 +763,15 @@ class NEPModel(nn.Module):
                     virial = virial+v
             if need_mforce:
                 mforces = -gs
+        if self.has_spin_wall:
+            e_wall, mf_wall = compute_spin_wall(
+                batch['spins'], types,
+                self._spin_wall_high_s, self._spin_wall_high_k,
+                self._spin_wall_low_s, self._spin_wall_low_k,
+            )
+            ei = ei + e_wall
+            if need_mforce:
+                mforces = mforces + mf_wall
         return ei,forces,virial,mforces
 
     def compute_properties_cached(self, batch, need_forces=True, need_virial=False,
@@ -902,6 +942,16 @@ def slim_model(model: NEPModel, keep_type_names: List[str]) -> NEPModel:
             "spin_type": [model.type_names[index] for index in keep_idx
                           if bool(model.spin_dof_type_active[index].item())],
         })
+        if model.has_spin_wall_high:
+            new_config["spin_wall_high"] = [
+                v for index in keep_idx
+                for v in (model.spin_wall_high_s[index], model.spin_wall_high_k[index])
+            ]
+        if model.has_spin_wall_low:
+            new_config["spin_wall_low"] = [
+                v for index in keep_idx
+                for v in (model.spin_wall_low_s[index], model.spin_wall_low_k[index])
+            ]
 
     dev = model.b1.device
     dtype = model.b1.dtype

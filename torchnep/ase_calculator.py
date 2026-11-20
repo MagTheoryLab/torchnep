@@ -72,6 +72,8 @@ class NEP(Calculator):
         round-off, ``"float32"`` is faster.
     device : str or torch.device
         Torch device, e.g. ``"cpu"`` (default) or ``"cuda"``.
+    spin_wall_high, spin_wall_low : sequence of float, optional
+        Inference-only threshold/stiffness overrides, passed to NEPCalculator.
     **kwargs
         Forwarded to ``ase.calculators.calculator.Calculator`` (e.g. ``label``).
 
@@ -89,10 +91,12 @@ class NEP(Calculator):
     ]
 
     def __init__(self, model_file, dtype="float64", device="cpu",
-                 tiled="auto", block_size="auto", compile=False, **kwargs):
+                 tiled="auto", block_size="auto", compile=False, *,
+                 spin_wall_high=None, spin_wall_low=None, **kwargs):
         super().__init__(**kwargs)
         self.nep = _NEPCore(model_file, dtype=_resolve_dtype(dtype),
-                            device=device)
+                            device=device, spin_wall_high=spin_wall_high,
+                            spin_wall_low=spin_wall_low)
         # tiled: memory-bounded analytical inference for large cells.
         #   True   -> always tile;  False -> never (autograd path);
         #   "auto" -> tile once the system exceeds ``tiled_threshold`` atoms.

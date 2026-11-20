@@ -184,6 +184,14 @@ def test_spin_zbl_component_split_sums_to_total(tmp_path):
                   - comp["total"]["stress"]).max() < 1e-12
     assert abs(comp["zbl"]["energy"]) > 1e-6
 
+    mforces = atoms.calc.get_magnetic_forces(atoms)
+    atoms.calc = NEP(path, spin_wall_high=(1.75, 2.0))
+    walled = atoms.calc.get_components(atoms)
+    assert walled["total"]["energy"] - comp["total"]["energy"] == pytest.approx(2.0 / 3 * .25**3)
+    expected = np.zeros((3, 3))
+    expected[0, 2] = -2.0 * .25**2
+    np.testing.assert_allclose(atoms.calc.get_magnetic_forces(atoms) - mforces, expected, atol=1e-12)
+
 
 def test_non_periodic_has_no_stress():
     # A small isolated cluster (no cell / no pbc): energy & forces, no stress.

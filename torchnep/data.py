@@ -460,6 +460,10 @@ def parse_nep_in(filename: str) -> Dict:
                 if len(parts) < 2:
                     raise ValueError("spin_cutoff requires at least one value")
                 params["spin_cutoff"] = [float(value) for value in parts[1:]]
+            elif key in ("spin_wall_high", "spin_wall_low"):
+                if len(parts) < 3:
+                    raise ValueError(f"{key} requires at least two values (<s_bound> <k>)")
+                params[key] = [float(value) for value in parts[1:]]
             elif key == "spin_type":
                 params[key] = parts[1:]
             elif key.startswith("spin_"):

@@ -51,7 +51,7 @@ from . import ops
 from . import __version__
 from .predict import predict_from_store_sharded
 from .model import slim_model
-from .spin_schema import resolve_gpumd_qscaler
+from .spin_schema import resolve_gpumd_qscaler, slim_type_config
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
@@ -652,16 +652,7 @@ def train_nep_sharded(
                        if t not in keep]
             if removed:
                 _slim_keep = keep
-                config = dict(orig_config)
-                config["type_names"] = keep
-                config["num_types"] = len(keep)
-                config["spin_cutoff_by_type"] = [orig_config["spin_cutoff_by_type"][orig_config["type_names"].index(name)] for name in keep]
-                if config.get("spin_type") is not None:
-                    config["spin_type"] = [name for name in config["spin_type"] if name in keep]
-                if (config.get("spin_mode", 0)
-                        and config.get("spin_type") == []):
-                    raise ValueError(
-                        "slim_types removed every active spin_type")
+                config = slim_type_config(orig_config, keep)
                 _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                      f"(removing: {removed})")
             else:
@@ -769,16 +760,7 @@ def train_nep_sharded(
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
             _slim_keep = keep
-            config = dict(orig_config)
-            config["type_names"] = keep
-            config["num_types"] = len(keep)
-            config["spin_cutoff_by_type"] = [orig_config["spin_cutoff_by_type"][orig_config["type_names"].index(name)] for name in keep]
-            if config.get("spin_type") is not None:
-                config["spin_type"] = [name for name in config["spin_type"] if name in keep]
-            if (config.get("spin_mode", 0)
-                    and config.get("spin_type") == []):
-                raise ValueError(
-                    "slim_types removed every active spin_type")
+            config = slim_type_config(orig_config, keep)
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:

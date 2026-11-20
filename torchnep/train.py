@@ -50,7 +50,7 @@ from .data import (read_xyz, parse_nep_in, valid_split_indices,
 from . import ops
 from . import __version__
 from .predict import predict_from_store
-from .spin_schema import resolve_gpumd_qscaler
+from .spin_schema import resolve_gpumd_qscaler, slim_type_config
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
@@ -201,6 +201,12 @@ def format_config_summary(config: dict) -> List[str]:
         spin_cutoff_text = " ".join(str(value) for value in spin_cutoffs)
         lines.append(f"  {tag('spin_cutoff'):10}  spin_cutoff "
                      f"{spin_cutoff_text}")
+        for wall_key in ("spin_wall_high", "spin_wall_low"):
+            wall_k = config.get(f"{wall_key}_k", [])
+            if any(k > 0.0 for k in wall_k):
+                wall_s = config[f"{wall_key}_s"]
+                pairs = " ".join(f"{s:g} {k:g}" for s, k in zip(wall_s, wall_k))
+                lines.append(f"  {tag(wall_key):10}  {wall_key} {pairs}")
 
     lines.append("")
     lines.append("Training schedule (Stage 1)")
@@ -2209,16 +2215,7 @@ def train_nep(
         removed = [t for t in orig_config["type_names"] if t not in keep]
         if removed:
             _slim_keep = keep
-            config = dict(orig_config)
-            config["type_names"] = keep
-            config["num_types"] = len(keep)
-            config["spin_cutoff_by_type"] = [orig_config["spin_cutoff_by_type"][orig_config["type_names"].index(name)] for name in keep]
-            if config.get("spin_type") is not None:
-                config["spin_type"] = [name for name in config["spin_type"] if name in keep]
-            if (config.get("spin_mode", 0)
-                    and config.get("spin_type") == []):
-                raise ValueError(
-                    "slim_types removed every active spin_type")
+            config = slim_type_config(orig_config, keep)
             _log(f"  slim_types: {orig_config['type_names']} -> {keep} "
                  f"(removing: {removed})")
         else:

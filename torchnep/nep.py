@@ -88,21 +88,32 @@ class NEPCalculator:
         Precision (default: float64 for accuracy).
     device : str or torch.device
         Compute device (default: 'cpu').
+    spin_wall_high, spin_wall_low : sequence of float, optional
+        Inference-only wall overrides as a threshold/stiffness pair or one
+        pair per element. Use `(0, 0)` to disable a wall stored in the file.
     """
 
-    def __init__(self, model_file: str, dtype=torch.float64, device="cpu"):
+    def __init__(self, model_file: str, dtype=torch.float64, device="cpu", *,
+                 spin_wall_high=None, spin_wall_low=None):
         self.dtype = dtype
         self.device = torch.device(device)
-        self._load_model(model_file)
+        overrides = {key: value for key, value in (
+            ("spin_wall_high", spin_wall_high), ("spin_wall_low", spin_wall_low))
+            if value is not None}
+        self._load_model(model_file, overrides)
 
-    def _load_model(self, path):
+    def _load_model(self, path, wall_overrides):
         from .model import NEPModel
-        from .spin_schema import read_nep_model
+        from .spin_schema import normalize_spin_config, read_nep_model
         config, _, _ = read_nep_model(path)
         # Reading a potential must not consume the caller's training RNG.
         with torch.random.fork_rng(devices=[]):
             model = NEPModel(config).to(dtype=self.dtype, device=self.device)
         model.load_weights_from_nep_txt(path)
+        if wall_overrides:
+            config.update(wall_overrides)
+            config["_explicit"] = config["_explicit"] | wall_overrides.keys()
+            model._set_spin_walls(normalize_spin_config(config), dtype=self.dtype, device=self.device)
         model.requires_grad_(False)
         names = ("num_types", "type_names", "rc_radial", "rc_angular", "n_max_radial", "n_max_angular",
                  "basis_size_radial", "basis_size_angular", "num_neurons", "l_max_3b", "has_q_222",
@@ -111,6 +122,9 @@ class NEPCalculator:
                  "dim_angular_233", "dim_angular_134", "struct_dim", "dim", "num_lm", "spin_mode", "spin_version",
                  "spin_order", "spin_soc", "spin_compress", "spin_basis_size", "spin_l_max", "spin_cutoff",
                  "spin_cutoff_by_type", "spin_cutoff_pair", "spin_has_typewise_cutoff", "spin_dof_type_active",
+                 "spin_wall_high_s", "spin_wall_high_k", "spin_wall_low_s", "spin_wall_low_k",
+                 "has_spin_wall_high", "has_spin_wall_low", "has_spin_wall",
+                 "_spin_wall_high_s", "_spin_wall_high_k", "_spin_wall_low_s", "_spin_wall_low_k",
                  "spin_descriptor", "spin_dim", "energy_baseline", "q_scaler", "_c3b", "_c4b", "_c5b", "_c4b2")
         for name in names:
             setattr(self, name, getattr(model, name))
@@ -169,7 +183,7 @@ class NEPCalculator:
         compute_descriptor : bool
             Also return scaled descriptors.
         return_components : bool
-            Also split the result into the NEP (neural-network) part and the
+            Also split the result into the NEP part (including any spin wall) and the
             ZBL repulsive part.  Adds ``energy_nep / forces_nep / virial_nep``
             and ``energy_zbl / forces_zbl / virial_zbl`` to the output; the
             plain ``energy / forces / virial`` keys remain the NEP+ZBL total
@@ -259,6 +273,14 @@ class NEPCalculator:
                                self.w0, self.b0, self.w1, self.b1,
                                self.dtype, self.device)
         Ei_nep = Ei_nep + self.energy_baseline[atom_types]
+        if self.has_spin_wall:
+            from .spin_schema import compute_spin_wall
+            e_wall, _ = compute_spin_wall(
+                spin_tensor, atom_types,
+                self._spin_wall_high_s, self._spin_wall_high_k,
+                self._spin_wall_low_s, self._spin_wall_low_k,
+            )
+            Ei_nep = Ei_nep + e_wall
 
         # ZBL repulsive correction (depends only on angular pairs)
         Ei_zbl = None
@@ -318,7 +340,7 @@ class NEPCalculator:
         else:
             if Ei_zbl is None:
                 # No ZBL: NEP == total; ZBL part is identically zero.
-                f_nep, v_nep = _force_virial(Ei_nep.sum(), retain_graph=False)
+                f_nep, v_nep = _force_virial(Ei_nep.sum(), retain_graph=self.spin_mode)
                 f_zbl = torch.zeros_like(f_nep)
                 v_zbl = torch.zeros_like(v_nep)
                 e_zbl = torch.zeros_like(Ei_nep)
@@ -516,6 +538,14 @@ class NEPCalculator:
                 q_scaled, batch["atom_types"], self.num_types,
                 self.w0, self.b0, self.w1, self.b1, dtype, device)
             Ei = Ei + self.energy_baseline[batch["atom_types"]]
+            if self.has_spin_wall:
+                from .spin_schema import compute_spin_wall
+                e_wall, _ = compute_spin_wall(
+                    spins, batch["atom_types"],
+                    self._spin_wall_high_s, self._spin_wall_high_k,
+                    self._spin_wall_low_s, self._spin_wall_low_k,
+                )
+                Ei = Ei + e_wall
             if self.has_zbl:
                 Ei = Ei + ops.compute_zbl(
                     batch["atom_types"], batch["pair_i_ang"],
