@@ -461,9 +461,18 @@ def parse_nep_in(filename: str) -> Dict:
                     raise ValueError("spin_cutoff requires at least one value")
                 params["spin_cutoff"] = [float(value) for value in parts[1:]]
             elif key in ("spin_wall_high", "spin_wall_low"):
-                if len(parts) < 3:
-                    raise ValueError(f"{key} requires at least two values (<s_bound> <k>)")
-                params[key] = [float(value) for value in parts[1:]]
+                if len(parts) == 4 and parts[1].lower() == "auto":
+                    margin, stiffness = float(parts[2]), float(parts[3])
+                    if (not (np.isfinite(margin) and np.isfinite(stiffness))
+                            or margin < 0.0 or stiffness < 0.0):
+                        raise ValueError(
+                            f"{key} auto requires finite non-negative <margin> <k>")
+                    params[key] = ("auto", margin, stiffness)
+                elif len(parts) >= 3:
+                    params[key] = [float(value) for value in parts[1:]]
+                else:
+                    raise ValueError(
+                        f"{key} requires <s_bound> <k>, auto <margin> <k>, or 2*num_types values")
             elif key == "spin_type":
                 params[key] = parts[1:]
             elif key.startswith("spin_"):

@@ -246,6 +246,8 @@ class NEPModel(nn.Module):
 
     def _set_spin_walls(self, config, *, dtype=torch.float64, device=None):
         for key in ("spin_wall_high", "spin_wall_low"):
+            if config.get(f"{key}_auto") is not None:
+                raise ValueError(f"{key} auto requires training data; resolve it before loading a model")
             for suffix in ("s", "k"):
                 name = f"{key}_{suffix}"
                 values = list(config[name])

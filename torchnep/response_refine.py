@@ -16,6 +16,7 @@ import torch
 
 from .data import parse_nep_in, read_xyz
 from .model import NEPModel
+from .spin_schema import resolve_auto_spin_walls
 from .response_training import (GENERATOR_CURVE_SCHEMA, configure_response_store,
                                 response_residual)
 
@@ -222,6 +223,7 @@ def refine_response(config_file, data_file, model_file, *, output_dir,
             raise ValueError("Refinement requires complete E/F/spin/MF labels; virial is optional")
         if not all(np.isfinite(np.asarray(f[k])).all() for k in ("energy", "forces", "spins", "mforces")):
             raise ValueError("Refinement requires finite E/F/spin/MF labels")
+    cfg = resolve_auto_spin_walls(cfg, frames)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     def make_store(data):
         structures = preprocess_structures(data, cfg, np.float64)

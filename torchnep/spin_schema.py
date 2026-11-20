@@ -18,9 +18,20 @@ def normalize_spin_cutoff(values, num_types):
     return cutoffs
 
 
+def _parse_auto_spin_wall(values, name):
+    if (isinstance(values, (list, tuple)) and len(values) == 3
+            and isinstance(values[0], str) and values[0].lower() == "auto"):
+        margin, stiffness = float(values[1]), float(values[2])
+        if (not (math.isfinite(margin) and math.isfinite(stiffness))
+                or margin < 0.0 or stiffness < 0.0):
+            raise ValueError(f"{name} auto requires finite non-negative <margin> <k>")
+        return (margin, stiffness)
+    return None
+
+
 def normalize_spin_wall(values, num_types, active_mask, name):
     """Normalize spin_wall_high / spin_wall_low into per-type (s, k) lists."""
-    if values is None:
+    if values is None or _parse_auto_spin_wall(values, name) is not None:
         return [0.0] * num_types, [0.0] * num_types
     nums = [float(value) for value in values]
     if any(not math.isfinite(value) or value < 0.0 for value in nums):
@@ -118,6 +129,8 @@ def normalize_spin_config(config):
         config["spin_wall_high_k"] = list(zeros)
         config["spin_wall_low_s"] = list(zeros)
         config["spin_wall_low_k"] = list(zeros)
+        config["spin_wall_high_auto"] = None
+        config["spin_wall_low_auto"] = None
         return config
     if config.setdefault("spin_version", 1) != 1:
         raise ValueError("only spin_version 1 is supported")
@@ -151,6 +164,12 @@ def normalize_spin_config(config):
         raise ValueError("spin_type requires distinct declared element names")
     active_set = set(config["type_names"] if names is None else names)
     active_mask = [name in active_set for name in config["type_names"]]
+    config["spin_wall_high_auto"] = _parse_auto_spin_wall(
+        config.get("spin_wall_high"), "spin_wall_high"
+    )
+    config["spin_wall_low_auto"] = _parse_auto_spin_wall(
+        config.get("spin_wall_low"), "spin_wall_low"
+    )
     hi_s, hi_k = normalize_spin_wall(
         config.get("spin_wall_high"), config["num_types"], active_mask, "spin_wall_high"
     )
@@ -172,6 +191,57 @@ def normalize_spin_config(config):
     return config
 
 
+def resolve_auto_spin_walls(config, frames, *, reduce_device=None):
+    """Resolve auto walls from training frames, optionally across DDP shards."""
+    hi_auto = config.get("spin_wall_high_auto")
+    lo_auto = config.get("spin_wall_low_auto")
+    if not config.get("spin_mode", 0) or (hi_auto is None and lo_auto is None):
+        return config
+    config = dict(config)
+    type_names = config["type_names"]
+    num_types = config["num_types"]
+    type_index = {name: i for i, name in enumerate(type_names)}
+    active_names = set(type_names if config.get("spin_type") is None else config["spin_type"])
+    active_mask = [name in active_names for name in type_names]
+
+    s_min = [float("inf")] * num_types
+    s_max = [float("-inf")] * num_types
+    for frame in frames:
+        spins = np.asarray(frame["spins"], dtype=np.float64)
+        norms = np.linalg.norm(spins, axis=-1)
+        for sp, m in zip(frame["species"], norms):
+            idx = type_index.get(sp)
+            if idx is not None and active_mask[idx]:
+                val = float(m)
+                if val < s_min[idx]:
+                    s_min[idx] = val
+                if val > s_max[idx]:
+                    s_max[idx] = val
+
+    if reduce_device is not None:
+        # Negate minima so both extrema fit in one MAX collective.
+        stats = torch.tensor([[-value for value in s_min], s_max],
+                             dtype=torch.float64, device=reduce_device)
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+        neg_min, s_max = stats.tolist()
+        s_min = [-value for value in neg_min]
+
+    for key, auto, extrema, sign in (
+        ("spin_wall_high", hi_auto, s_max, 1),
+        ("spin_wall_low", lo_auto, s_min, -1),
+    ):
+        if auto is None:
+            continue
+        margin, stiffness = auto
+        pairs = []
+        for observed in extrema:
+            bound = observed + sign * margin
+            pairs.extend((bound, stiffness) if math.isfinite(observed)
+                         and bound > 0.0 and stiffness > 0.0 else (0.0, 0.0))
+        config[key] = pairs
+    return normalize_spin_config(config)
+
+
 def slim_type_config(config, keep):
     """Slice every per-element spin setting in the same order as the types."""
     indices = [config["type_names"].index(name) for name in keep]
@@ -183,7 +253,7 @@ def slim_type_config(config, keep):
         if config["spin_mode"] and not result["spin_type"]:
             raise ValueError("slim_types removed every active spin_type")
     for key in ("spin_wall_high", "spin_wall_low"):
-        if key in config:
+        if key in config and config.get(f"{key}_auto") is None:
             result[key] = [config[f"{key}_{field}"][i] for i in indices for field in ("s", "k")]
     return normalize_spin_config(result)
 

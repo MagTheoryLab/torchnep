@@ -50,7 +50,7 @@ from .data import (read_xyz, parse_nep_in, valid_split_indices,
 from . import ops
 from . import __version__
 from .predict import predict_from_store
-from .spin_schema import resolve_gpumd_qscaler, slim_type_config
+from .spin_schema import resolve_gpumd_qscaler, resolve_auto_spin_walls, slim_type_config
 from .response_training import (
     GENERATOR_CURVE_HUBER_DELTA,
     GENERATOR_CURVE_MEAN_WEIGHT,
@@ -202,8 +202,11 @@ def format_config_summary(config: dict) -> List[str]:
         lines.append(f"  {tag('spin_cutoff'):10}  spin_cutoff "
                      f"{spin_cutoff_text}")
         for wall_key in ("spin_wall_high", "spin_wall_low"):
+            wall_auto = config.get(f"{wall_key}_auto")
             wall_k = config.get(f"{wall_key}_k", [])
-            if any(k > 0.0 for k in wall_k):
+            if wall_auto is not None:
+                lines.append(f"  {tag(wall_key):10}  {wall_key} auto {wall_auto[0]:g} {wall_auto[1]:g}")
+            elif any(k > 0.0 for k in wall_k):
                 wall_s = config[f"{wall_key}_s"]
                 pairs = " ".join(f"{s:g} {k:g}" for s, k in zip(wall_s, wall_k))
                 lines.append(f"  {tag(wall_key):10}  {wall_key} {pairs}")
@@ -267,6 +270,17 @@ def format_config_summary(config: dict) -> List[str]:
     return lines
 
 
+def resolve_training_spin_walls(config, frames, log, *, reduce_device=None):
+    resolved = resolve_auto_spin_walls(config, frames, reduce_device=reduce_device)
+    for key in ("spin_wall_high", "spin_wall_low"):
+        if config.get(f"{key}_auto") is not None:
+            pairs = " ".join(
+                f"{name}:{s:.8g}(k={k:g})"
+                for name, s, k in zip(resolved["type_names"],
+                                      resolved[f"{key}_s"], resolved[f"{key}_k"])
+            )
+            log(f"  resolved {key}: {pairs}")
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -2201,6 +2215,7 @@ def train_nep(
     # torch.compile dislikes the wider spread of input shapes that sorting
     # produces).
     n_structs = len(frames)
+    orig_config = config = resolve_training_spin_walls(config, frames, _log)
 
     # slim_types: detect which element types actually appear in the data and
     # narrow config before building neighbor lists / data store / model.

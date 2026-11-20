@@ -129,6 +129,12 @@ The `Properties=...` schema declares column layout. TorchNEP recognizes:
 
 Each wall accepts one `threshold stiffness` pair for all spin-active elements
 or one pair per element in the `type` order. Zero stiffness disables that wall.
+The training input also accepts `spin_wall_high auto 0.5 2.0`. At the start of a
+run, the trainer sets each spin-active element's threshold to its maximum
+training moment plus 0.5 μB. A low wall with `auto` subtracts the margin from
+the training minimum and is disabled when the result is nonpositive.
+The calculation uses the training split, including all training shards in DDP.
+Exported thresholds are numeric.
 Exports with an enabled wall carry TorchNEP metadata that current GPUMD c516
 does not read. Existing c516 files without wall metadata load with both walls off.
 

@@ -10,7 +10,7 @@ import torch
 from torchnep.data import parse_nep_in
 from torchnep.model import NEPModel, slim_model
 from torchnep.nep import NEPCalculator
-from torchnep.spin_schema import compute_spin_wall
+from torchnep.spin_schema import compute_spin_wall, read_nep_model
 from torchnep.train import StreamDataStore, preprocess_structures
 
 
@@ -285,6 +285,8 @@ def test_spin_wall_model_cached_autograd_calculator_parity_and_roundtrip(tmp_pat
     torch.testing.assert_close(bare_res["mforces"], res_base["mforces"])
     overlay = NEPCalculator(base_txt, dtype=DTYPE, spin_wall_high=(5.0, 2.5), spin_wall_low=(2.0, 1.2))
     calc = NEPCalculator(wall_txt, dtype=DTYPE)
+    with pytest.raises(ValueError, match="spin_wall_high auto requires training data"):
+        NEPCalculator(wall_txt, spin_wall_high=("auto", 0.5, 2.0))
     calc_res = calc.compute(*args, spins=frame["spins"], return_components=True)
     calc_batch = calc.compute_batch(batch)
     torch.testing.assert_close(calc_res["energy"], res_cached["Ei"], rtol=1e-11, atol=1e-11)
@@ -304,3 +306,55 @@ def test_spin_wall_model_cached_autograd_calculator_parity_and_roundtrip(tmp_pat
     assert slimmed.spin_wall_high_k == [2.5, 0.0]
     assert slimmed.spin_wall_low_s == [2.0, 0.0]
     assert slimmed.spin_wall_low_k == [1.2, 0.0]
+
+
+def test_spin_wall_auto_resolution(tmp_path):
+    from torchnep.spin_schema import resolve_auto_spin_walls, slim_type_config
+
+    p = tmp_path / "auto.in"
+    _write_input(
+        p,
+        "spin_wall_high auto 0.5 2.0\nspin_wall_low auto 0.6 1.5",
+        types="3 Bi Fe Ni",
+        spin_type="Fe Ni",
+    )
+    cfg = parse_nep_in(p)
+    assert cfg["spin_wall_high_auto"] == (0.5, 2.0)
+    assert cfg["spin_wall_low_auto"] == (0.6, 1.5)
+    with pytest.raises(ValueError, match="spin_wall_high auto requires training data"):
+        NEPModel(cfg)
+
+    # slim_type_config preserves auto specs prior to frame resolution
+    slim_cfg = slim_type_config(cfg, ["Fe", "Ni"])
+    assert slim_cfg["spin_wall_high_auto"] == (0.5, 2.0)
+    assert slim_cfg["spin_wall_low_auto"] == (0.6, 1.5)
+
+    frames = [
+        {
+            "species": ["Bi", "Fe", "Ni"],
+            "spins": np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 0.4, 0.0]]),
+        },
+        {
+            "species": ["Bi", "Fe", "Ni"],
+            "spins": np.array([[0.0, 0.0, 0.0], [0.0, 4.8, 0.0], [0.0, 0.0, 0.9]]),
+        },
+    ]
+    resolved = resolve_auto_spin_walls(cfg, frames)
+    assert resolved["spin_wall_high_auto"] is None
+    assert resolved["spin_wall_low_auto"] is None
+    # Fe: max=4.8 -> 5.3, min=3.0 -> 2.4; Ni: max=0.9 -> 1.4, min=0.4 - 0.6 <= 0 -> low disabled
+    assert resolved["spin_wall_high_s"] == pytest.approx([0.0, 5.3, 1.4])
+    assert resolved["spin_wall_high_k"] == [0.0, 2.0, 2.0]
+    assert resolved["spin_wall_low_s"] == pytest.approx([0.0, 2.4, 0.0])
+    assert resolved["spin_wall_low_k"] == [0.0, 1.5, 0.0]
+
+    # Exported nep.txt writes concrete resolved numbers (never 'auto')
+    model = NEPModel(resolved).double()
+    out_txt = tmp_path / "auto.txt"
+    model.save_nep_txt(out_txt, max_NN_radial=32, max_NN_angular=32)
+    reread, _, _ = read_nep_model(out_txt)
+    for key in ("spin_wall_high", "spin_wall_low"):
+        assert reread[f"{key}_auto"] is None
+        assert reread[f"{key}_s"] == resolved[f"{key}_s"]
+        assert reread[f"{key}_k"] == resolved[f"{key}_k"]
+    model.load_weights_from_nep_txt(out_txt)

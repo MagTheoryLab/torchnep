@@ -246,20 +246,39 @@ def test_two_rank_oc_training_smoke(tmp_path):
 
 
 @pytest.mark.parametrize("streamed", [False, True])
-def test_two_rank_spin_q_scaler_excludes_padding(tmp_path, streamed):
+@pytest.mark.parametrize("auto_wall", [False, True])
+def test_two_rank_spin_q_scaler_excludes_padding(tmp_path, streamed, auto_wall):
     """The DDP-only duplicate frame must not change spin RMS scaling."""
     if os.environ.get("TORCHNEP_TEST_DDP") != "1":
         pytest.skip("DDP test is local-only (set TORCHNEP_TEST_DDP=1)")
 
-    config, xyz, _ = _write_case(tmp_path)
-    config.write_text(config.read_text().replace("type 1 Fe", "type 3 O Fe Bi") +
-                      "\nspin_type Fe\nspin_wall_high 0 0 .95 2 0 0\n"
-                      "spin_wall_low 0 0 .5 1 0 0\n")
+    config, xyz, valid = _write_case(tmp_path)
+    text = config.read_text().replace("type 1 Fe", "type 3 O Fe Bi") + "\nspin_type Fe\n"
+    if auto_wall:
+        text = text.replace("lambda_spin_response 0.1", "lambda_spin_response 0")
+        text += "spin_wall_high auto 0.5 2\nspin_wall_low auto 0.25 1\n"
+        # Put independent extrema in two training frames and an outlier in validation.
+        for data, changes in ((xyz, [(0, 2.0), (1, .75)]), (valid, [(0, 8.0)])):
+            rows = data.read_text().splitlines()
+            for frame, moment in changes:
+                i = frame * 5 + 2
+                fields = rows[i].split()
+                fields[7:10] = [str(moment), "0", "0"]
+                rows[i] = " ".join(fields)
+            data.write_text("\n".join(rows) + "\n")
+        # This fixture otherwise holds a repeated rotation group.
+        valid_file = str(valid)
+        high, low = [2.5], [.5]
+    else:
+        text += "spin_wall_high 0 0 .95 2 0 0\nspin_wall_low 0 0 .5 1 0 0\n"
+        valid_file = None
+        high, low = [.95], [.5]
+    config.write_text(text)
     single = tmp_path / "single-spin"
     train_nep(
         str(config), str(xyz), output_dir=str(single), device="cpu",
         precision="float64", restart=False, prediction_interval=0,
-        run_seed=7, slim_types=True,
+        run_seed=7, slim_types=True, valid_file=valid_file,
     )
 
     sharded = tmp_path / "sharded-spin"
@@ -267,13 +286,10 @@ def test_two_rank_spin_q_scaler_excludes_padding(tmp_path, streamed):
     driver.write_text(
         "import sys\n"
         "from torchnep import train_nep_sharded\n"
-        "if sys.argv[4] == 'streamed':\n"
-        "    from importlib import import_module\n"
-        "    import_module('torchnep.train_sharded')._STREAM_THRESHOLD = 0\n"
         "train_nep_sharded(\n"
         "    sys.argv[1], sys.argv[2], output_dir=sys.argv[3],\n"
         "    precision='float64', restart=False, prediction_interval=0,\n"
-        "    run_seed=7, slim_types=True,\n"
+        "    run_seed=7, slim_types=True, valid_file=sys.argv[4] or None,\n"
         ")\n"
     )
     env = os.environ.copy()
@@ -283,6 +299,7 @@ def test_two_rank_spin_q_scaler_excludes_padding(tmp_path, streamed):
         if env.get("PYTHONPATH") else repo_root
     )
     env["OMP_NUM_THREADS"] = "1"
+    env["TORCHNEP_STREAM_THRESHOLD"] = "0" if streamed else str(2**40)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         master_port = str(sock.getsockname()[1])
@@ -292,17 +309,18 @@ def test_two_rank_spin_q_scaler_excludes_padding(tmp_path, streamed):
             "--nnodes=1", "--node_rank=0", "--nproc_per_node=2",
             "--master_addr=127.0.0.1", f"--master_port={master_port}",
             str(driver), str(config), str(xyz), str(sharded),
-            "streamed" if streamed else "ordinary",
+            valid_file or "",
         ],
         cwd=tmp_path, env=env, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=120,
     )
     assert completed.returncode == 0, completed.stdout
+    assert ("streamed shard loading" in completed.stdout) == streamed
 
     calc_single = NEPCalculator(single / "nep_final.txt", dtype=torch.float64)
     calc_sharded = NEPCalculator(sharded / "nep_final.txt", dtype=torch.float64)
     torch.testing.assert_close(calc_sharded.q_scaler, calc_single.q_scaler, rtol=2e-13, atol=2e-13)
     for calc in (calc_single, calc_sharded):
         assert calc.type_names == ["Fe"]
-        assert calc.spin_wall_high_s == [.95] and calc.spin_wall_high_k == [2.0]
-        assert calc.spin_wall_low_s == [.5] and calc.spin_wall_low_k == [1.0]
+        assert calc.spin_wall_high_s == high and calc.spin_wall_high_k == [2.0]
+        assert calc.spin_wall_low_s == low and calc.spin_wall_low_k == [1.0]

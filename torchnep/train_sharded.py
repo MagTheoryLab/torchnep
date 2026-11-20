@@ -169,7 +169,7 @@ class _NEPDDPShim(nn.Module):
 from .train import (
     _BANNER, _AUTHOR,
     _backend_info, StreamDataStore, iter_collated,
-    format_config_summary,
+    format_config_summary, resolve_training_spin_walls,
     preprocess_structures, compute_max_neighbors,
     fit_energy_baseline_frames,
     virial6_for_loss,
@@ -715,6 +715,12 @@ def train_nep_sharded(
         validate_spin_frames(contract_train_frames, "training")
         if contract_valid_frames is not None:
             validate_spin_frames(contract_valid_frames, "validation")
+    resolved_config = resolve_training_spin_walls(
+        orig_config, contract_train_frames, _log,
+        reduce_device=bcast_dev if streamed else None)
+    if resolved_config is not orig_config:
+        orig_config = resolved_config
+        config = orig_config if _slim_keep is None else slim_type_config(orig_config, _slim_keep)
     if valid_file is not None and not streamed:
         validate_response_group_disjoint(frames, valid_frames)
     response_loss_weight = float(config.get("lambda_spin_response", 0.0))
