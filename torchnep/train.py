@@ -477,6 +477,16 @@ class StreamDataStore:
         self._f_flag_t = torch.tensor(self.has_forces_flag, dtype=torch.bool)
         self._v_flag_t = torch.tensor(self.has_virial_flag, dtype=torch.bool)
         self._energy_t = torch.tensor(self.energy, dtype=dtype)
+        self._energy_residual_t = None
+        self.energy_weights = np.asarray([
+            s.get("energy_weight", 1.0) if has_energy else 0.0
+            for s, has_energy in zip(structures, self.has_energy_flag)
+        ], dtype=np.float64)
+        self._energy_weight_t = torch.as_tensor(self.energy_weights, dtype=dtype)
+        self._energy_loss_weight_t = torch.as_tensor([
+            weight * s.get("weight", 1.0)**2
+            for s, weight in zip(structures, self.energy_weights)
+        ], dtype=dtype)
         self._nat_t = torch.from_numpy(self._nat)
         if self.has_spin:
             self._m_flag_t = torch.tensor(
@@ -584,6 +594,8 @@ class StreamDataStore:
             "energy": _stage(self._energy_t[idx_t]),
             "natoms": _stage(self._nat_t[idx_t].to(self.dtype)),
             "energy_mask": _stage(self._e_flag_t[idx_t]),
+            "energy_weight": _stage(self._energy_weight_t[idx_t]),
+            "energy_loss_weight": _stage(self._energy_loss_weight_t[idx_t]),
             "forces": _stage(self._cat(self._f_all, idx, self._nat_cum)),
             "force_mask": _stage(torch.repeat_interleave(
                 self._f_flag_t[idx_t], nat_t)),
@@ -627,11 +639,16 @@ class StreamDataStore:
                 "has_m": bool(self._m_flag_t[idx_t].any()),
                 "has_tau": bool(self._tau_flag_t[idx_t].any()),
             })
+        if self._energy_residual_t is not None:
+            out["energy_residual"] = _stage(self._energy_residual_t[idx_t])
+        if self.contrast_specs is not None:
+            out["contrasts"] = [(self.contrast_specs[i], self.natoms[i]) for i in indices]
         return out
 
     _DEVICE_KEYS = ("atom_types", "struct_idx", "pair_i_rad", "pair_j_rad",
                     "rij_rad", "pair_i_ang", "pair_j_ang", "rij_ang",
-                    "energy", "natoms", "energy_mask", "forces",
+                    "energy", "natoms", "energy_mask", "energy_weight",
+                    "energy_loss_weight", "forces",
                     "force_mask", "virial", "virial_mask", "volumes")
     _SPIN_DEVICE_KEYS = (
         "pair_i_spin", "pair_j_spin", "rij_spin", "spins",
@@ -647,6 +664,13 @@ class StreamDataStore:
         a torch.compile'd version of this same method.
         """
         return ops.structural_basis(rij_r,rij_a,self._rc_r,self._rc_a,self._bs_r,self._bs_a,self._l3)
+
+    def set_energy_reference(self, baseline):
+        reference = baseline.detach().cpu().double().numpy()
+        residual = [energy - counts @ reference if has_energy else 0.0
+                    for energy, counts, has_energy in zip(
+                        self.energy, self.type_counts, self.has_energy_flag)]
+        self._energy_residual_t = torch.as_tensor(residual, dtype=self.dtype)
 
     def compile_basis(self):
         """torch.compile the per-batch basis compute (~4x fewer kernel
@@ -668,8 +692,12 @@ class StreamDataStore:
         if self.has_spin:
             batch["has_m"] = staged["has_m"]
             batch["has_tau"] = staged["has_tau"]
+        if "contrasts" in staged:
+            batch["contrasts"] = staged["contrasts"]
         keys = self._DEVICE_KEYS + (
             self._SPIN_DEVICE_KEYS if self.has_spin else ())
+        if "energy_residual" in staged:
+            keys += ("energy_residual",)
         for key in keys:
             t = staged[key]
             batch[key] = (t.to(dev, non_blocking=True) if self._pin
@@ -824,7 +852,8 @@ def _preprocess_one_frame(args):
         s["spin_tangent"] = frame["spin_tangent"].astype(dtype)
     for key in (
         "response_group", "response_probe", "response_coordinate",
-        "response_branch",
+        "response_branch", "contrast_spec", "response_batch_group",
+        "weight", "energy_weight",
     ):
         if key in frame:
             s[key] = frame[key]
@@ -948,53 +977,50 @@ def compute_max_neighbors(structures):
     return max_rad, max_ang
 
 
-def fit_energy_baseline(structures, num_types):
-    """Per-type baseline for the same per-structure E/N metric as training."""
-    labelled = [structure for structure in structures if "energy" in structure]
-    if not labelled:
+def fit_energy_baseline_frames(frames, type_names, *, reduce_device=None):
+    """Minimum-norm reference energies in the training per-structure E/N metric."""
+    labelled = (frame for frame in frames
+                if "energy" in frame and frame.get("energy_weight", 1.0) > 0)
+    num_types = len(type_names)
+    type_index = {name: index for index, name in enumerate(type_names)}
+    width = num_types + 1
+    rows = np.empty((0, width), dtype=np.float64)
+    num_rows = 0
+    # Merge QR factors of [composition | E/N] in bounded memory without
+    # squaring singular values or changing the fit's numerical rank cutoff.
+    while chunk := list(islice(labelled, 4096)):
+        block = np.zeros((len(chunk), width), dtype=np.float64)
+        for row, frame in zip(block, chunk):
+            species = frame["species"]
+            for name in species:
+                row[type_index[name]] += 1.0
+            row[-1] = frame["energy"]
+            row *= (frame.get("weight", 1.0) * math.sqrt(frame.get("energy_weight", 1.0))
+                    / len(species))
+        rows = np.linalg.qr(np.vstack((rows, block)), mode="r")
+        num_rows += len(chunk)
+    if reduce_device is not None:
+        import torch.distributed as dist
+
+        packet = torch.zeros((width + 1, width), dtype=torch.float64,
+                             device=reduce_device)
+        packet[:len(rows)] = torch.from_numpy(rows).to(reduce_device)
+        packet[-1, 0] = num_rows
+        packets = [torch.empty_like(packet) for _ in range(dist.get_world_size())]
+        dist.all_gather(packets, packet)
+        gathered = torch.stack(packets).cpu().numpy()
+        num_rows = int(gathered[:, -1, 0].sum())
+        rows = gathered[:, :-1].reshape(-1, width)
+    if not num_rows:
         return np.zeros(num_types, dtype=np.float64)
-    counts = np.stack([
-        np.bincount(structure["atom_types"], minlength=num_types)
-        for structure in labelled
-    ]).astype(np.float64)
-    natoms = np.asarray(
-        [structure["natoms"] for structure in labelled], dtype=np.float64)
-    totals = np.asarray(
-        [structure["energy"] for structure in labelled], dtype=np.float64)
-    baseline, _, rank, _ = np.linalg.lstsq(
-        counts / natoms[:, None], totals / natoms, rcond=None)
+    rcond = np.finfo(np.float64).eps * max(num_rows, num_types)
+    baseline, _, rank, _ = np.linalg.lstsq(rows[:, :-1], rows[:, -1], rcond=rcond)
+    if not np.isfinite(baseline).all():
+        raise ValueError("energy_reference fit requires finite training energies")
     if rank < num_types and int(os.environ.get("RANK", "0")) == 0:
         warnings.warn(
-            "per-element spin_baseline is non-unique for this composition "
-            "matrix; it is a conditioning offset, not a physical atomic "
-            "energy",
-            RuntimeWarning,
-        )
-    return baseline
-
-
-def fit_energy_baseline_frames(frames, type_names):
-    """Per-type E/N baseline without building neighbor lists."""
-    labelled = [frame for frame in frames if "energy" in frame]
-    if not labelled:
-        return np.zeros(len(type_names), dtype=np.float64)
-    type_index = {name: index for index, name in enumerate(type_names)}
-    counts = np.zeros((len(labelled), len(type_names)), dtype=np.float64)
-    for row, frame in enumerate(labelled):
-        for species in frame["species"]:
-            counts[row, type_index[species]] += 1.0
-    totals = np.asarray(
-        [frame["energy"] for frame in labelled], dtype=np.float64
-    )
-    natoms = np.asarray(
-        [len(frame["species"]) for frame in labelled], dtype=np.float64)
-    baseline, _, rank, _ = np.linalg.lstsq(
-        counts / natoms[:, None], totals / natoms, rcond=None)
-    if rank < len(type_names) and int(os.environ.get("RANK", "0")) == 0:
-        warnings.warn(
-            "per-element spin_baseline is non-unique for this composition "
-            "matrix; it is a conditioning offset, not a physical atomic "
-            "energy",
+            f"energy_reference fit rank {rank} of {num_types}, using the "
+            "minimum-norm solution for the training compositions",
             RuntimeWarning,
         )
     return baseline
@@ -1245,6 +1271,38 @@ def compute_q_scaler(model, data_store, batch_size=1000, backend="loop",
 
 
 @torch.no_grad()
+def align_finetune_energy_reference(model, data_store, fitted_reference,
+                                   batch_size, backend, *, sharded=False):
+    """Use GPUMD's ordinary NEP fine-tune reference on the target data."""
+    stats = torch.zeros((2, model.num_types), dtype=torch.float64,
+                        device=model.b1.device)
+    was_training = model.training
+    model.eval()
+    try:
+        for start in range(0, data_store.n, batch_size):
+            indices = list(range(start, min(start + batch_size, data_store.n)))
+            batch = data_store.collate(indices)
+            result = model.compute_properties_cached(
+                batch, need_forces=False, backend=backend, include_baseline=False)
+            weight = batch["energy_loss_weight"].double() / batch["natoms"]
+            atom_weight = weight[batch["struct_idx"]]
+            types = batch["atom_types"]
+            stats[0].index_add_(0, types, atom_weight * result["Ei"].double())
+            stats[1].index_add_(0, types, atom_weight)
+    finally:
+        model.train(was_training)
+    if sharded:
+        torch.distributed.all_reduce(stats)
+    if not stats[1].any():
+        return
+    shift = torch.where(stats[1] > 0, stats[0] / stats[1], 0.0)
+    reference = torch.as_tensor(fitted_reference, device=stats.device) - shift
+    if not torch.isfinite(reference).all():
+        raise ValueError("fine-tune energy_reference alignment is not finite")
+    model.set_energy_baseline(reference)
+
+
+@torch.no_grad()
 def recompute_b1_shift(raw_model, data_store, batch_size, backend):
     """Set the energy offset ``b1`` to its analytical optimum (GPUMD-style).
 
@@ -1255,7 +1313,7 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
     (current) mean per-atom residual, and since the predicted energy already
     contains ``b1`` it is an additive correction
 
-        b1 <- b1 + mean_over_energy_structs(E_pred/Na - E_ref/Na).
+        b1 <- b1 + weighted_mean(E_pred/Na - E_ref/Na, energy_weight).
 
     This mirrors GPUMD, which recomputes the energy shift every generation so
     the energy loss is offset-free and the overall level cannot drift.
@@ -1266,7 +1324,7 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
     dev = raw_model.b1.device
     dtype = raw_model.b1.dtype
     num = torch.zeros((), dtype=dtype, device=dev)
-    den = 0
+    den = torch.zeros_like(num)
     for start in range(0, data_store.n, batch_size):
         end = min(start + batch_size, data_store.n)
         batch = data_store.collate(list(range(start, end)))
@@ -1274,12 +1332,14 @@ def recompute_b1_shift(raw_model, data_store, batch_size, backend):
         if not bool(e_mask.any()):
             continue
         res = raw_model.compute_properties_cached(
-            batch, need_forces=False, need_virial=False, backend=backend)
+            batch, need_forces=False, need_virial=False, backend=backend,
+            include_baseline="energy_residual" not in batch)
         e_pa_pred = res["Etot"] / batch["natoms"]
-        e_pa_ref = batch["energy"] / batch["natoms"]
+        e_pa_ref = batch.get("energy_residual", batch["energy"]) / batch["natoms"]
         diff = (e_pa_pred - e_pa_ref)[e_mask]
-        num = num + diff.sum()
-        den += int(e_mask.sum().item())
+        weight = batch["energy_weight"][e_mask]
+        num = num + (diff * weight).sum()
+        den = den + weight.sum()
     if den > 0:
         raw_model.b1.add_(num / den)
     if was_training:
@@ -1584,7 +1644,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
     """
     sum_le = sum_lf = sum_lv = sum_ls = 0.0
     sum_lm = sum_lt = 0.0
-    sum_e_resid = 0.0      # Σ signed per-atom energy residual (for exact b1)
+    sum_e_resid = sum_e_weight = 0.0
     n_e = n_f = n_v = n_m = n_t = 0
 
     was_training = raw_model.training
@@ -1613,21 +1673,25 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
                         need_mforce=has_mforce, need_tau=has_tau,
                         rij_spin=batch.get("rij_spin"),
                         pi_spin=batch.get("pair_i_spin"),
-                        pj_spin=batch.get("pair_j_spin"))
+                        pj_spin=batch.get("pair_j_spin"),
+                        include_baseline="energy_residual" not in batch)
                 else:
                     batch["need_mforce"] = has_mforce
                     batch["need_tau"] = has_tau
                     result = compute_props_cached(
                         batch, need_forces=has_forces,
-                        need_virial=has_virial, backend=backend)
+                        need_virial=has_virial, backend=backend,
+                        include_baseline="energy_residual" not in batch)
 
                 e_mask = batch["energy_mask"]
                 if e_mask.any():
                     e_pa_pred = result["Etot"] / batch["natoms"]
-                    e_pa_ref = batch["energy"] / batch["natoms"]
+                    e_pa_ref = batch.get("energy_residual", batch["energy"]) / batch["natoms"]
                     diff_e = e_pa_pred[e_mask] - e_pa_ref[e_mask]
-                    sum_le += (diff_e ** 2).sum().item()
-                    sum_e_resid += diff_e.sum().item()
+                    weight = batch["energy_weight"][e_mask]
+                    sum_le += (diff_e.square() * weight).sum().item()
+                    sum_e_resid += (diff_e * weight).sum().item()
+                    sum_e_weight += weight.sum().item()
                     n_e += int(e_mask.sum().item())
 
                 if has_forces:
@@ -1689,7 +1753,7 @@ def _accumulate_true_loss_sums(data_store, batch_size, raw_model,
             raw_model.train()
 
     return (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
-            n_e, n_f, n_v, n_m, n_t, sum_e_resid)
+            n_e, n_f, n_v, n_m, n_t, sum_e_resid, sum_e_weight)
 
 
 def _evaluate_true_loss(data_store, batch_size, raw_model,
@@ -1703,7 +1767,7 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
     best-save block in the epoch loop).
 
     Side effect: sets the exact optimal energy offset ``b1`` for these frozen
-    weights (δ = sum_e_resid / n_e) so the evaluated loss and the saved model
+    weights (δ = sum_e_resid / sum_e_weight) so the evaluated loss and the saved model
     agree. This is what keeps nep_best ≤ nep_final: every candidate (the final
     epoch always among them) is judged AND saved with its own exact b1.
 
@@ -1721,15 +1785,14 @@ def _evaluate_true_loss(data_store, batch_size, raw_model,
         use_autograd_forces, backend, has_forces, has_virial,
         has_mforce, has_tau, dtype, dev)
     (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
-     n_e, n_f, n_v, n_m, n_t, sum_e_resid) = sums
+     n_e, n_f, n_v, n_m, n_t, sum_e_resid, sum_e_weight) = sums
     # Exact optimal b1 for these frozen weights, solved from this same pass.
-    delta = sum_e_resid / n_e if n_e > 0 else 0.0
-    if n_e > 0:
+    delta = sum_e_resid / sum_e_weight if sum_e_weight > 0 else 0.0
+    if sum_e_weight > 0:
         with torch.no_grad():
             raw_model.b1.add_(delta)
-    # Offset-corrected energy MSE = Var(residual) = E[r²] − δ². Clamp tiny
-    # negatives from float round-off.
-    mse_e = max(0.0, sum_le / max(n_e, 1) - delta * delta)
+    # Subtract the improvement in weighted SSE from the fitted offset.
+    mse_e = max(0.0, (sum_le - delta * sum_e_resid) / max(n_e, 1))
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
     mse_s = sum_ls / max(n_v, 1)
@@ -1768,7 +1831,7 @@ def _evaluate_valid_loss(valid_store, batch_size, raw_model,
         use_autograd_forces, backend, has_forces, has_virial,
         has_mforce, has_tau, dtype, dev)
     (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
-     n_e, n_f, n_v, n_m, n_t, _) = sums
+     n_e, n_f, n_v, n_m, n_t, _, _) = sums
     mse_e = sum_le / max(n_e, 1)
     mse_f = sum_lf / max(n_f, 1)
     mse_v = sum_lv / max(n_v, 1)
@@ -2247,8 +2310,9 @@ def train_nep(
 
     max_NN_rad, max_NN_ang = compute_max_neighbors(structures)
     energy_baseline_values = (
-        fit_energy_baseline(structures, config["num_types"])
-        if config.get("spin_mode", 0) else None)
+        fit_energy_baseline_frames(frames, config["type_names"])
+        if resume_ckpt is None and (finetune_from is None or not config.get("spin_mode"))
+        else None)
 
     t0 = time.time()
     data_store = StreamDataStore(structures, dev, dtype, config=config)
@@ -2310,7 +2374,7 @@ def train_nep(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if energy_baseline_values is not None:
+    if energy_baseline_values is not None and finetune_from is None:
         model.set_energy_baseline(torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev))
 
@@ -2372,7 +2436,8 @@ def train_nep(
             for i in range(data_store.n)
             if data_store.has_energy_flag[i]
         ]
-        mean_epa = float(np.mean(energy_per_atom)) if energy_per_atom else 0.0
+        weight = data_store.energy_weights[data_store.has_energy_flag]
+        mean_epa = np.dot(energy_per_atom, weight) / weight.sum() if weight.any() else 0.0
         with torch.no_grad():
             model.b1.fill_(-mean_epa)
         _log(f"  {sum(p.numel() for p in model.parameters())} parameters, "
@@ -2448,6 +2513,11 @@ def train_nep(
         if dev.type == "cuda":
             torch.cuda.synchronize()
         _log(f"  q_scaler in {time.time() - t0:.1f}s")
+
+    if finetune_from is not None and not model.spin_mode:
+        align_finetune_energy_reference(model, data_store, energy_baseline_values,
+                                       batch_size, backend)
+        _log("  energy_reference: aligned to the target training set")
 
     raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
@@ -2653,6 +2723,10 @@ def train_nep(
                 info, lr_scheduler, stage2_scheduler,
             )
 
+    data_store.set_energy_reference(raw_model.energy_baseline)
+    if valid_store is not None:
+        valid_store.set_energy_reference(raw_model.energy_baseline)
+
     n_structs = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
     # the CURRENT stage's weights — so a stage-1 weight of 0 can still enable
@@ -2761,7 +2835,7 @@ def train_nep(
             # pipeline (the CPU must run a full step ahead of the GPU for
             # the streamed collate + kernel launches to hide).
             # Layout: E/F/V/stress/M/Tau sums, E/F/V/M/Tau counts, E residual.
-            acc = torch.zeros(12, dtype=torch.float64, device=dev)
+            acc = torch.zeros(13, dtype=torch.float64, device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -2881,14 +2955,15 @@ def train_nep(
                         need_tau=has_tau,
                         rij_spin=batch.get("rij_spin"),
                         pi_spin=batch.get("pair_i_spin"),
-                        pj_spin=batch.get("pair_j_spin"))
+                        pj_spin=batch.get("pair_j_spin"),
+                        include_baseline="energy_residual" not in batch)
                 else:
                     result = compute_props_cached(
                         batch, need_forces=has_forces, need_virial=has_virial,
-                        backend=train_backend)
+                        backend=train_backend, include_baseline=False)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
-                e_pa_ref = batch["energy"] / batch["natoms"]
+                e_pa_ref = batch["energy_residual"] / batch["natoms"]
                 loss = torch.tensor(0.0, dtype=dtype, device=dev)
                 # Loss + metrics are built BRANCHLESSLY (masked weighted
                 # sums, host-side has_* flags) and kept as device scalars:
@@ -2903,11 +2978,11 @@ def train_nep(
                     emf = batch["energy_mask"].to(dtype)
                     ne_b = emf.sum()
                     de = (e_pa_pred - e_pa_ref) * emf
-                    loss = loss + cur_pref_e * ((de ** 2).sum() / ne_b)
-                    m_le = (de ** 2).sum()
-                    # Signed residual for the analytical b1 update (folded
-                    # into this pass — no extra forward).
-                    m_resid = de.sum()
+                    de_squared = de.square()
+                    energy_sse = (de_squared * batch["energy_loss_weight"]).sum()
+                    loss = loss + cur_pref_e * energy_sse / ne_b
+                    m_le = (de_squared * batch["energy_weight"]).sum()
+                    m_resid = (de * batch["energy_weight"]).sum()
 
                 if has_forces and batch["has_f"]:
                     fmf = batch["force_mask"].to(dtype).unsqueeze(-1)
@@ -3052,6 +3127,7 @@ def train_nep(
                     (t_mask.sum().double()
                      if m_lt is not None else zero64),
                     m_resid.double() if m_resid is not None else zero64,
+                    (batch["energy_weight"] * batch["energy_mask"]).sum().double(),
                 ])
                 max_gn_t = torch.maximum(
                     max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
@@ -3064,7 +3140,7 @@ def train_nep(
             # One epoch-level fetch of every device accumulator (the only
             # metric sync of the epoch).
             (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
-             n_e_f, n_f_f, n_v_f, n_m_f, n_t_f, sum_e_resid) = acc.tolist()
+             n_e_f, n_f_f, n_v_f, n_m_f, n_t_f, sum_e_resid, sum_e_weight) = acc.tolist()
             sum_e_structs = int(round(n_e_f))
             sum_f_atoms = int(round(n_f_f))
             sum_v_structs = int(round(n_v_f))
@@ -3082,9 +3158,9 @@ def train_nep(
             # the batch loop but BEFORE the best-model eval / nep_best save, so
             # the saved weights and offset stay consistent. ``b1`` is not a
             # gradient parameter (see the optimizer exclusion above).
-            if sum_e_structs > 0:
+            if sum_e_weight > 0:
                 with torch.no_grad():
-                    raw_model.b1.add_(sum_e_resid / sum_e_structs)
+                    raw_model.b1.add_(sum_e_resid / sum_e_weight)
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
             # consistent with rmse_{e,f,v}: avg_loss == \Sigma pref_X * MSE_X

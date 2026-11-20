@@ -309,6 +309,15 @@ export_valid_split("train.xyz", valid_ratio=0.1, run_seed=42,
 python run_train.py
 ```
 
+Ordinary NEP and NEP-Spin fit `energy_reference` from the training-set
+compositions and energies per atom. Optional extended XYZ tags `weight` and
+`energy_weight` multiply the energy fitting objective by
+`weight² × energy_weight`. The shared `b1` is fitted with `energy_weight`.
+Training uses residual energies, and predictions restore the per-element
+reference. Resume inherits the checkpoint reference. Ordinary fine-tuning
+fits the target reference and removes the source network's weighted mean
+energy per element from it. Spin fine-tuning inherits the source reference.
+
 ### Multi-GPU, single node — `train_nep_sharded`
 
 Each rank keeps only `1/N` of the preprocessed structures in its GPU data

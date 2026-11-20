@@ -292,6 +292,17 @@ def _parse_comment(comment: str, natoms: int, energy_key: str = "energy") -> Dic
     e_val = _find_scalar(comment, energy_key)
     if e_val is not None:
         frame["energy"] = float(e_val)
+        if not np.isfinite(frame["energy"]):
+            raise ValueError(f"invalid XYZ {energy_key}={e_val}")
+
+    for key in ("weight", "energy_weight"):
+        value = _find_scalar(comment, key)
+        if value is None:
+            continue
+        weight = float(value)
+        if not np.isfinite(weight) or weight < 0 or (key == "weight" and not 0 < weight <= 100):
+            raise ValueError(f"invalid XYZ {key}={value}")
+        frame[key] = weight
 
     vir_str = _find_quoted(comment, "virial")
     if vir_str is not None:

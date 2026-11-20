@@ -159,19 +159,19 @@ class _NEPDDPShim(nn.Module):
                 need_mforce=need_mforce, need_tau=need_tau,
                 rij_spin=batch.get("rij_spin"),
                 pi_spin=batch.get("pair_i_spin"),
-                pj_spin=batch.get("pair_j_spin"))
+                pj_spin=batch.get("pair_j_spin"), include_baseline=False)
         batch["need_mforce"] = need_mforce
         batch["need_tau"] = need_tau
         return self._compute_cached(
             batch, need_forces=need_forces, need_virial=need_virial,
-            backend=backend)
+            backend=backend, include_baseline=False)
 
 from .train import (
     _BANNER, _AUTHOR,
     _backend_info, StreamDataStore, iter_collated,
     format_config_summary, resolve_training_spin_walls,
     preprocess_structures, compute_max_neighbors,
-    fit_energy_baseline_frames,
+    fit_energy_baseline_frames, align_finetune_energy_reference,
     virial6_for_loss,
     grouped_validation_indices, validate_spin_frames,
     validate_response_group_disjoint, build_data_lineage,
@@ -773,34 +773,15 @@ def train_nep_sharded(
             _log("  slim_types: all types present in data, nothing to remove")
 
     energy_baseline_values = None
-    if config.get("spin_mode", 0):
-        if not streamed:
+    if resume_ckpt is None and (finetune_from is None or not config.get("spin_mode")):
+        if streamed:
+            real_frames = (frame for frame, is_real in zip(local_frames, local_real_flags)
+                           if is_real)
+            energy_baseline_values = fit_energy_baseline_frames(
+                real_frames, config["type_names"], reduce_device=bcast_dev)
+        else:
             energy_baseline_values = fit_energy_baseline_frames(
                 frames, config["type_names"])
-        else:
-            type_index = {
-                name: index for index, name in enumerate(config["type_names"])}
-            ntype = len(type_index)
-            ata = np.zeros((ntype, ntype), dtype=np.float64)
-            aty = np.zeros(ntype, dtype=np.float64)
-            for frame, is_real in zip(local_frames, local_real_flags):
-                if not is_real or "energy" not in frame:
-                    continue
-                x = np.zeros(ntype, dtype=np.float64)
-                for species in frame["species"]:
-                    x[type_index[species]] += 1.0
-                x /= len(frame["species"])
-                y = float(frame["energy"]) / len(frame["species"])
-                ata += np.outer(x, x)
-                aty += x * y
-            stats = torch.from_numpy(
-                np.concatenate([ata.ravel(), aty])).to(dev)
-            dist.all_reduce(stats)
-            stats_np = stats.cpu().numpy()
-            ata = stats_np[:ntype * ntype].reshape(ntype, ntype)
-            aty = stats_np[ntype * ntype:]
-            energy_baseline_values = np.linalg.lstsq(
-                ata, aty, rcond=None)[0]
 
     # Random sharding: shuffle globally with a fixed seed (identical on
     # every rank -> all ranks agree on the partition), then give rank r the
@@ -978,7 +959,7 @@ def train_nep_sharded(
     _log("-----")
     _log(f"  run_seed: {run_seed}")
     model = NEPModel(config).to(dtype).to(dev)
-    if energy_baseline_values is not None:
+    if energy_baseline_values is not None and finetune_from is None:
         baseline = torch.as_tensor(
             energy_baseline_values, dtype=dtype, device=dev
         )
@@ -1034,11 +1015,11 @@ def train_nep_sharded(
             (
                 data_store.energy[i]
                 - float(data_store.type_counts[i] @ baseline_np)
-            ) / data_store.natoms[i]
-            for i in range(data_store.n) if data_store.has_energy_flag[i]
+            ) / data_store.natoms[i] * weight
+            for i, weight in enumerate(data_store.energy_weights) if weight > 0
         )
-        local_n_e = float(data_store.n_energy)
-        epa_t = torch.tensor([local_epa_sum, local_n_e], device=dev, dtype=torch.float64)
+        epa_t = torch.tensor([local_epa_sum, data_store.energy_weights.sum()],
+                             device=dev, dtype=torch.float64)
         dist.all_reduce(epa_t)
         mean_epa = float(epa_t[0] / epa_t[1]) if epa_t[1] > 0 else 0.0
         with torch.no_grad():
@@ -1128,6 +1109,11 @@ def train_nep_sharded(
         _log(f"  q_scaler in {time.time() - t_qs:.1f}s "
              f"(all-reduce across shards)")
 
+    if finetune_from is not None and not model.spin_mode:
+        align_finetune_energy_reference(model, data_store, energy_baseline_values,
+                                       batch_size, backend, sharded=True)
+        _log("  energy_reference: aligned to the target training set")
+
     # Wrap in a shim whose forward calls compute_properties{_cached} — this
     # keeps the force/virial compute on DDP's forward path so the reducer can
     # arm backward all-reduce. See _NEPDDPShim docstring. torch.compile is
@@ -1205,13 +1191,13 @@ def train_nep_sharded(
         sums_t = torch.tensor(sums, device=dev, dtype=torch.float64)
         dist.all_reduce(sums_t)
         (s_le, s_lf, s_lv, s_ls, s_lm, s_lt,
-         n_e, n_f, n_v, n_m, n_t, s_e_resid) = sums_t.tolist()
-        delta = (
-            s_e_resid / n_e if fit_energy_offset and n_e > 0 else 0.0)
-        if fit_energy_offset and n_e > 0:
+         n_e, n_f, n_v, n_m, n_t, s_e_resid, s_e_weight) = sums_t.tolist()
+        delta = (s_e_resid / s_e_weight
+                 if fit_energy_offset and s_e_weight > 0 else 0.0)
+        if fit_energy_offset and s_e_weight > 0:
             with torch.no_grad():
                 raw_model.b1.add_(delta)
-        mse_e = max(0.0, s_le / max(n_e, 1.0) - delta * delta)
+        mse_e = max(0.0, (s_le - delta * s_e_resid) / max(n_e, 1.0))
         mse_f = s_lf / max(n_f, 1.0)
         mse_v = s_lv / max(n_v, 1.0)
         mse_s = s_ls / max(n_v, 1.0)
@@ -1377,6 +1363,10 @@ def train_nep_sharded(
                 info, lr_scheduler, stage2_scheduler,
             )
 
+    data_store.set_energy_reference(raw_model.energy_baseline)
+    if valid_store is not None:
+        valid_store.set_energy_reference(raw_model.energy_baseline)
+
     n_local = data_store.n
     # has_forces / has_virial are recomputed per-epoch inside the loop using
     # the CURRENT stage's weights — so a stage-1 weight of 0 can still enable
@@ -1482,7 +1472,7 @@ def train_nep_sharded(
             # Device-side accumulators, fetched (and all-reduced) once per
             # epoch — see train_nep. Layout: E/F/V/stress/M/Tau sums,
             # E/F/V/M/Tau counts, and the signed E residual.
-            acc = torch.zeros(12, dtype=torch.float64, device=dev)
+            acc = torch.zeros(13, dtype=torch.float64, device=dev)
             max_gn_t = torch.zeros((), dtype=dtype, device=dev)
             n_bad_t = torch.zeros((), dtype=dtype, device=dev)
 
@@ -1591,7 +1581,7 @@ def train_nep_sharded(
                                has_mforces, has_tau, train_backend)
 
                 e_pa_pred = result["Etot"] / batch["natoms"]
-                e_pa_ref = batch["energy"] / batch["natoms"]
+                e_pa_ref = batch["energy_residual"] / batch["natoms"]
                 active = (
                     raw_model.spin_dof_type_active[batch["atom_types"]]
                     if has_mforces or has_tau else None)
@@ -1651,11 +1641,11 @@ def train_nep_sharded(
 
                 if batch["has_e"]:
                     de = (e_pa_pred - e_pa_ref) * emf
-                    loss = loss + cur_pref_e * (de ** 2).sum() * ws / cg[0]
-                    m_le = (de ** 2).sum()           # global SSE
-                    # Signed residual for the analytical b1 update (folded into
-                    # this pass; all-reduced below with the other metrics).
-                    m_resid = de.sum()
+                    de_squared = de.square()
+                    energy_sse = (de_squared * batch["energy_loss_weight"]).sum()
+                    loss = loss + cur_pref_e * energy_sse * ws / cg[0]
+                    m_le = (de_squared * batch["energy_weight"]).sum()
+                    m_resid = (de * batch["energy_weight"]).sum()
 
                 if fmf is not None and batch["has_f"]:
                     df = (result["forces"] - batch["forces"]) * fmf
@@ -1791,6 +1781,7 @@ def train_nep_sharded(
                     (t_mask.sum().double()
                      if m_lt is not None else zero64),
                     m_resid.double() if m_resid is not None else zero64,
+                    (batch["energy_weight"] * batch["energy_mask"]).sum().double(),
                 ])
                 max_gn_t = torch.maximum(
                     max_gn_t, torch.nan_to_num(gn_t, 0.0, 0.0, 0.0))
@@ -1802,7 +1793,7 @@ def train_nep_sharded(
             dist.all_reduce(n_bad_t, op=dist.ReduceOp.MAX)
             (sum_le, sum_lf, sum_lv, sum_ls, sum_lm, sum_lt,
              sum_e_structs, sum_f_atoms, sum_v_structs,
-             sum_m_atoms, sum_t_atoms, sum_e_resid) = acc.tolist()
+             sum_m_atoms, sum_t_atoms, sum_e_resid, sum_e_weight) = acc.tolist()
             max_gn = float(max_gn_t)
             if is_main and int(n_bad_t):
                 _log(f"  warning: {int(n_bad_t)} step(s) skipped this epoch "
@@ -1812,9 +1803,9 @@ def train_nep_sharded(
             # all-reduced above — identical on every rank. Updated before the
             # best-model eval / nep_best save so weights and offset stay
             # consistent. b1 is not gradient-trained (optimizer-excluded).
-            if sum_e_structs > 0:
+            if sum_e_weight > 0:
                 with torch.no_grad():
-                    raw_model.b1.add_(sum_e_resid / sum_e_structs)
+                    raw_model.b1.add_(sum_e_resid / sum_e_weight)
 
             # Per-sample (not per-batch) averaging so avg_loss is self-
             # consistent with rmse_{e,f,v}: avg_loss == \Sigma pref_X * MSE_X
